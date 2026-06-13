@@ -132,9 +132,10 @@ def test_inv14_indexed_project_negative_scope_is_clamped_by_health_and_backend()
 def test_negative_scope_index_scope_matrix():
     assert_violates(
         "INV14_MATRIX",
+        resolved=Resolved.NOT_FOUND,
         coverage=Coverage(
             index_scope=IndexScope.EXTERNAL_KNOWN,
-            is_exhaustive_within_scope=False,
+            is_exhaustive_within_scope=True,
             negative_scope=NegativeScope.CURRENT_TU,
         ),
     )
@@ -240,6 +241,68 @@ def test_inv2_now_rejects_semantic_from_reserved_log_search():
         source=Source.LOG_SEARCH,
         certainty=Certainty.SEMANTIC,
     )
+
+
+def test_inv20_not_found_requires_clangd_semantic_without_blind_spot():
+    assert_violates(
+        "INV12",
+        source=Source.TREE_SITTER,
+        certainty=Certainty.SYNTACTIC,
+        resolved=Resolved.NOT_FOUND,
+        dependency=DependencyScope.not_applicable(),
+        coverage=NF_CURRENT_TU,
+    )
+    assert_violates(
+        "INV5",
+        resolved=Resolved.NOT_FOUND,
+        coverage=NF_CURRENT_TU,
+        blind_spot_affects_result=True,
+    )
+    assert_violates(
+        "INV20",
+        source=Source.LOG_SEARCH,
+        certainty=Certainty.SYNTACTIC,
+        resolved=Resolved.NOT_FOUND,
+        coverage=NF_CURRENT_TU,
+    )
+    assert_violates(
+        "INV20",
+        certainty=Certainty.SYNTACTIC,
+        resolved=Resolved.NOT_FOUND,
+        coverage=NF_CURRENT_TU,
+    )
+    check_invariants(F.clangd_not_found(QueryKind.ENTITY, DEP_OK))
+
+
+def test_inv21_negative_scope_only_for_not_found_and_unresolved_not_exhaustive():
+    assert_violates(
+        "INV21",
+        coverage=Coverage(
+            index_scope=IndexScope.CURRENT_TU,
+            is_exhaustive_within_scope=False,
+            negative_scope=NegativeScope.CURRENT_TU,
+        ),
+    )
+    assert_violates(
+        "INV21",
+        resolved=Resolved.UNRESOLVED,
+        coverage=Coverage(
+            index_scope=IndexScope.CURRENT_TU,
+            is_exhaustive_within_scope=True,
+            negative_scope=NegativeScope.NONE,
+        ),
+    )
+    check_invariants(
+        mk(
+            resolved=Resolved.RESOLVED,
+            coverage=Coverage(
+                index_scope=IndexScope.INDEXED_PROJECT,
+                is_exhaustive_within_scope=True,
+                negative_scope=NegativeScope.NONE,
+            ),
+        )
+    )
+    check_invariants(mk(coverage=Coverage()))
 
 
 def test_log_search_syntactic_reserved_source_is_legal():

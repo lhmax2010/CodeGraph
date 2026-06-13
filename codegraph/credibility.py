@@ -246,6 +246,10 @@ def check_invariants(c: Credibility) -> None:
     INV18 dependency.status 与 missing 一致; level=n_a 不参与 not_found 证明。
     INV19 exact_syntactic => source=log_search。log_search/exact_syntactic 是二期
           预留值,合法组合放行,不得写死 MVP 白名单。
+    INV20 not_found => source=clangd 且 certainty=semantic 且无结果盲区。
+          只有 clangd 语义无盲区才有权断言"不存在"。
+    INV21 resolved!=not_found => negative_scope=none；resolved==unresolved =>
+          is_exhaustive_within_scope=False。
     """
     for checker in _INVARIANT_CHECKS:
         checker(c)
@@ -347,6 +351,17 @@ def _check_inv12(c: Credibility) -> None:
         )
 
 
+def _check_inv20(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if c.source != Source.CLANGD:
+        raise InvariantError("INV20", "not_found requires source=clangd")
+    if c.certainty != Certainty.SEMANTIC:
+        raise InvariantError("INV20", "not_found requires semantic certainty")
+    if c.blind_spot_affects_result:
+        raise InvariantError("INV20", "not_found forbids blind_spot_affects_result")
+
+
 def _check_inv13(c: Credibility) -> None:
     if c.resolved != Resolved.NOT_FOUND:
         return
@@ -394,6 +409,18 @@ def _check_inv14c(c: Credibility) -> None:
     ):
         raise InvariantError(
             "INV14C", "background-index forbids indexed_project not_found"
+        )
+
+
+def _check_inv21(c: Credibility) -> None:
+    if (
+        c.resolved != Resolved.NOT_FOUND
+        and c.coverage.negative_scope != NegativeScope.NONE
+    ):
+        raise InvariantError("INV21", "negative_scope is only meaningful for not_found")
+    if c.resolved == Resolved.UNRESOLVED and c.coverage.is_exhaustive_within_scope:
+        raise InvariantError(
+            "INV21", "unresolved results cannot be exhaustive within scope"
         )
 
 
@@ -484,10 +511,12 @@ _INVARIANT_CHECKS: tuple[Callable[[Credibility], None], ...] = (
     _check_inv10,
     _check_inv11,
     _check_inv12,
+    _check_inv20,
     _check_inv13,
     _check_inv14a,
     _check_inv14b,
     _check_inv14c,
+    _check_inv21,
     _check_negative_scope_index_scope,
     _check_inv15,
     _check_inv16,

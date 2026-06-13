@@ -44,6 +44,9 @@
 - 决策：两个设计层小项已登记到 `docs/design_changes/change_1.md`，待 design owner 决策。
   - 原因：`_check_inv14a` 在当前 NegativeScope 三值模型下位于 INV13 后不可达，但保留独立检查函数无害；`make_error_credibility()` 使用 `source=clangd` 是 design §4.3 的明确占位规范，当前 schema 无 `Source.UNKNOWN`。这些属于 frozen design 的注释/语义澄清项，不改 `docs/design.md`，不返工 P1。
   - 排除的方案：删除 `_check_inv14a` 或新增/替换错误占位 source。前者会弱化每个 INV 独立函数的实现形态，后者会修改冻结设计。
+- 决策：INV20 放在 INV12 之后、INV5 之后；INV21 放在 negative_scope/index_scope 矩阵检查之前，并同步把矩阵测试改成 `resolved=not_found` 隔离。
+  - 原因：保持既有更具体不变量的错误码稳定（tree-sitter+not_found 仍由 INV12 拦，blind_spot+semantic 仍由 INV5 拦），同时让 positive/unresolved 夹带 negative_scope 时稳定命中 INV21。
+  - 排除的方案：只新增 INV21 不改矩阵测试。该方案会让现有矩阵测试被 INV21 抢先拦截，测试不到兼容矩阵本身。
 
 ## 改动摘要
 - 文件/模块：`AGENTS.md`
@@ -80,6 +83,10 @@
   - 改动内容：运行 black 统一格式化 P1 代码、复用资产与测试；运行 ruff 清理未使用 import/变量。
 - 文件/模块：`.gitignore`
   - 改动内容：忽略 `.venv/`，避免本地 Python 工具环境污染 git 状态。
+- 文件/模块：`codegraph/credibility.py`
+  - 改动内容：按 design v1.4.2 实现 INV20/INV21，保持 INV20 在 INV12/INV5 之后执行，INV21 在矩阵检查之前执行。
+- 文件/模块：`tests/test_phase1_metadata.py`
+  - 改动内容：新增 INV20/INV21 专属测试；矩阵测试改为 `resolved=not_found` 隔离，避免 INV21 抢占矩阵错误码。
 
 ## 进度日志
 - [2026-06-13] 阅读 `docs/CodeGraph-SOP部署开发Guide.md`，确认一次性准备、Phase 串行策略、P1 启动要求。
@@ -98,3 +105,5 @@
 - [2026-06-13] design 经 R1 变更至 v1.4（`docs/design_changes/change_2.md`），待复核后实现 INV20/21；本次只落文档，不改 P1 实现代码。
 - [2026-06-13] design 修订至 v1.4.1（`docs/design_changes/change_2.md`），待第二轮 AI 复核后实现 INV20/21；本次只核对和记录，不改 P1 实现代码。
 - [2026-06-13] design 定稿至 v1.4.2（`docs/design_changes/change_2.md`），落实第二轮复核后的 typo/交叉引用清理；契约语义不变，仍等待后续指令再实现 INV20/21。
+- [2026-06-13] 按 design v1.4.2 实现 INV20/INV21；`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 28 passed，`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 67 passed。
+- [2026-06-13] 静态 gate 闭环：`uv tool run ruff check .` 通过；`uv tool run black --check .` 通过；`uv tool run mypy codegraph` 通过；`pytest --cov=codegraph --cov-branch` 为 67 passed / codegraph coverage 97%。
