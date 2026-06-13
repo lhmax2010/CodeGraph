@@ -211,20 +211,33 @@ Codex 报风险档后：
 - 它判轻了（尤其 P7）→ `P7 验证 CodeGraph 核心价值(跨TU find_references)，定为高风险，走三路 review。`
 
 ### D. PR 后转三方 review（SOP 步骤 5，外发前先做硬检查）
-**先硬检查**：diff/PR描述/dev_memory/日志里不含内部代码路径、设备信息、受限符号名。
-然后按风险档转（高=三路 Claude+ChatGPT+Kimi，普通=两路，低=一路）：
+
+> **本项目的实际 review 链路（按工具现状定）**：
+> - **第一路 = gstack Claude（自动）**：Codex 用 `/gstack-claude`（或读 SKILL.md 跑 nested
+>   `claude -p`）对 `git diff origin/main` 自动审，结果存 `docs/review/phase_N_review_result.md`。
+>   这一路每个 Phase 都跑，不用你动手。
+> - **第二/三路 = ChatGPT + Kimi Code + Gemini（手动，Phase 收口时）**：本机没有 ChatGPT/Kimi/
+>   Gemini 的可调 CLI/API，所以**在每个 Phase 实现+gstack Claude 审完、准备 merge 前**，你开
+>   **新的 ChatGPT / Kimi Code / Gemini 会话**手动转一轮（高风险三个都上，普通档至少再上一个）。
+> - 严格说 gstack Claude + 你自己的核查已是两个异构视角；ChatGPT/Kimi/Gemini 是 merge 前的
+>   加固层，把跨模型盲区补掉。
+
+**外发前硬检查**：diff/result文件/dev_memory/日志里不含内部代码路径、设备信息、受限符号名。
+然后开新会话转（每个模型独立一份，互不告知，最后你汇总）：
 ```
-这是 CodeGraph Phase <N> 的代码改动，独立 review 找 bug，逐条标严重程度
-([BLOCKER]/[MAJOR]/[MINOR]/[NIT])。重点查：
-- 是否符合 design.md 冻结契约（§4 接口/§4.2 不变量/§4.4 路由/QR1-9），逐条对，别漏 INV18/19；
-- 不变量是否模块化（每个 INV 一个函数，非 200 行 if-elif）；
-- 预留值 log_search/exact_syntactic 是否放行而非写死白名单；
-- 所有 `X|None` 模块是否加 from __future__ import annotations（3.10 不加会崩）；
-- 是否引入第三方依赖（核心必须纯 stdlib）；
-- 是否越界做了别的 Phase 的活。
-[贴 diff]
+这是 CodeGraph（C/C++ 代码智能服务，Python 实现）Phase <N> 的代码改动，独立 review，
+逐条标严重程度（[BLOCKER]/[MAJOR]/[MINOR]/[NIT]），只挑问题不肯定优点。重点查：
+- 是否符合 design.md 冻结契约（§4 接口/§4.2 不变量/§4.4 路由/QR1-9），逐条对；
+- 不变量是否模块化（每个 INV 一个函数）；预留值 log_search/exact_syntactic 是否放行而非写死白名单；
+- 所有 X|None 模块是否加 from __future__ import annotations；
+- 是否引入第三方依赖（核心必须纯 stdlib）；frozen dataclass 有无可变/hash 隐患；
+- 是否越界做了别的 Phase 的活；测试是否覆盖"被拒非法 + 紧邻合法不误杀"两类。
+本代码已过 gstack Claude review，已知 findings：<贴 phase_N_review_result.md 的 MAJOR/MINOR>，
+请确认或反驳，并找新问题。
+[贴 git diff origin/main]
 ```
-> 第二、三路末尾加：`前一路已审，发现：<贴上一路的致命/重要 finding>，请确认或反驳并补充。`
+> 第二个模型起的会话末尾，把第一个模型的新 finding 也带上，让它确认或补充（异构交叉）。
+
 
 ### E. 汇总意见交 Codex 修（SOP 步骤 5，R14 闭环）
 ```
