@@ -80,8 +80,8 @@ resolved=resolved/unresolved 的结果可携带 negative_scope=current_tu、is_e
 ---
 
 ## 处理建议
-- 项1（BLOCKER）、项2（MAJOR）建议**接受修法**，更新 design.md 至 v1.4，P1 随之微调（加 INV20、
+- 项1（BLOCKER）、项2（MAJOR）建议**接受修法**，更新 design.md（经两轮复核定稿为 v1.4.2），P1 随之微调（加 INV20/INV21、
   QR7 注释对齐），重测 + 复核后再 merge P1。
-- 项3（MINOR）建议一并加。
+- 项3（MINOR）已加，但经复核【缩范围】：只锁 negative_scope=none；is_exhaustive 仅对 unresolved 强制 False（positive 结果允许 exhaustive=True，保留 P7 穷尽信号）。
 - 三项都是 design 层修订；P1 代码改动小（加 INV20 检查 + 测试，QR7 是 P2 的不在此实现）。
 - 本提案与 change_1.md 不冲突；change_1 的两项仍按"零改动加注"处理。

@@ -97,3 +97,4 @@
 - [2026-06-13] R14 closure：处理 review MINOR/NIT，已修 PEP604 guard、`clangd_relation_must` docstring、enum/string drift 测试、protocol stub 测试、`validate()` identity、`log_search+syntactic`、invariant order 注释、`__init__.py` docstring；`make_error_credibility source=clangd` 按 design §4.3 保留。
 - [2026-06-13] design 经 R1 变更至 v1.4（`docs/design_changes/change_2.md`），待复核后实现 INV20/21；本次只落文档，不改 P1 实现代码。
 - [2026-06-13] design 修订至 v1.4.1（`docs/design_changes/change_2.md`），待第二轮 AI 复核后实现 INV20/21；本次只核对和记录，不改 P1 实现代码。
+- [2026-06-13] design 定稿至 v1.4.2（`docs/design_changes/change_2.md`），落实第二轮复核后的 typo/交叉引用清理；契约语义不变，仍等待后续指令再实现 INV20/21。
