@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：无（stage01_metadata 已 Merge；Phase 2 未启动）
+- 当前活跃 stage：stage02_routing（开 stage / 待 restate 确认）
 - 最后已确认 stage（已 Merge）：stage01_metadata
 - 设计基线：docs/design.md v1.4.2 Frozen（2026-06-13；R1 change_2 已应用）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -12,6 +12,7 @@
 | 编号 | 名称 | 状态 | PR 链接 | Git Commit |
 |------|------|------|---------|------------|
 | stage01 | metadata | 已 Merge | N/A（按用户要求只 push 不走 PR） | `2e0d0aa` / `checkpoint/phase_1_metadata` |
+| stage02 | routing | 进行中（待 restate 确认后实现） | N/A（按用户要求只 push 不走 PR） | baseline `9e1157f` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
