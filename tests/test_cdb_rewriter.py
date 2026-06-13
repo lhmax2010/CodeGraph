@@ -2,12 +2,16 @@
 """test_cdb_rewriter.py — 用合成数据钉死改写规则(不依赖真机)。"""
 
 import os
-import tempfile
 import pytest
 
 from cdb_rewriter import (
-    RewriteConfig, RewriteStats, prefix_chroot_path,
-    rewrite_include_flag, rewrite_entry, _split_command, detect_triple,
+    RewriteConfig,
+    RewriteStats,
+    prefix_chroot_path,
+    rewrite_include_flag,
+    rewrite_entry,
+    _split_command,
+    detect_triple,
 )
 
 BR = "/home/u/GBS-ROOT/local/BUILD-ROOTS/scratch.armv7l.0"
@@ -21,21 +25,33 @@ def cfg(**kw):
 
 # ---- prefix_chroot_path ----
 
+
 def test_prefix_usr_abs():
-    assert prefix_chroot_path("/usr/include/glib-2.0", cfg()) == BR + "/usr/include/glib-2.0"
+    assert (
+        prefix_chroot_path("/usr/include/glib-2.0", cfg())
+        == BR + "/usr/include/glib-2.0"
+    )
+
 
 def test_prefix_lib_abs():
     assert prefix_chroot_path("/lib/foo", cfg()) == BR + "/lib/foo"
 
+
 def test_prefix_home_abuild():
-    assert prefix_chroot_path("/home/abuild/rpmbuild/BUILD/x", cfg()) == BR + "/home/abuild/rpmbuild/BUILD/x"
+    assert (
+        prefix_chroot_path("/home/abuild/rpmbuild/BUILD/x", cfg())
+        == BR + "/home/abuild/rpmbuild/BUILD/x"
+    )
+
 
 def test_relative_untouched():
     assert prefix_chroot_path("subdir/include", cfg()) == "subdir/include"
 
+
 def test_already_prefixed_not_doubled():
     p = BR + "/usr/include"
     assert prefix_chroot_path(p, cfg()) == p
+
 
 def test_host_source_tree_untouched():
     # 不在 chroot 根下的绝对路径(宿主机工程源码)不动
@@ -45,11 +61,17 @@ def test_host_source_tree_untouched():
 
 # ---- include flags ----
 
+
 def test_glued_I_flag():
-    assert rewrite_include_flag("-I/usr/include/dlog", cfg()) == "-I" + BR + "/usr/include/dlog"
+    assert (
+        rewrite_include_flag("-I/usr/include/dlog", cfg())
+        == "-I" + BR + "/usr/include/dlog"
+    )
+
 
 def test_glued_I_relative_untouched():
     assert rewrite_include_flag("-Isubprojects/gst", cfg()) == "-Isubprojects/gst"
+
 
 def test_glued_I_host_tree_untouched():
     src = "-I/home/u/Toolchain/codes/pkgmgr-info/include"
@@ -57,6 +79,7 @@ def test_glued_I_host_tree_untouched():
 
 
 # ---- entry: 完整改写(meson ARM 风格,command 字符串) ----
+
 
 def make_meson_entry():
     return {
@@ -111,10 +134,12 @@ def test_meson_entry_full_rewrite():
     # file 解析成基于前缀 directory 的绝对路径
     assert r["file"] == os.path.normpath(
         BR + "/home/abuild/rpmbuild/BUILD/gstreamer-1.24.11/build/"
-        "../subprojects/gstreamer/gst/gstelement.c")
+        "../subprojects/gstreamer/gst/gstelement.c"
+    )
 
 
 # ---- entry: clang driver + arguments 数组 + 内嵌 -D 路径 ----
+
 
 def test_define_embedded_path(tmp_path):
     # 造一个真实存在的 sysroot 路径,验证 -DLIB_PATH 会被前缀
@@ -125,13 +150,18 @@ def test_define_embedded_path(tmp_path):
     out = rewrite_include_flag(tok, c)
     assert br + "/usr/lib64" in out
 
+
 def test_define_pure_logic_macro_untouched():
     # 不含真实路径的 -D 不应被乱改
     assert rewrite_include_flag("-DHAVE_CONFIG_H", cfg()) == "-DHAVE_CONFIG_H"
-    assert rewrite_include_flag("-D_FILE_OFFSET_BITS=64", cfg()) == "-D_FILE_OFFSET_BITS=64"
+    assert (
+        rewrite_include_flag("-D_FILE_OFFSET_BITS=64", cfg())
+        == "-D_FILE_OFFSET_BITS=64"
+    )
 
 
 # ---- PoC 发现 2 的两个回归 ----
+
 
 def test_define_already_prefixed_no_double(tmp_path):
     # -DLIB_PATH="<root>/usr/lib64" 已带前缀,不应再加(双前缀 bug)
@@ -143,10 +173,12 @@ def test_define_already_prefixed_no_double(tmp_path):
     assert out.count(br) == 1, f"double prefix: {out}"
     assert out == tok
 
+
 def test_define_sysconfdir_etc_untouched():
     # -DSYSCONFDIR="/etc" 是运行期路径,绝不能前缀
     tok = '-DSYSCONFDIR="/etc"'
     assert rewrite_include_flag(tok, cfg()) == tok
+
 
 def test_etc_not_in_chroot_roots():
     # /etc 不应被当作 chroot include 根
@@ -155,9 +187,13 @@ def test_etc_not_in_chroot_roots():
 
 # ---- arguments vs command 都支持 ----
 
+
 def test_arguments_array_input():
-    e = {"directory": "/usr/src", "file": "a.c",
-         "arguments": ["clang", "-I/usr/include", "-c", "a.c", "-o", "a.o"]}
+    e = {
+        "directory": "/usr/src",
+        "file": "a.c",
+        "arguments": ["clang", "-I/usr/include", "-c", "a.c", "-o", "a.o"],
+    }
     toks = _split_command(e)
     assert toks[0] == "clang"
     stats = RewriteStats()
@@ -168,15 +204,18 @@ def test_arguments_array_input():
 
 # ---- triple 自动探测 ----
 
+
 def test_detect_triple_single(tmp_path):
     gccdir = tmp_path / "usr" / "lib" / "gcc" / "armv7l-tizen-linux-gnueabi" / "14.2.0"
     gccdir.mkdir(parents=True)
     assert detect_triple(str(tmp_path)) == "armv7l-tizen-linux-gnueabi"
 
+
 def test_detect_triple_lib64(tmp_path):
     gccdir = tmp_path / "usr" / "lib64" / "gcc" / "x86_64-tizen-linux-gnu" / "14.2.0"
     gccdir.mkdir(parents=True)
     assert detect_triple(str(tmp_path)) == "x86_64-tizen-linux-gnu"
+
 
 def test_detect_triple_none(tmp_path):
     assert detect_triple(str(tmp_path)) is None

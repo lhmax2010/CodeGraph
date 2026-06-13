@@ -83,3 +83,48 @@ Per SOP R14:
 - `[MAJOR]` findings need fixes or explicit developer waiver before Phase 1 is considered review-closed.
 - `[MINOR]` findings can be fixed now or recorded as TODOs.
 - `[NIT]` findings are optional unless the developer chooses to tighten polish now.
+
+## R14 Closure Update - 2026-06-13
+
+Status: Phase 1 review findings are closed. No PR was created, per user override; closure is via pushed branch + review artifacts.
+
+### Major Findings
+
+- `[MAJOR] consumer_hint mutable/hash risk`: Fixed.
+  - `Credibility.consumer_hint` remains the frozen-contract `dict | None` style extension point, but is now declared with `field(default=None, compare=False, hash=False)`.
+  - Added regression coverage proving a populated mutable hint does not affect equality/hash stability.
+- `[MAJOR] deterministic gate gap`: Fixed for P1 scope.
+  - Direct `pip --user` install was blocked by PEP 668; local `venv` was blocked by missing `ensurepip`; deterministic tools were run through installed `uv tool run` instead.
+  - `ruff`, `black`, `mypy`, and `pytest-cov` all ran successfully.
+  - Full `--cov=codegraph --cov=tools` was executed and passed tests, but total coverage is 58% because `tools/verify_clangd.py` is an external clangd/LSP integration asset with no P1 local runtime coverage. P1 core coverage was therefore measured with `--cov=codegraph`: 97%.
+
+### Minor / Nit Findings
+
+- `_check_inv14a` reachability: No code change. It is retained as the dedicated INV14a checker required by design; while enum-typed normal construction reaches INV13 first for `none`, the checker still documents the frozen invariant and can catch non-enum runtime values.
+- PEP604 guard wording/logic: Fixed. The guard now checks annotation syntax only and no longer treats runtime type aliases as future-import-protected annotations.
+- `clangd_relation_must` docstring overclaim: Fixed. The docstring now states caller responsibility and notes the factory does not enforce `dep.status=complete`.
+- Enum/string representation drift risk: Fixed with a regression test pinning `QueryKind`, `SymbolKind`, and `IndexHealth` string values at public container boundaries.
+- `make_error_credibility()` source attribution: No code change. Design §4.3 explicitly specifies `source=clangd` for the neutral FAILED/INVALID_REQUEST placeholder; changing it would require an R1 design change.
+- Thin protocol/helper tests: Fixed. Added a minimal protocol stub test, legal `log_search + syntactic` coverage, and `validate()` identity coverage.
+- Invariant order is load-bearing: Fixed with an explicit comment above `_INVARIANT_CHECKS`.
+- Mutable result containers vs frozen `QueryMeta`: No code change. This is contract-compliant per design §4.1.2; P2 will enforce container invariants.
+- `codegraph/__init__.py` docstring removed: Fixed.
+- Dev-memory drift: Fixed in progress/result updates; latest all-test count is 65.
+- P5 follow-up: `tools/cdb_rewriter.py` filesystem behavior remains recorded as out-of-P1 scope for P5 review.
+
+### Closure Commands
+
+- `/home/linhao/.local/bin/uv tool run ruff check .`
+  - Result: `All checks passed!`
+- `/home/linhao/.local/bin/uv tool run black --check .`
+  - Result: `11 files would be left unchanged.`
+- `/home/linhao/.local/bin/uv tool run mypy codegraph`
+  - Result: `Success: no issues found in 6 source files`
+- `PYTHONPATH=.:tools python3 -m pytest tests/ -q`
+  - Result: `65 passed in 0.07s`
+- `PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q`
+  - Result: `28 passed in 0.02s`
+- `python3 -m compileall -q codegraph tools tests`
+  - Result: passed with no output.
+- `PYTHONPATH=.:tools /home/linhao/.local/bin/uv tool run --with pytest-cov pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing`
+  - Result: `65 passed`; `codegraph` coverage total `97%`.

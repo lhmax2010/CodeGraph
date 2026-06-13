@@ -26,28 +26,36 @@ import threading
 import time
 from typing import Any, Optional
 
-
 # ---------------------------------------------------------------------------
 # 极简 LSP over stdio 客户端
 # ---------------------------------------------------------------------------
 
+
 class LSPClient:
-    def __init__(self, clangd_path: str, extra_args: list[str], cwd: str,
-                 verbose: bool = False):
+    def __init__(
+        self, clangd_path: str, extra_args: list[str], cwd: str, verbose: bool = False
+    ):
         self.verbose = verbose
         self._id = 0
         self._responses: dict[int, Any] = {}
         self._lock = threading.Lock()
         self._diagnostics: dict[str, list] = {}
-        args = [clangd_path,
-                "--background-index=false",   # 同步、可预测
-                "--pch-storage=memory",
-                "--log=error"] + extra_args
+        args = [
+            clangd_path,
+            "--background-index=false",  # 同步、可预测
+            "--pch-storage=memory",
+            "--log=error",
+        ] + extra_args
         if verbose:
             print(f"[lsp] launching: {' '.join(args)}", file=sys.stderr)
         self.proc = subprocess.Popen(
-            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, cwd=cwd, bufsize=0)
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            bufsize=0,
+        )
         self._stderr_lines: list[str] = []
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -62,7 +70,6 @@ class LSPClient:
                 print(f"[clangd-stderr] {s}", file=sys.stderr)
 
     def _read_loop(self):
-        buf = b""
         stream = self.proc.stdout
         while True:
             # 读 header
@@ -149,6 +156,7 @@ def path_to_uri(p: str) -> str:
 # 验证流程
 # ---------------------------------------------------------------------------
 
+
 def flatten_symbols(syms: list, depth: int = 0) -> list[dict]:
     """documentSymbol 返回可能是 DocumentSymbol(树) 或 SymbolInformation(平)。
     返回 dict 列表,带 selectionRange(符号名本身的位置,用于精确探针,
@@ -161,21 +169,38 @@ def flatten_symbols(syms: list, depth: int = 0) -> list[dict]:
             decl_line = s["range"]["start"]["line"]
             # selectionRange 指向符号名本身;没有就退回 range.start
             sel = s.get("selectionRange", s["range"])["start"]
-            out.append({"name": name, "kind": kind,
-                        "line": sel["line"], "char": sel["character"],
-                        "decl_line": decl_line})
+            out.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "line": sel["line"],
+                    "char": sel["character"],
+                    "decl_line": decl_line,
+                }
+            )
             if s.get("children"):
                 out += flatten_symbols(s["children"], depth + 1)
         elif "location" in s:  # SymbolInformation
             st = s["location"]["range"]["start"]
-            out.append({"name": name, "kind": kind,
-                        "line": st["line"], "char": st["character"],
-                        "decl_line": st["line"]})
+            out.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "line": st["line"],
+                    "char": st["character"],
+                    "decl_line": st["line"],
+                }
+            )
     return out
 
 
-def run_verification(cdb_path: str, clangd: str, files: list[str],
-                     find_func: Optional[str], verbose: bool) -> int:
+def run_verification(
+    cdb_path: str,
+    clangd: str,
+    files: list[str],
+    find_func: Optional[str],
+    verbose: bool,
+) -> int:
     # cdb_path 可为目录(推荐,clangd --compile-commands-dir 语义)或直接 json 文件
     if os.path.isdir(cdb_path):
         compile_dir = os.path.abspath(cdb_path)
@@ -187,11 +212,13 @@ def run_verification(cdb_path: str, clangd: str, files: list[str],
         print(f"FAIL: no compile_commands.json at {cdb_json}", file=sys.stderr)
         return 2
     if os.path.basename(cdb_json) != "compile_commands.json":
-        print(f"WARNING: clangd only reads a file named exactly "
-              f"'compile_commands.json'; got {os.path.basename(cdb_json)}. "
-              f"clangd will fall back to no-flags mode and results will be "
-              f"syntactic-only. Pass the containing DIRECTORY instead.",
-              file=sys.stderr)
+        print(
+            f"WARNING: clangd only reads a file named exactly "
+            f"'compile_commands.json'; got {os.path.basename(cdb_json)}. "
+            f"clangd will fall back to no-flags mode and results will be "
+            f"syntactic-only. Pass the containing DIRECTORY instead.",
+            file=sys.stderr,
+        )
     with open(cdb_json, encoding="utf-8") as fh:
         cdb = json.load(fh)
     if not cdb:
@@ -211,25 +238,33 @@ def run_verification(cdb_path: str, clangd: str, files: list[str],
         print("FAIL: no existing source files to test", file=sys.stderr)
         return 2
 
-    client = LSPClient(clangd, [f"--compile-commands-dir={compile_dir}"],
-                       cwd=compile_dir, verbose=verbose)
+    client = LSPClient(
+        clangd,
+        [f"--compile-commands-dir={compile_dir}"],
+        cwd=compile_dir,
+        verbose=verbose,
+    )
 
     ok = True
     report: dict[str, Any] = {"files": {}, "checks": []}
 
     try:
         root = compile_dir
-        client.request("initialize", {
-            "processId": os.getpid(),
-            "rootUri": path_to_uri(root),
-            "capabilities": {
-                "textDocument": {
-                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
-                    "definition": {}, "references": {},
-                    "callHierarchy": {"dynamicRegistration": False},
-                }
+        client.request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": path_to_uri(root),
+                "capabilities": {
+                    "textDocument": {
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                        "definition": {},
+                        "references": {},
+                        "callHierarchy": {"dynamicRegistration": False},
+                    }
+                },
             },
-        })
+        )
         client.notify("initialized", {})
 
         # ---- 检查 1: 每个文件能 index 出符号 ----
@@ -242,28 +277,45 @@ def run_verification(cdb_path: str, clangd: str, files: list[str],
                 print(f"  skip {f}: {e}", file=sys.stderr)
                 continue
             lang = "cpp" if f.endswith((".cc", ".cpp", ".cxx")) else "c"
-            client.notify("textDocument/didOpen", {
-                "textDocument": {"uri": uri, "languageId": lang,
-                                 "version": 1, "text": text}})
+            client.notify(
+                "textDocument/didOpen",
+                {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": lang,
+                        "version": 1,
+                        "text": text,
+                    }
+                },
+            )
             time.sleep(0.2)
-            syms = client.request("textDocument/documentSymbol", {
-                "textDocument": {"uri": uri}}, timeout=40)
+            syms = client.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": uri}},
+                timeout=40,
+            )
             flat = flatten_symbols(syms or [])
             diags = client.diagnostics_for(uri, wait=2.0)
             errs = [d for d in diags if d.get("severity") == 1]
             # file-not-found 类错误是"CDB flag 没吃到/sysroot 没接上"的铁证:
             # 语法兜底仍能吐符号(假 PASS 根源——PoC 发现 1),但 #include 必然爆这个。
-            include_errs = [d for d in errs
-                            if "file not found" in d.get("message", "").lower()
-                            or "'" in d.get("message", "") and "not found" in d.get("message", "").lower()]
+            include_errs = [
+                d
+                for d in errs
+                if "file not found" in d.get("message", "").lower()
+                or "'" in d.get("message", "")
+                and "not found" in d.get("message", "").lower()
+            ]
             report["files"][f] = {
                 "symbols": len(flat),
                 "errors": len(errs),
                 "include_not_found": len(include_errs),
                 "error_samples": [d.get("message", "")[:80] for d in errs[:3]],
             }
-            print(f"  [{os.path.basename(f)}] symbols={len(flat)} "
-                  f"errors={len(errs)}", file=sys.stderr)
+            print(
+                f"  [{os.path.basename(f)}] symbols={len(flat)} " f"errors={len(errs)}",
+                file=sys.stderr,
+            )
             if len(flat) == 0:
                 ok = False
                 print(f"    FAIL: no symbols indexed in {f}", file=sys.stderr)
@@ -286,27 +338,45 @@ def run_verification(cdb_path: str, clangd: str, files: list[str],
             name = cand["name"]
             # 用 selectionRange 的精确行列(符号名本身),不靠猜(PoC 发现 3)
             line, col = cand["line"], cand["char"]
-            print(f"  probing symbol '{name}' at {line+1}:{col+1} "
-                  f"(decl starts line {cand['decl_line']+1})", file=sys.stderr)
+            print(
+                f"  probing symbol '{name}' at {line+1}:{col+1} "
+                f"(decl starts line {cand['decl_line']+1})",
+                file=sys.stderr,
+            )
 
             try:
-                defn = client.request("textDocument/definition", {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": col}}, timeout=30)
+                defn = client.request(
+                    "textDocument/definition",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": line, "character": col},
+                    },
+                    timeout=30,
+                )
                 got_def = bool(defn)
                 report["checks"].append({"definition": got_def, "symbol": name})
-                print(f"    definition: {'OK' if got_def else 'EMPTY'}", file=sys.stderr)
+                print(
+                    f"    definition: {'OK' if got_def else 'EMPTY'}", file=sys.stderr
+                )
                 if not got_def:
-                    print("    (note: empty definition may be normal for the picked "
-                          "symbol; not necessarily a sysroot failure)", file=sys.stderr)
+                    print(
+                        "    (note: empty definition may be normal for the picked "
+                        "symbol; not necessarily a sysroot failure)",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(f"    definition ERROR: {e}", file=sys.stderr)
 
             try:
-                refs = client.request("textDocument/references", {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": col},
-                    "context": {"includeDeclaration": True}}, timeout=30)
+                refs = client.request(
+                    "textDocument/references",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": line, "character": col},
+                        "context": {"includeDeclaration": True},
+                    },
+                    timeout=30,
+                )
                 nrefs = len(refs or [])
                 report["checks"].append({"references": nrefs, "symbol": name})
                 print(f"    references: {nrefs}", file=sys.stderr)
@@ -333,26 +403,40 @@ def run_verification(cdb_path: str, clangd: str, files: list[str],
     # 凡 #include 了 sysroot 头的文件,绝不出现 file-not-found。
     # 因此 include-not-found > 0 => sysroot/CDB flag 没吃到 => 判 FAIL,即使有符号。
     if not ok or total_syms == 0:
-        print("RESULT: FAIL (clangd did not index symbols — check sysroot/CDB)",
-              file=sys.stderr)
+        print(
+            "RESULT: FAIL (clangd did not index symbols — check sysroot/CDB)",
+            file=sys.stderr,
+        )
         return 1
     if total_inf > 0:
-        print(f"RESULT: FAIL (sysroot NOT effective — {total_inf} include-not-found "
-              f"errors). clangd likely fell back to no-flags mode; symbols are "
-              f"syntactic-only. Check: is the rewritten CDB named exactly "
-              f"'compile_commands.json' in the dir you passed?", file=sys.stderr)
+        print(
+            f"RESULT: FAIL (sysroot NOT effective — {total_inf} include-not-found "
+            f"errors). clangd likely fell back to no-flags mode; symbols are "
+            f"syntactic-only. Check: is the rewritten CDB named exactly "
+            f"'compile_commands.json' in the dir you passed?",
+            file=sys.stderr,
+        )
         return 1
-    print("RESULT: PASS (clangd indexed with sysroot effective — "
-          "0 include-not-found, semantic types resolved)", file=sys.stderr)
+    print(
+        "RESULT: PASS (clangd indexed with sysroot effective — "
+        "0 include-not-found, semantic types resolved)",
+        file=sys.stderr,
+    )
     return 0
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cdb", help="rewritten compile_commands.json")
-    ap.add_argument("--clangd", default="clangd", help="clangd binary (default: host clangd)")
-    ap.add_argument("--file", action="append", default=[],
-                    help="specific source file(s) to test; repeatable")
+    ap.add_argument(
+        "--clangd", default="clangd", help="clangd binary (default: host clangd)"
+    )
+    ap.add_argument(
+        "--file",
+        action="append",
+        default=[],
+        help="specific source file(s) to test; repeatable",
+    )
     ap.add_argument("--func", default=None, help="function name to probe for def/refs")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)

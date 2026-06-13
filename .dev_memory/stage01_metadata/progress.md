@@ -29,6 +29,18 @@
 - 决策：针对 review 提出的 §2.1 future annotations 风险，补 AST 守护测试而非重复修改已合规文件。
   - 原因：当前 `factories.py`、`credibility.py`、`types.py`、`engines/protocol.py`、`tools/cdb_rewriter.py` 均已含 `from __future__ import annotations`；守护测试能防止后续新增 `|` 注解时漏加。
   - 排除的方案：重复添加 future import 或只在 progress 里口头确认。前者无效，后者不能防回归。
+- 决策：R14 闭环时不改 `docs/design.md`，直接修复可代码闭环的 MAJOR/MINOR/NIT；涉及冻结设计的建议仅记录理由。
+  - 原因：review 未发现 BLOCKER；`make_error_credibility()` 的 `source=clangd` 来自 design §4.3 明确占位规范，改它会触发 R1 设计变更。
+  - 排除的方案：新增 `Source.UNKNOWN` 或改错误占位 source。该方案会修改冻结 schema，不属于 P1 review closure。
+- 决策：`consumer_hint` 保持 `dict | None` 外部扩展语义，但从 dataclass compare/hash 中排除。
+  - 原因：review 提出的 MAJOR 可用 `field(compare=False, hash=False)` 闭环，既不改变冻结设计的扩展点，也避免可变 dict 破坏 frozen dataclass 的 hash/equality。
+  - 排除的方案：改成不可变 mapping。该方案更强，但会改变对外类型语义，可能越过 design §4.2。
+- 决策：deterministic gate 通过 `uv tool run` 执行，不把 ruff/black/mypy/pytest-cov 加入项目运行时依赖。
+  - 原因：系统 Python 受 PEP 668 管理，`pip --user` 被拒；本机缺 `ensurepip`，无法创建 venv；`uv` 已安装且可隔离执行开发检查工具。
+  - 排除的方案：用 `--break-system-packages` 覆盖系统 Python。该方案会污染系统环境。
+- 决策：覆盖率 gate 以 P1 核心范围 `codegraph` 计，`tools/verify_clangd.py` 作为外部 clangd/LSP 集成资产例外记录。
+  - 原因：全仓库 coverage 已能运行且测试通过，但 `tools/verify_clangd.py` 需要真实 clangd/LSP 环境，P1 不实现/测试该集成；P1 核心模块 coverage 为 97%。
+  - 排除的方案：为了覆盖率在 P1 伪造 verify_clangd 测试。该方案会制造低价值测试且越过 P1 目标。
 
 ## 改动摘要
 - 文件/模块：`AGENTS.md`
@@ -55,6 +67,16 @@
   - 改动内容：新增 P1 不变量、预留值、QueryMeta、QueryResult/Candidate、协议导出测试。
 - 文件/模块：`tests/test_phase1_metadata.py`
   - 改动内容：新增 §2.1 守护测试，扫描 `codegraph/` 与 `tools/` 中使用 PEP604 `|` 类型语法的文件必须声明 future annotations。
+- 文件/模块：`codegraph/credibility.py`
+  - 改动内容：`consumer_hint` 设为 opaque/non-hash-participating 字段，并补 invariant 顺序说明注释。
+- 文件/模块：`codegraph/factories.py`
+  - 改动内容：收窄 `clangd_relation_must` docstring，避免暗示工厂强制 dependency complete。
+- 文件/模块：`tests/test_phase1_metadata.py`
+  - 改动内容：新增 `consumer_hint` hash/equality、合法 `log_search+syntactic`、`validate()` identity、协议 stub、enum/string 边界测试；修正 PEP604 守护测试只检查 annotation syntax。
+- 文件/模块：Python 代码格式
+  - 改动内容：运行 black 统一格式化 P1 代码、复用资产与测试；运行 ruff 清理未使用 import/变量。
+- 文件/模块：`.gitignore`
+  - 改动内容：忽略 `.venv/`，避免本地 Python 工具环境污染 git 状态。
 
 ## 进度日志
 - [2026-06-13] 阅读 `docs/CodeGraph-SOP部署开发Guide.md`，确认一次性准备、Phase 串行策略、P1 启动要求。
@@ -64,7 +86,9 @@
 - [2026-06-13] 切分支 `phase/1-metadata`，记录 baseline 检查结果。
 - [2026-06-13] 导入复用资产并提交：`7222155`；资产基线 47 tests 通过。
 - [2026-06-13] 开始 Phase 1 编码前确认：INV17 属 P2 QR7、QueryMeta 用 frozen dataclass、预留值按 INV19 放行。
-- [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 通过 59 tests。
+- [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 当时通过 59 tests（后续补测与 R14 closure 后更新为 65 tests）。
 - [2026-06-13] 旧 credibility 回归基线单跑通过：`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 通过 28 tests。
 - [2026-06-13] Review 修复：确认 `factories.py` 已有 future import；`credibility.py` 无 PEP604 `|` 联合注解但已有 future import；`types.py` / `engines/protocol.py` 已有 future import；`tools/cdb_rewriter.py` 使用 `list[str] | None` 且已有 future import。补充 AST 守护测试防回归。
 - [2026-06-13] 安装并跑通 gstack：用户强调 gstack review 必须补齐后，安装 Bun、gstack host=codex、Claude CLI，并按 `/gstack-claude review` 的 tool-less nested Claude 流程审查 `git diff origin/main`。结果写入 `docs/review/phase_1_review_result.md`；无 BLOCKER，有 2 个 MAJOR 与若干 MINOR/NIT，待开发者决策修复/放行。
+- [2026-06-13] R14 closure：修复 `consumer_hint` MAJOR；用 `uv tool run` 补跑 ruff/black/mypy/pytest-cov gate；P1 核心 coverage `97%`；全量测试 `65 passed`，旧 `test_credibility.py` `28 passed`。
+- [2026-06-13] R14 closure：处理 review MINOR/NIT，已修 PEP604 guard、`clangd_relation_must` docstring、enum/string drift 测试、protocol stub 测试、`validate()` identity、`log_search+syntactic`、invariant order 注释、`__init__.py` docstring；`make_error_credibility source=clangd` 按 design §4.3 保留。

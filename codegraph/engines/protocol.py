@@ -35,49 +35,71 @@ class EngineObservation(Protocol):
     """Semantic engine observation interface consumed by the router."""
 
     def search_symbol(
-            self, symbol: str, *, kind_filter: str | None = None,
-            limit: int = 100, offset: int = 0,
-    ) -> EngineObservationResult:
-        ...
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult: ...
 
     def get_definition(
-            self, symbol: str, file: str, pos: Pos,
-    ) -> EngineObservationResult:
-        ...
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+    ) -> EngineObservationResult: ...
 
     def find_references(
-            self, symbol: str, file: str, pos: Pos, *,
-            limit: int = 100, offset: int = 0,
-    ) -> EngineObservationResult:
-        ...
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult: ...
 
     def find_callers(
-            self, symbol: str, file: str, pos: Pos, *,
-            limit: int = 100, offset: int = 0,
-    ) -> EngineObservationResult:
-        ...
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult: ...
 
     def find_callees(
-            self, symbol: str, file: str, pos: Pos, *,
-            limit: int = 100, offset: int = 0,
-    ) -> EngineObservationResult:
-        ...
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult: ...
 
 
 class SyntacticProvider(Protocol):
     """Syntactic fallback interface whose outputs stay in candidate channel."""
 
     def search_candidates(
-            self, symbol: str, *, kind_filter: str | None = None,
-            limit: int = 100, offset: int = 0,
-    ) -> Sequence[Candidate]:
-        ...
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Sequence[Candidate]: ...
 
     def candidates_near(
-            self, symbol: str, file: str, pos: Pos, *,
-            limit: int = 100,
-    ) -> Sequence[Candidate]:
-        ...
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+    ) -> Sequence[Candidate]: ...
 
-    def is_preprocessor_location(self, file: str, pos: Pos) -> bool:
-        ...
+    def is_preprocessor_location(self, file: str, pos: Pos) -> bool: ...

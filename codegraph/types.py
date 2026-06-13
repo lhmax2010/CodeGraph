@@ -8,7 +8,6 @@ from typing import Literal
 
 from .credibility import Credibility
 
-
 Path = str
 
 

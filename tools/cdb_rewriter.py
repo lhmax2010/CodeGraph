@@ -29,34 +29,42 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
 from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RewriteConfig:
-    buildroot: str                       # <BUILDROOT> 绝对路径(宿主机上的实际位置)
-    target: Optional[str] = None         # --target=...;None 则尝试从 buildroot 自动探测
-    inject_resource_dir: Optional[str] = None   # 仅"直调 clang 二进制"场景需要;clangd 留空
+    buildroot: str  # <BUILDROOT> 绝对路径(宿主机上的实际位置)
+    target: Optional[str] = None  # --target=...;None 则尝试从 buildroot 自动探测
+    inject_resource_dir: Optional[str] = (
+        None  # 仅"直调 clang 二进制"场景需要;clangd 留空
+    )
     # chroot 内会被加前缀的绝对路径根(只含真正可能承载 include/库的根)。
     # 注意:不含 /etc —— /etc 是目标设备的运行期路径,不是 include 根,
     # 误前缀会把 -DSYSCONFDIR="/etc" 改坏(见 PoC 发现 2)。
-    chroot_abs_roots: tuple[str, ...] = ("/usr", "/lib", "/lib64", "/opt", "/home/abuild")
+    chroot_abs_roots: tuple[str, ...] = (
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/opt",
+        "/home/abuild",
+    )
     # 语法检查无关、应丢弃的 flag(精确匹配或前缀匹配)
     drop_exact: tuple[str, ...] = ("-c", "-frecord-gcc-switches", "-pipe", "-g")
     drop_prefix: tuple[str, ...] = ("-Wa,", "-Wl,", "-Wp,", "-MF", "-MT", "-MQ")
     # 带一个独立参数、需要连参数一起丢的 flag
     drop_with_arg: tuple[str, ...] = ("-o", "-MT", "-MF", "-MQ", "-MJ")
-    keep_unknown: bool = True            # 不认识的 flag 默认保留(宁可多留)
+    keep_unknown: bool = True  # 不认识的 flag 默认保留(宁可多留)
 
 
 # ---------------------------------------------------------------------------
 # 路径改写
 # ---------------------------------------------------------------------------
+
 
 def prefix_chroot_path(path: str, cfg: RewriteConfig) -> str:
     """若 path 是 chroot 内绝对路径,加上 buildroot 前缀;否则原样返回。"""
@@ -74,7 +82,7 @@ def prefix_chroot_path(path: str, cfg: RewriteConfig) -> str:
 
 
 # -I/-isystem/-iquote/-idirafter 等带路径的 include flag
-_INCLUDE_FLAGS_GLUED = ("-I", "-iquote")          # 可能 -I/path 粘连
+_INCLUDE_FLAGS_GLUED = ("-I", "-iquote")  # 可能 -I/path 粘连
 _INCLUDE_FLAGS_SPACED = ("-isystem", "-idirafter", "-iquote", "-include", "-isysroot")
 
 
@@ -82,7 +90,7 @@ def rewrite_include_flag(tok: str, cfg: RewriteConfig) -> str:
     """处理粘连写法 -I/abs/path。返回改写后的 token。"""
     for f in _INCLUDE_FLAGS_GLUED:
         if tok.startswith(f) and len(tok) > len(f):
-            path = tok[len(f):]
+            path = tok[len(f) :]
             return f + prefix_chroot_path(path, cfg)
     # -D 里也可能内嵌 chroot 绝对路径(报告 D10: -DLIB_PATH=\"/.../usr/lib64\")
     if tok.startswith("-D") and "/" in tok:
@@ -100,6 +108,7 @@ def _rewrite_define_embedded_path(tok: str, cfg: RewriteConfig) -> str:
     (PoC 发现 2:-DLIB_PATH="<root>/usr/lib64" 旧逻辑会再加一遍)。
     保守:只在加前缀后该路径在 sysroot 里真实存在时才改,避免误伤纯逻辑/运行期宏。"""
     br = cfg.buildroot.rstrip("/")
+
     def _sub(m: re.Match) -> str:
         p = m.group(1)
         start = m.start(1)
@@ -109,6 +118,7 @@ def _rewrite_define_embedded_path(tok: str, cfg: RewriteConfig) -> str:
             return p
         cand = br + p
         return cand if os.path.exists(cand) else p
+
     return _DEFINE_PATH_RE.sub(_sub, tok)
 
 
@@ -116,13 +126,17 @@ def _rewrite_define_embedded_path(tok: str, cfg: RewriteConfig) -> str:
 # triple 自动探测
 # ---------------------------------------------------------------------------
 
+
 def detect_triple(buildroot: str) -> Optional[str]:
     """从 <BUILDROOT>/usr/lib/gcc/<triple>/ 或 usr/lib64/gcc/<triple>/ 取 triple。"""
     for libdir in ("lib", "lib64"):
         gcc_dir = os.path.join(buildroot, "usr", libdir, "gcc")
         if os.path.isdir(gcc_dir):
-            entries = [d for d in os.listdir(gcc_dir)
-                       if os.path.isdir(os.path.join(gcc_dir, d))]
+            entries = [
+                d
+                for d in os.listdir(gcc_dir)
+                if os.path.isdir(os.path.join(gcc_dir, d))
+            ]
             if len(entries) == 1:
                 return entries[0]
             # 多个时,优先含 tizen 的
@@ -135,6 +149,7 @@ def detect_triple(buildroot: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 单条 entry 改写
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RewriteStats:
@@ -239,8 +254,9 @@ def rewrite_entry(entry: dict, cfg: RewriteConfig, stats: RewriteStats) -> dict:
     return result
 
 
-def rewrite_cdb(cdb: list[dict], cfg: RewriteConfig,
-                require_file_exists: bool = True) -> tuple[list[dict], RewriteStats]:
+def rewrite_cdb(
+    cdb: list[dict], cfg: RewriteConfig, require_file_exists: bool = True
+) -> tuple[list[dict], RewriteStats]:
     stats = RewriteStats()
     out: list[dict] = []
     for entry in cdb:
@@ -262,21 +278,35 @@ def rewrite_cdb(cdb: list[dict], cfg: RewriteConfig,
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Rewrite GBS chroot CDB for host clangd.")
     ap.add_argument("input", help="path to source compile_commands.json")
-    ap.add_argument("output",
-                    help="output path. If it ends with .json, written as that file. "
-                         "Otherwise treated as a DIRECTORY and written as "
-                         "<output>/compile_commands.json (required name for clangd's "
-                         "--compile-commands-dir).")
-    ap.add_argument("--buildroot", required=True, help="<BUILDROOT> absolute path on host")
-    ap.add_argument("--target", default=None,
-                    help="target triple; auto-detected from buildroot if omitted")
-    ap.add_argument("--resource-dir", default=None,
-                    help="inject -resource-dir (only for direct-clang use; leave empty for clangd)")
-    ap.add_argument("--keep-missing-files", action="store_true",
-                    help="keep entries whose file does not exist on host")
+    ap.add_argument(
+        "output",
+        help="output path. If it ends with .json, written as that file. "
+        "Otherwise treated as a DIRECTORY and written as "
+        "<output>/compile_commands.json (required name for clangd's "
+        "--compile-commands-dir).",
+    )
+    ap.add_argument(
+        "--buildroot", required=True, help="<BUILDROOT> absolute path on host"
+    )
+    ap.add_argument(
+        "--target",
+        default=None,
+        help="target triple; auto-detected from buildroot if omitted",
+    )
+    ap.add_argument(
+        "--resource-dir",
+        default=None,
+        help="inject -resource-dir (only for direct-clang use; leave empty for clangd)",
+    )
+    ap.add_argument(
+        "--keep-missing-files",
+        action="store_true",
+        help="keep entries whose file does not exist on host",
+    )
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.buildroot):
@@ -285,8 +315,10 @@ def main(argv: list[str] | None = None) -> int:
 
     target = args.target or detect_triple(args.buildroot)
     if not target:
-        print("WARNING: could not auto-detect triple; proceeding without --target",
-              file=sys.stderr)
+        print(
+            "WARNING: could not auto-detect triple; proceeding without --target",
+            file=sys.stderr,
+        )
 
     cfg = RewriteConfig(
         buildroot=os.path.abspath(args.buildroot),
@@ -312,8 +344,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[cdb_rewriter] wrote           = {out_path}", file=sys.stderr)
     print(f"[cdb_rewriter] target          = {target}", file=sys.stderr)
-    print(f"[cdb_rewriter] entries in/out  = {stats.entries_in} / {stats.entries_out}",
-          file=sys.stderr)
+    print(
+        f"[cdb_rewriter] entries in/out  = {stats.entries_in} / {stats.entries_out}",
+        file=sys.stderr,
+    )
     print(f"[cdb_rewriter] paths prefixed  = {stats.paths_prefixed}", file=sys.stderr)
     print(f"[cdb_rewriter] tokens dropped  = {stats.tokens_dropped}", file=sys.stderr)
     print(f"[cdb_rewriter] skipped(no file)= {stats.skipped_no_file}", file=sys.stderr)

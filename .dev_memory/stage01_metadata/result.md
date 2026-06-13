@@ -1,28 +1,31 @@
 # Stage 01 - Metadata / Result
 
 ## 最终状态
-实现完成，待 Review。按用户指令，本项目只 `git push`，不创建 PR。
+实现完成，R14 review 闭环完成。按用户指令，本项目只 `git push`，不创建 PR；Phase 2 尚未启动。
 
 ## 测试情况
 - UT 结果：
-  - `PYTHONPATH=.:tools python3 -m pytest tests/ -q`：60 passed in 0.07s。
+  - `PYTHONPATH=.:tools python3 -m pytest tests/ -q`：65 passed in 0.07s。
   - `PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q`：28 passed in 0.02s。
   - `python3 -m compileall -q codegraph tools tests`：通过，无输出。
-- 覆盖率（行/分支）：未生成；`pytest-cov` 未安装，`--cov` 参数不可用。
-- 未运行成功的确定性检查：
-  - `ruff check`：`ruff` 命令不存在。
-  - `black --check .`：`black` 命令不存在。
-  - `mypy codegraph`：`mypy` 命令不存在。
-- 补测内容：新增 `tests/test_phase1_metadata.py`，覆盖 INV13-16/18/19、预留值、`make_error_credibility()`、`QueryMeta` frozen dataclass、`QueryResult`/`Candidate` 默认值、Engine/Syntactic 协议导出，以及 §2.1 future annotations 守护。
+- 确定性检查：
+  - `/home/linhao/.local/bin/uv tool run ruff check .`：All checks passed。
+  - `/home/linhao/.local/bin/uv tool run black --check .`：11 files would be left unchanged。
+  - `/home/linhao/.local/bin/uv tool run mypy codegraph`：Success, no issues in 6 source files。
+- 覆盖率（P1 核心范围）：
+  - `PYTHONPATH=.:tools /home/linhao/.local/bin/uv tool run --with pytest-cov pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing`：65 passed；`codegraph` total coverage 97%。
+  - 全仓库 `--cov=codegraph --cov=tools` 已能运行且测试通过，但 total coverage 为 58%，原因是 `tools/verify_clangd.py` 是外部 clangd/LSP 集成资产，P1 不在本地覆盖该真机/子进程路径；此项作为 coverage 例外记录。
+- 补测内容：新增 `tests/test_phase1_metadata.py`，覆盖 INV13-16/18/19、预留值、`make_error_credibility()`、`QueryMeta` frozen dataclass、`QueryResult`/`Candidate` 默认值、Engine/Syntactic 协议导出、§2.1 future annotations 守护、`consumer_hint` hash/equality、合法 `log_search+syntactic`、`validate()` identity、协议 stub、enum/string 边界。
 
 ## PR 与代码
 - PR 链接：N/A（用户明确要求不走 PR，只 push）。
-- 对应 Git Commit：本次 Phase 1 feat 提交（见 git log）
+- 对应 Git Commit：本次 Phase 1 feat + R14 closure 提交（见 git log）。
 
 ## 遗留问题 / 风险
-- 开发工具缺失：`ruff`、`black`、`mypy`、`pytest-cov` 未安装；本次无法完成 lint/type/coverage gate。
+- 本地系统 Python 受 PEP 668 管理，`pip --user` 被拒；`python3 -m venv` 因缺 `ensurepip` 被拒。已用已安装的 `uv tool run` 隔离执行 ruff/black/mypy/pytest-cov，不污染项目运行时依赖。
+- `tools/verify_clangd.py` 作为外部 clangd/LSP 集成资产未纳入 P1 coverage 门槛；后续 P3/P6/P8 真集成时应补对应验证。
 - P1 只定义协议形状，不实现 P2 QR1-9、路由状态机、P3/P4 引擎适配、P5 建库、P6+ API。
-- `tools/verify_clangd.py` 与 `tools/cdb_rewriter.py` 已作为复用资产入库，但未在 P1 中改动逻辑。
+- `tools/verify_clangd.py` 与 `tools/cdb_rewriter.py` 已作为复用资产入库；R14 中仅做 ruff/black 机械清理/格式化，未改变 P1 业务逻辑。
 
 ## 下一阶段计划
 Review 通过后，进入 Phase 2：路由判定核心 + QR1-9 容器校验。Phase 2 不得实现 P4 评分算法本身，只读取候选 relevance_score。
