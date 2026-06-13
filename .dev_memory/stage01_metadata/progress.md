@@ -67,3 +67,4 @@
 - [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 通过 59 tests。
 - [2026-06-13] 旧 credibility 回归基线单跑通过：`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 通过 28 tests。
 - [2026-06-13] Review 修复：确认 `factories.py` 已有 future import；`credibility.py` 无 PEP604 `|` 联合注解但已有 future import；`types.py` / `engines/protocol.py` 已有 future import；`tools/cdb_rewriter.py` 使用 `list[str] | None` 且已有 future import。补充 AST 守护测试防回归。
+- [2026-06-13] 安装并跑通 gstack：用户强调 gstack review 必须补齐后，安装 Bun、gstack host=codex、Claude CLI，并按 `/gstack-claude review` 的 tool-less nested Claude 流程审查 `git diff origin/main`。结果写入 `docs/review/phase_1_review_result.md`；无 BLOCKER，有 2 个 MAJOR 与若干 MINOR/NIT，待开发者决策修复/放行。
