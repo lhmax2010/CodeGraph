@@ -41,8 +41,8 @@
 - 决策：覆盖率 gate 以 P1 核心范围 `codegraph` 计，`tools/verify_clangd.py` 作为外部 clangd/LSP 集成资产例外记录。
   - 原因：全仓库 coverage 已能运行且测试通过，但 `tools/verify_clangd.py` 需要真实 clangd/LSP 环境，P1 不实现/测试该集成；P1 核心模块 coverage 为 97%。
   - 排除的方案：为了覆盖率在 P1 伪造 verify_clangd 测试。该方案会制造低价值测试且越过 P1 目标。
-- 决策：记录但不修两个设计层小项，待 design owner 决策。
-  - 原因：`_check_inv14a` 在当前 NegativeScope 三值模型下位于 INV13 后不可达，但保留独立检查函数无害；`make_error_credibility()` 使用 `source=clangd` 是 design §4.3 的明确占位规范，当前 schema 无 `Source.UNKNOWN`。
+- 决策：两个设计层小项已登记到 `docs/design_changes/change_1.md`，待 design owner 决策。
+  - 原因：`_check_inv14a` 在当前 NegativeScope 三值模型下位于 INV13 后不可达，但保留独立检查函数无害；`make_error_credibility()` 使用 `source=clangd` 是 design §4.3 的明确占位规范，当前 schema 无 `Source.UNKNOWN`。这些属于 frozen design 的注释/语义澄清项，不改 `docs/design.md`，不返工 P1。
   - 排除的方案：删除 `_check_inv14a` 或新增/替换错误占位 source。前者会弱化每个 INV 独立函数的实现形态，后者会修改冻结设计。
 
 ## 改动摘要
