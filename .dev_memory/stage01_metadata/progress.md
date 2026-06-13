@@ -95,3 +95,4 @@
 - [2026-06-13] 安装并跑通 gstack：用户强调 gstack review 必须补齐后，安装 Bun、gstack host=codex、Claude CLI，并按 `/gstack-claude review` 的 tool-less nested Claude 流程审查 `git diff origin/main`。结果写入 `docs/review/phase_1_review_result.md`；无 BLOCKER，有 2 个 MAJOR 与若干 MINOR/NIT，待开发者决策修复/放行。
 - [2026-06-13] R14 closure：修复 `consumer_hint` MAJOR；用 `uv tool run` 补跑 ruff/black/mypy/pytest-cov gate；P1 核心 coverage `97%`；全量测试 `65 passed`，旧 `test_credibility.py` `28 passed`。
 - [2026-06-13] R14 closure：处理 review MINOR/NIT，已修 PEP604 guard、`clangd_relation_must` docstring、enum/string drift 测试、protocol stub 测试、`validate()` identity、`log_search+syntactic`、invariant order 注释、`__init__.py` docstring；`make_error_credibility source=clangd` 按 design §4.3 保留。
+- [2026-06-13] design 经 R1 变更至 v1.4（`docs/design_changes/change_2.md`），待复核后实现 INV20/21；本次只落文档，不改 P1 实现代码。

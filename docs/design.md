@@ -1,14 +1,27 @@
 # CodeGraph 设计文档
 
 ## 0. 元信息
-- 版本：v1.3（规范版；前身规范外迭代版至 DESIGN v1.3）
+- 版本：v1.4（规范版；前身规范外迭代版至 DESIGN v1.3）
 - 创建时间：2026-06-11
-- 状态：**Frozen**（冻结于 2026-06-11；开发期间不得修改，变更须走 R1 提案流程）
-- 成熟度说明：本设计在进入公司规范流程前，已经过三轮多 AI 架构 review + 一轮主系统
-  对接 review，并有四项真机实测支撑（见 §2.4，风险表见 §6）。规范版又经三轮多 AI
-  评审收敛（v1.0→v1.1→v1.2→v1.3）。三轮均判"可冻结"，本版清完最后衔接缝隙。
-- 前身：本文由 CodeGraph DESIGN v1.3（规范外迭代版）按公司设计规范模板重构而来，
-  内容等价，仅结构对齐规范。原 [契约] 标记的硬约束全部保留并归入 §4。
+- 状态：**Frozen**（v1.3 冻结于 2026-06-11；v1.4 为 P1 实现期经 R1 变更后的修订，2026-06-13）
+- 成熟度说明：本设计经三轮多 AI 架构 review + 一轮主系统对接 + 三轮规范化评审冻结为 v1.3；
+  进入 Phase 1 开发后，多路代码 review（ChatGPT/Kimi/Gemini）发现冻结设计的一处契约矛盾
+  （QR7×INV9）+ 一处虚假否定漏洞，经 R1 变更（change_2.md）修订为 v1.4。
+- 前身：本文由 CodeGraph DESIGN v1.3（规范外迭代版）按公司设计规范模板重构而来。
+- **v1.4 相对 v1.3 的变更**（R1 变更 change_2.md，P1 多路 review 发现）：
+  - **[BLOCKER 修正] QR7 放宽**：candidate 的 relation 从 `==may` 改为 `∈{may, n/a}`
+    （等价 `!=must`）。原 `==may` 与 INV9（entity⟹relation=n/a）在 entity 查询候选上
+    不可联合满足，会让 P2 容器校验在最常见路径上撞不可满足契约。放宽保留"候选绝不 must"
+    真意图，兼容 INV9。涉及 §4.1.4 QR7、§4.1.2 Candidate 注释。
+  - **[MAJOR 修正] 新增 INV20**：not_found ⟹ clangd ∧ semantic ∧ ¬blind_spot_affects_result。
+    把 INV12（tree-sitter 不能 not_found）泛化为系统立身之本：只有 clangd 语义无盲区才能
+    断言"不存在"。补全了 log_search/exact_syntactic 预留只守 certainty（INV19）没守 not_found
+    的半截漏洞——原本 clangd+syntactic、log_search 等三种虚假否定能过校验。
+  - **[MINOR 修正] 新增 INV21**：resolved≠not_found ⟹ negative_scope=none ∧ ¬is_exhaustive。
+    coverage 负证明字段只在 not_found 有意义，禁 positive/unresolved 结果夹带负证明语义。
+  - 三条修订均不破坏现有工厂/测试（唯一合法 not_found 工厂 clangd_not_found 本就
+    clangd+semantic+¬blindspot）；P1 代码随之加 INV20/21 检查 + 测试。
+  - change_1.md 的两项（INV14a 冗余、make_error source 占位）仍按"零改动加注"处理，与本次无关。
 - **v1.3 相对 v1.2 的变更**（第三轮三 AI 评审收敛；三份均判"补完即可冻结"）：
   - 删除 §4.1.2 Candidate 代码块的重复粘贴残留（致命：Codex 复制会编译失败）。
   - §2.1 声明 `from __future__ import annotations` 必要性（修 3.10 下 `X|None` dataclass 运行时崩溃）。
@@ -331,7 +344,8 @@ class Result:
 class Candidate:
     data: "LocationResult | ReferenceResult"
     credibility: Credibility         # [契约] 候选 credibility 恒为：resolved=resolved（候选是
-                                     #   "找到的疑似项"非负证明，避 INV3/4）、relation=may、
+                                     #   "找到的疑似项"非负证明，避 INV3/4）、relation ∈ {may, n/a}
+                                     #   （relation 候选用 may、entity 候选用 n/a；绝不 must）、
                                      #   certainty=syntactic。由 QR7 容器级强制（不在 check_invariants，
                                      #   因单条 Credibility 不知自己是否属候选）。
                                      # source 如实标：tree-sitter→tree-sitter(active_config=unknown)；
@@ -375,9 +389,11 @@ class ImpactResult:     # get_impact（二期），MVP 桩不产出此结构
          `status∈{UNRESOLVED,FAILED,INVALID_REQUEST} ⟹ status_credibility.resolved==unresolved`
   - QR6: 所有 Result/Candidate 的 build_config_id 与 query.build_config_id 一致
   - QR7（护栏4 + 候选身份约束，**取代原 INV17**）: `∀c ∈ syntactic_candidates:
-         c.credibility.resolved==resolved ∧ c.credibility.relation==may
+         c.credibility.resolved==resolved ∧ c.credibility.relation ∈ {may, n/a}
          ∧ c.credibility.certainty==syntactic`
-         （候选恒为"找到的疑似项"：不参与负证明、不声称必然、永远语法级。
+         （候选恒为"找到的疑似项"：不参与负证明、**绝不声称 must（必然关系）**、永远语法级。
+          relation 取 {may, n/a}：relation 候选用 may，entity 候选用 n/a——因 entity 查询
+          受 INV9 约束必须 relation=n/a，故 QR7 不能强求 may，只能禁 must。
           为何在容器级而非 check_invariants：单条 Credibility 不知自己是否属候选，
           只有容器知道它在 syntactic_candidates 列表里。）
   - QR8: 所有 Result/Candidate 的 credibility.query_kind 与 query.kind 一致
@@ -480,7 +496,7 @@ consumer_hint: dict | None       # 消费方扩展点，CodeGraph 不填
 **[契约] index_health / index_backend 是 INV14 的承载字段**——没有它们 INV14 无法自动校验，
 故纳入 Credibility（index_health 同时在 QueryResult 冗余暴露给消费方，二者一致）。
 
-#### 4.2.2 不变量 INV1–INV16, INV18（check_invariants 强制；INV17 已并入容器级 QR7）
+#### 4.2.2 不变量 INV1–INV16, INV18–INV21（check_invariants 强制；INV17 已并入容器级 QR7）
 ```
 INV1  tree-sitter ⟹ syntactic            INV2  semantic ⟹ clangd
       （INV2 是【单向】蕴含：source=clangd 且 certainty=syntactic 是合法降级状态，
@@ -507,6 +523,14 @@ INV18 dependency.status=incomplete ⟹ missing≠[]；status=complete ⟹ missin
 INV19 certainty=exact_syntactic ⟹ source=log_search（二期日志匹配专用，clangd/tree-sitter
       不得用 exact_syntactic）。MVP 不产出 exact_syntactic/log_search，但 check_invariants
       对它们【放行】（视为合法但暂不产出），避免二期日志功能接入即破坏冻结契约。
+INV20 not_found ⟹ source=clangd ∧ certainty=semantic ∧ blind_spot_affects_result=False
+      （把 INV12 的「tree-sitter 不能 not_found」泛化为系统立身之本：只有 clangd 语义、
+       且本结果不受盲区影响，才有权断言"不存在"。语法级/日志级/受盲区影响的结果一律
+       不得 not_found——log_search/exact_syntactic 同样被此条挡住，补全了 INV19 只守
+       certainty 没守 not_found 的半截预留。唯一合法 not_found 来源是 clangd 语义穷尽。）
+INV21 resolved ≠ not_found ⟹ negative_scope = none ∧ is_exhaustive_within_scope = False
+      （coverage 的负证明字段只在 not_found 时有意义；positive/unresolved 结果不得夹带
+       负证明语义，防消费方误读、防 P2 路由 bug 漏出陈旧 coverage。）
 （原 INV17 "Candidate⟹relation=may" 移至容器级 QR7——单条 Credibility 不知自己是否属候选，
   必须在容器扫 syntactic_candidates 列表时校验。）
 兼容矩阵:
