@@ -18,9 +18,9 @@ credibility.py — CodeGraph 查询结果的可信度元数据模型。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -30,11 +30,13 @@ from typing import Optional
 class Source(str, Enum):
     CLANGD = "clangd"
     TREE_SITTER = "tree-sitter"
+    LOG_SEARCH = "log_search"
 
 
 class Certainty(str, Enum):
     SEMANTIC = "semantic"
     SYNTACTIC = "syntactic"
+    EXACT_SYNTACTIC = "exact_syntactic"
 
 
 class Relation(str, Enum):
@@ -59,13 +61,58 @@ class DepScopeLevel(str, Enum):
     QUERY_LOCAL = "query_local"            # 仅本结果所需依赖闭包
     TRANSLATION_UNIT = "translation_unit"  # 整个 TU
     GLOBAL = "global"                      # 整个工程
-    NOT_APPLICABLE = "n/a"                 # 不依赖编译环境(tree-sitter)
+    NOT_APPLICABLE = "n_a"                 # 不依赖编译环境(tree-sitter)
 
 
 class DepStatus(str, Enum):
     COMPLETE = "complete"      # 该 scope 内依赖齐全
     INCOMPLETE = "incomplete"  # 有缺失(missing 非空)
     UNKNOWN = "unknown"        # 无法判定缺失是否影响本结果 —— 存疑从严
+
+
+class IndexScope(str, Enum):
+    CURRENT_TU = "current_tu"
+    INDEXED_PROJECT = "indexed_project"
+    GLOBAL = "global"
+    EXTERNAL_KNOWN = "external_known"
+    EXTERNAL_UNKNOWN = "external_unknown"
+
+
+class NegativeScope(str, Enum):
+    CURRENT_TU = "current_tu"
+    INDEXED_PROJECT = "indexed_project"
+    NONE = "none"
+
+
+class ActiveConfig(str, Enum):
+    HOST = "host"
+    TARGET = "target"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
+class IndexHealth(str, Enum):
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    UNKNOWN = "unknown"
+
+
+class IndexBackend(str, Enum):
+    BACKGROUND_INDEX = "background-index"
+    CLANGD_INDEXER = "clangd-indexer"
+
+
+class SymbolKind(str, Enum):
+    ORDINARY_FUNCTION = "ordinary_function"
+    ORDINARY_VARIABLE = "ordinary_variable"
+    TYPE = "type"
+    MACRO = "macro"
+    FUNC_POINTER = "func_pointer"
+    VIRTUAL = "virtual"
+    WEAK = "weak"
+    INLINE_ASM = "inline_asm"
+    CROSS_SO = "cross_so"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -78,6 +125,10 @@ class DependencyScope:
     level: DepScopeLevel
     status: DepStatus
     missing: tuple[str, ...] = ()   # 缺失的头/TU 列表;仅 INCOMPLETE 时应非空
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.missing, tuple):
+            object.__setattr__(self, "missing", tuple(self.missing))
 
     @staticmethod
     def not_applicable() -> "DependencyScope":
@@ -99,6 +150,14 @@ class DependencyScope:
         return DependencyScope(level=level, status=DepStatus.UNKNOWN)
 
 
+@dataclass(frozen=True)
+class Coverage:
+    """本条结果的索引/负证明覆盖范围。"""
+    index_scope: IndexScope = IndexScope.CURRENT_TU
+    is_exhaustive_within_scope: bool = False
+    negative_scope: NegativeScope = NegativeScope.NONE
+
+
 # ---------------------------------------------------------------------------
 # 核心数据(纯 dataclass,不依赖 pydantic)
 # ---------------------------------------------------------------------------
@@ -112,6 +171,12 @@ class Credibility:
     resolved: Resolved
     query_kind: QueryKind
     dependency: DependencyScope
+    coverage: Coverage = Coverage()
+    active_config: ActiveConfig = ActiveConfig.UNKNOWN
+    build_config_id: str = "unknown"
+    symbol_kind: SymbolKind = SymbolKind.UNKNOWN
+    index_health: IndexHealth = IndexHealth.UNKNOWN
+    index_backend: IndexBackend = IndexBackend.BACKGROUND_INDEX
     blind_spot_nearby: bool = False     # 附近存在盲区(信息性,不触发降级)
     blind_spot_affects_result: bool = False  # 盲区影响本结果(进硬不变量)
     # 消费方扩展点:CodeGraph 自己永远不填,留给主系统贴业务标注(如"够判责")。
@@ -159,62 +224,215 @@ def check_invariants(c: Credibility) -> None:
           语法引擎无权断言"确实不存在";它的"没看到"只能是 unresolved。
           (这条 review 未覆盖,设计时自查发现:tree-sitter 的 not_applicable
            依赖使其能绕过 INV6,故需单独一条挡住。)
+    INV13 not_found => exhaustive 且 negative_scope!=none。
+    INV14 not_found 负证明范围被 index_health/index_backend 钳制。
+    INV15 not_found => symbol_kind 属于可穷尽集合。
+    INV16 tree-sitter => active_config=unknown。
+    INV18 dependency.status 与 missing 一致; level=n_a 不参与 not_found 证明。
+    INV19 exact_syntactic => source=log_search。log_search/exact_syntactic 是二期
+          预留值,合法组合放行,不得写死 MVP 白名单。
     """
-    src, cert, rel, res = c.source, c.certainty, c.relation, c.resolved
-    dep = c.dependency
+    for checker in _INVARIANT_CHECKS:
+        checker(c)
 
-    # INV1
-    if src == Source.TREE_SITTER and cert != Certainty.SYNTACTIC:
+
+def _check_inv1(c: Credibility) -> None:
+    if c.source == Source.TREE_SITTER and c.certainty != Certainty.SYNTACTIC:
         raise InvariantError("INV1",
             "tree-sitter source must carry syntactic certainty")
-    # INV2
+
+
+def _check_inv2(c: Credibility) -> None:
+    cert, src = c.certainty, c.source
     if cert == Certainty.SEMANTIC and src != Source.CLANGD:
         raise InvariantError("INV2",
             "semantic certainty must come from clangd")
-    # INV3 / INV4
-    if res in (Resolved.UNRESOLVED, Resolved.NOT_FOUND) and rel != Relation.NA:
+
+
+def _check_inv3(c: Credibility) -> None:
+    if c.resolved == Resolved.UNRESOLVED and c.relation != Relation.NA:
         raise InvariantError("INV3_4",
-            f"resolved={res.value} requires relation=n/a, got {rel.value}")
-    # INV5
+            f"resolved={c.resolved.value} requires relation=n/a, got {c.relation.value}")
+
+
+def _check_inv4(c: Credibility) -> None:
+    if c.resolved == Resolved.NOT_FOUND and c.relation != Relation.NA:
+        raise InvariantError("INV3_4",
+            f"resolved={c.resolved.value} requires relation=n/a, got {c.relation.value}")
+
+
+def _check_inv5(c: Credibility) -> None:
     if c.blind_spot_affects_result:
-        if cert == Certainty.SEMANTIC:
+        if c.certainty == Certainty.SEMANTIC:
             raise InvariantError("INV5",
                 "blind_spot_affects_result forbids semantic certainty")
-        if rel == Relation.MUST:
+        if c.relation == Relation.MUST:
             raise InvariantError("INV5",
                 "blind_spot_affects_result forbids must relation")
-    # INV6
-    if res == Resolved.NOT_FOUND and dep.status != DepStatus.COMPLETE:
+
+
+def _check_inv6(c: Credibility) -> None:
+    if c.resolved == Resolved.NOT_FOUND and c.dependency.status != DepStatus.COMPLETE:
         raise InvariantError("INV6",
-            f"not_found requires dependency.status=complete, got {dep.status.value} "
+            f"not_found requires dependency.status=complete, got {c.dependency.status.value} "
             f"(incomplete/unknown deps mean we cannot see, not that it's absent)")
-    # INV7
-    if dep.status == DepStatus.UNKNOWN and res == Resolved.NOT_FOUND:
+
+
+def _check_inv7(c: Credibility) -> None:
+    if c.dependency.status == DepStatus.UNKNOWN and c.resolved == Resolved.NOT_FOUND:
         raise InvariantError("INV7",
             "dependency.status=unknown forbids not_found (downgrade to unresolved)")
-    # INV8
-    if rel == Relation.MUST and cert != Certainty.SEMANTIC:
+
+
+def _check_inv8(c: Credibility) -> None:
+    if c.relation == Relation.MUST and c.certainty != Certainty.SEMANTIC:
         raise InvariantError("INV8",
             "must relation requires semantic certainty")
-    # INV9
-    if c.query_kind == QueryKind.ENTITY and rel != Relation.NA:
+
+
+def _check_inv9(c: Credibility) -> None:
+    if c.query_kind == QueryKind.ENTITY and c.relation != Relation.NA:
         raise InvariantError("INV9",
-            f"entity query requires relation=n/a, got {rel.value}")
-    # INV10
-    if src == Source.TREE_SITTER and dep.status == DepStatus.INCOMPLETE:
+            f"entity query requires relation=n/a, got {c.relation.value}")
+
+
+def _check_inv10(c: Credibility) -> None:
+    if c.source == Source.TREE_SITTER and c.dependency.status == DepStatus.INCOMPLETE:
         raise InvariantError("INV10",
             "tree-sitter does not consume compile deps; must not be 'incomplete' "
             "(use level=n/a)")
-    # INV11
-    if rel == Relation.MUST and res != Resolved.RESOLVED:
+
+
+def _check_inv11(c: Credibility) -> None:
+    if c.relation == Relation.MUST and c.resolved != Resolved.RESOLVED:
         raise InvariantError("INV11",
-            f"must relation requires resolved=resolved, got {res.value}")
-    # INV12
-    if src == Source.TREE_SITTER and res == Resolved.NOT_FOUND:
+            f"must relation requires resolved=resolved, got {c.resolved.value}")
+
+
+def _check_inv12(c: Credibility) -> None:
+    if c.source == Source.TREE_SITTER and c.resolved == Resolved.NOT_FOUND:
         raise InvariantError("INV12",
             "tree-sitter cannot assert not_found: syntactic analysis has no "
             "authority to claim 'truly absent'. Use unresolved instead "
             "('not seen syntactically' != 'confirmed absent').")
+
+
+def _check_inv13(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if not c.coverage.is_exhaustive_within_scope:
+        raise InvariantError("INV13",
+            "not_found requires coverage.is_exhaustive_within_scope=True")
+    if c.coverage.negative_scope == NegativeScope.NONE:
+        raise InvariantError("INV13",
+            "not_found requires coverage.negative_scope != none")
+
+
+def _check_inv14a(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if c.coverage.negative_scope not in (
+            NegativeScope.CURRENT_TU, NegativeScope.INDEXED_PROJECT):
+        raise InvariantError("INV14A",
+            "not_found negative_scope must be current_tu or indexed_project")
+
+
+def _check_inv14b(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if (c.index_health in (IndexHealth.INCOMPLETE, IndexHealth.UNKNOWN)
+            and c.coverage.negative_scope == NegativeScope.INDEXED_PROJECT):
+        raise InvariantError("INV14B",
+            "incomplete/unknown index_health forbids indexed_project not_found")
+
+
+def _check_inv14c(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if (c.index_backend == IndexBackend.BACKGROUND_INDEX
+            and c.coverage.negative_scope == NegativeScope.INDEXED_PROJECT):
+        raise InvariantError("INV14C",
+            "background-index forbids indexed_project not_found")
+
+
+def _check_negative_scope_index_scope(c: Credibility) -> None:
+    neg, idx = c.coverage.negative_scope, c.coverage.index_scope
+    if neg == NegativeScope.INDEXED_PROJECT and idx not in (
+            IndexScope.INDEXED_PROJECT, IndexScope.GLOBAL):
+        raise InvariantError("INV14_MATRIX",
+            "negative_scope=indexed_project requires indexed_project/global index_scope")
+    if neg == NegativeScope.CURRENT_TU and idx not in (
+            IndexScope.CURRENT_TU, IndexScope.INDEXED_PROJECT):
+        raise InvariantError("INV14_MATRIX",
+            "negative_scope=current_tu requires current_tu/indexed_project index_scope")
+    if neg == NegativeScope.NONE and c.resolved == Resolved.NOT_FOUND:
+        raise InvariantError("INV14_MATRIX",
+            "negative_scope=none forbids resolved=not_found")
+
+
+def _check_inv15(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if c.symbol_kind not in _EXHAUSTIVE_SYMBOL_KINDS:
+        raise InvariantError("INV15",
+            f"not_found cannot be asserted for symbol_kind={c.symbol_kind.value}")
+
+
+def _check_inv16(c: Credibility) -> None:
+    if c.source == Source.TREE_SITTER and c.active_config != ActiveConfig.UNKNOWN:
+        raise InvariantError("INV16",
+            "tree-sitter results must carry active_config=unknown")
+
+
+def _check_inv18(c: Credibility) -> None:
+    dep = c.dependency
+    if dep.status == DepStatus.INCOMPLETE and not dep.missing:
+        raise InvariantError("INV18",
+            "dependency.status=incomplete requires missing to be non-empty")
+    if dep.status == DepStatus.COMPLETE and dep.missing:
+        raise InvariantError("INV18",
+            "dependency.status=complete requires missing to be empty")
+    if dep.level == DepScopeLevel.NOT_APPLICABLE and c.resolved == Resolved.NOT_FOUND:
+        raise InvariantError("INV18",
+            "dependency.level=n_a cannot participate in not_found proof")
+
+
+def _check_inv19(c: Credibility) -> None:
+    if (c.certainty == Certainty.EXACT_SYNTACTIC
+            and c.source != Source.LOG_SEARCH):
+        raise InvariantError("INV19",
+            "exact_syntactic certainty is reserved for log_search source")
+
+
+_EXHAUSTIVE_SYMBOL_KINDS = frozenset({
+    SymbolKind.ORDINARY_FUNCTION,
+    SymbolKind.ORDINARY_VARIABLE,
+    SymbolKind.TYPE,
+})
+
+_INVARIANT_CHECKS: tuple[Callable[[Credibility], None], ...] = (
+    _check_inv1,
+    _check_inv2,
+    _check_inv3,
+    _check_inv4,
+    _check_inv5,
+    _check_inv6,
+    _check_inv7,
+    _check_inv8,
+    _check_inv9,
+    _check_inv10,
+    _check_inv11,
+    _check_inv12,
+    _check_inv13,
+    _check_inv14a,
+    _check_inv14b,
+    _check_inv14c,
+    _check_negative_scope_index_scope,
+    _check_inv15,
+    _check_inv16,
+    _check_inv18,
+    _check_inv19,
+)
 
 
 # linter 级别的"软"检查:不阻断,只提示可疑组合(不进硬不变量,见 review inv10 讨论)

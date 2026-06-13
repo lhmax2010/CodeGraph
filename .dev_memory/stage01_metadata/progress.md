@@ -11,6 +11,21 @@
 - 决策：P1 编码暂停，先等待复用资产或开发者确认重建。
   - 原因：当前仓库缺少 guide 要求的旧 `credibility.py` / `factories.py` / 28 测试，P1 不能声称“扩展且不破旧测试”。
   - 排除的方案：直接从设计重写 P1。该方案与“复用资产不重写”硬约束冲突，除非开发者明确授权。
+- 决策：复用资产已补入后，在旧 `credibility.py` / `factories.py` 上增量扩展，不重写资产逻辑。
+  - 原因：资产基线 `PYTHONPATH=.:tools python3 -m pytest tests/ -q` 已通过 47 tests，满足 P1 红线前置。
+  - 排除的方案：删除旧实现从 design 重建。该方案会丢失已验证 PoC 行为。
+- 决策：P1 不实现 INV17。
+  - 原因：design.md 明确原 INV17 已并入容器级 QR7，QR1-9 属 P2。
+  - 排除的方案：在 `check_invariants` 中强行校验候选身份。单条 Credibility 不知道自身是否属于 syntactic_candidates。
+- 决策：`QueryMeta` 使用 `@dataclass(frozen=True)`，不用 TypedDict。
+  - 原因：design.md §4.1.2 已拍板，避免 3.10/3.11 分叉；字段为 kind/symbol/build_config_id 必填，file/pos 可选。
+  - 排除的方案：TypedDict/NotRequired。该方案与冻结契约冲突。
+- 决策：预留值按 INV19 放行并校验，不写死 source/certainty 白名单。
+  - 原因：`log_search` / `exact_syntactic` 是二期预留 schema，P1 需要允许合法组合并拒绝非法组合。
+  - 排除的方案：仅允许 clangd/tree-sitter 或 semantic/syntactic。该方案会破坏冻结契约的二期兼容性。
+- 决策：删除传输容器 `codegraph_assets.tar.gz` 并加入 `.gitignore`；将 `ASSETS_README.md` 移入 `docs/reuse-assets.md`。
+  - 原因：压缩包资产已解压且冗余，不该入库；资产说明有后续接手价值，保留在 docs 更合适。
+  - 排除的方案：保留根目录未跟踪文件。该方案会污染后续 `git status`。
 
 ## 改动摘要
 - 文件/模块：`AGENTS.md`
@@ -21,6 +36,20 @@
   - 改动内容：创建 `codegraph/`、`codegraph/engines/`、`tools/`、`tests/`、docs 标准子目录与 checkpoints 文件。
 - 文件/模块：`docs/review/design_review_phase_1.md`
   - 改动内容：记录 Phase 1 启动前设计 review。
+- 文件/模块：`.gitignore`
+  - 改动内容：忽略 Python 缓存与 `codegraph_assets.tar.gz`。
+- 文件/模块：`docs/reuse-assets.md`
+  - 改动内容：保存复用资产包说明，替代根目录未跟踪 `ASSETS_README.md`。
+- 文件/模块：`codegraph/credibility.py`
+  - 改动内容：扩展 Source/Certainty/Coverage/active_config/index/symbol/dependency schema，新增 INV13-16/18/19，保留 INV17 给 P2 QR7。
+- 文件/模块：`codegraph/factories.py`
+  - 改动内容：旧 factory 签名保持兼容，补充新字段参数与 `make_error_credibility()`。
+- 文件/模块：`codegraph/types.py`
+  - 改动内容：定义 §4.1 Pos/Range/SymbolId/QueryStatus/IssueCode/QueryMeta/Note/QueryResult/Result/Candidate/Result data schema。
+- 文件/模块：`codegraph/engines/protocol.py`
+  - 改动内容：定义 P1 的 EngineObservation/SyntacticProvider 协议形状。
+- 文件/模块：`tests/test_phase1_metadata.py`
+  - 改动内容：新增 P1 不变量、预留值、QueryMeta、QueryResult/Candidate、协议导出测试。
 
 ## 进度日志
 - [2026-06-13] 阅读 `docs/CodeGraph-SOP部署开发Guide.md`，确认一次性准备、Phase 串行策略、P1 启动要求。
@@ -28,3 +57,7 @@
 - [2026-06-13] 完成环境预检：Git/Codex/GitHub CLI 可用；Python 需用 `python3`；Node/npm/Bun 缺失。
 - [2026-06-13] 创建初始化骨架并提交 baseline：`804d50c`。
 - [2026-06-13] 切分支 `phase/1-metadata`，记录 baseline 检查结果。
+- [2026-06-13] 导入复用资产并提交：`7222155`；资产基线 47 tests 通过。
+- [2026-06-13] 开始 Phase 1 编码前确认：INV17 属 P2 QR7、QueryMeta 用 frozen dataclass、预留值按 INV19 放行。
+- [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 通过 59 tests。
+- [2026-06-13] 旧 credibility 回归基线单跑通过：`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 通过 28 tests。
