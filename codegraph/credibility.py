@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable
 
 # ---------------------------------------------------------------------------
 # 枚举(用 str Enum,JSON 友好)
@@ -171,7 +171,11 @@ class Coverage:
 
 @dataclass(frozen=True)
 class Credibility:
-    """一条查询结果的可信度元数据。"""
+    """一条查询结果的可信度元数据。
+
+    consumer_hint 是消费方业务标注的不透明袋子，不参与 credibility
+    的相等性/hash 判断。
+    """
 
     source: Source
     certainty: Certainty
@@ -189,7 +193,7 @@ class Credibility:
     blind_spot_affects_result: bool = False  # 盲区影响本结果(进硬不变量)
     # 消费方扩展点:CodeGraph 自己永远不填。该字段是外部 opaque 标注,
     # 不参与 Credibility 的相等性或哈希,避免可变 dict 破坏 frozen dataclass 语义。
-    consumer_hint: Optional[dict] = field(default=None, compare=False, hash=False)
+    consumer_hint: dict | None = field(default=None, compare=False, hash=False)
 
 
 # ---------------------------------------------------------------------------

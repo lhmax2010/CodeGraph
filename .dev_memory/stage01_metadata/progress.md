@@ -41,6 +41,9 @@
 - 决策：覆盖率 gate 以 P1 核心范围 `codegraph` 计，`tools/verify_clangd.py` 作为外部 clangd/LSP 集成资产例外记录。
   - 原因：全仓库 coverage 已能运行且测试通过，但 `tools/verify_clangd.py` 需要真实 clangd/LSP 环境，P1 不实现/测试该集成；P1 核心模块 coverage 为 97%。
   - 排除的方案：为了覆盖率在 P1 伪造 verify_clangd 测试。该方案会制造低价值测试且越过 P1 目标。
+- 决策：记录但不修两个设计层小项，待 design owner 决策。
+  - 原因：`_check_inv14a` 在当前 NegativeScope 三值模型下位于 INV13 后不可达，但保留独立检查函数无害；`make_error_credibility()` 使用 `source=clangd` 是 design §4.3 的明确占位规范，当前 schema 无 `Source.UNKNOWN`。
+  - 排除的方案：删除 `_check_inv14a` 或新增/替换错误占位 source。前者会弱化每个 INV 独立函数的实现形态，后者会修改冻结设计。
 
 ## 改动摘要
 - 文件/模块：`AGENTS.md`
@@ -86,7 +89,7 @@
 - [2026-06-13] 切分支 `phase/1-metadata`，记录 baseline 检查结果。
 - [2026-06-13] 导入复用资产并提交：`7222155`；资产基线 47 tests 通过。
 - [2026-06-13] 开始 Phase 1 编码前确认：INV17 属 P2 QR7、QueryMeta 用 frozen dataclass、预留值按 INV19 放行。
-- [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 当时通过 59 tests（后续补测与 R14 closure 后更新为 65 tests）。
+- [2026-06-13] 完成 Phase 1 元数据实现与 R14 补测；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 当前通过 65 tests。
 - [2026-06-13] 旧 credibility 回归基线单跑通过：`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 通过 28 tests。
 - [2026-06-13] Review 修复：确认 `factories.py` 已有 future import；`credibility.py` 无 PEP604 `|` 联合注解但已有 future import；`types.py` / `engines/protocol.py` 已有 future import；`tools/cdb_rewriter.py` 使用 `list[str] | None` 且已有 future import。补充 AST 守护测试防回归。
 - [2026-06-13] 安装并跑通 gstack：用户强调 gstack review 必须补齐后，安装 Bun、gstack host=codex、Claude CLI，并按 `/gstack-claude review` 的 tool-less nested Claude 流程审查 `git diff origin/main`。结果写入 `docs/review/phase_1_review_result.md`；无 BLOCKER，有 2 个 MAJOR 与若干 MINOR/NIT，待开发者决策修复/放行。
