@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：无（一次性准备完成后启动 Phase 1）
+- 当前活跃 stage：stage01_metadata（准备中；编码因复用资产缺失暂停）
 - 最后已确认 stage（已 Merge）：无
 - 设计基线：docs/design.md v1.3 Frozen（2026-06-11）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -11,6 +11,7 @@
 ## stage 列表
 | 编号 | 名称 | 状态 | PR 链接 | Git Commit |
 |------|------|------|---------|------------|
+| stage01 | metadata | 准备中 | - | baseline 804d50c |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
