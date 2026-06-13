@@ -26,6 +26,9 @@
 - 决策：删除传输容器 `codegraph_assets.tar.gz` 并加入 `.gitignore`；将 `ASSETS_README.md` 移入 `docs/reuse-assets.md`。
   - 原因：压缩包资产已解压且冗余，不该入库；资产说明有后续接手价值，保留在 docs 更合适。
   - 排除的方案：保留根目录未跟踪文件。该方案会污染后续 `git status`。
+- 决策：针对 review 提出的 §2.1 future annotations 风险，补 AST 守护测试而非重复修改已合规文件。
+  - 原因：当前 `factories.py`、`credibility.py`、`types.py`、`engines/protocol.py`、`tools/cdb_rewriter.py` 均已含 `from __future__ import annotations`；守护测试能防止后续新增 `|` 注解时漏加。
+  - 排除的方案：重复添加 future import 或只在 progress 里口头确认。前者无效，后者不能防回归。
 
 ## 改动摘要
 - 文件/模块：`AGENTS.md`
@@ -50,6 +53,8 @@
   - 改动内容：定义 P1 的 EngineObservation/SyntacticProvider 协议形状。
 - 文件/模块：`tests/test_phase1_metadata.py`
   - 改动内容：新增 P1 不变量、预留值、QueryMeta、QueryResult/Candidate、协议导出测试。
+- 文件/模块：`tests/test_phase1_metadata.py`
+  - 改动内容：新增 §2.1 守护测试，扫描 `codegraph/` 与 `tools/` 中使用 PEP604 `|` 类型语法的文件必须声明 future annotations。
 
 ## 进度日志
 - [2026-06-13] 阅读 `docs/CodeGraph-SOP部署开发Guide.md`，确认一次性准备、Phase 串行策略、P1 启动要求。
@@ -61,3 +66,4 @@
 - [2026-06-13] 开始 Phase 1 编码前确认：INV17 属 P2 QR7、QueryMeta 用 frozen dataclass、预留值按 INV19 放行。
 - [2026-06-13] 完成 Phase 1 元数据实现；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` 通过 59 tests。
 - [2026-06-13] 旧 credibility 回归基线单跑通过：`PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q` 通过 28 tests。
+- [2026-06-13] Review 修复：确认 `factories.py` 已有 future import；`credibility.py` 无 PEP604 `|` 联合注解但已有 future import；`types.py` / `engines/protocol.py` 已有 future import；`tools/cdb_rewriter.py` 使用 `list[str] | None` 且已有 future import。补充 AST 守护测试防回归。

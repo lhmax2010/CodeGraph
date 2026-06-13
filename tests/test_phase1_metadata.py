@@ -1,3 +1,5 @@
+import ast
+from pathlib import Path
 from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
@@ -41,6 +43,7 @@ from codegraph.types import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DEP_OK = DependencyScope.complete()
 NF_CURRENT_TU = Coverage(
     index_scope=IndexScope.CURRENT_TU,
@@ -278,3 +281,51 @@ def test_engine_protocol_module_exports_phase1_shapes():
     assert observation.locations == ()
     assert observation.references == ()
     assert observation.call_edges == ()
+
+
+def _contains_pep604_union(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.BinOp) and isinstance(child.op, ast.BitOr)
+        for child in ast.walk(node)
+    )
+
+
+def _has_future_annotations(tree: ast.Module) -> bool:
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
+
+
+def _uses_pep604_type_syntax(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and node.annotation is not None:
+            if _contains_pep604_union(node.annotation):
+                return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations = [arg.annotation for arg in node.args.args]
+            annotations.extend(arg.annotation for arg in node.args.kwonlyargs)
+            annotations.extend(
+                arg.annotation for arg in (node.args.posonlyargs if hasattr(node.args, "posonlyargs") else [])
+            )
+            annotations.extend([node.args.vararg.annotation if node.args.vararg else None])
+            annotations.extend([node.args.kwarg.annotation if node.args.kwarg else None])
+            annotations.extend([node.returns])
+            if any(annotation is not None and _contains_pep604_union(annotation) for annotation in annotations):
+                return True
+        if isinstance(node, ast.Assign) and _contains_pep604_union(node.value):
+            return True
+    return False
+
+
+def test_pep604_union_syntax_requires_future_annotations():
+    checked_roots = (REPO_ROOT / "codegraph", REPO_ROOT / "tools")
+    offenders: list[str] = []
+    for root in checked_roots:
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            if _uses_pep604_type_syntax(tree) and not _has_future_annotations(tree):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == []

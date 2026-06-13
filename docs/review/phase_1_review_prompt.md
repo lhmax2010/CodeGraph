@@ -34,7 +34,7 @@ CodeGraph Phase 1：元数据层 + 数据结构 + 引擎观察协议。
 
 ## 已执行命令
 - `PYTHONPATH=.:tools python3 -m pytest tests/ -q`
-  - 结果：59 passed in 0.05s。
+  - 结果：60 passed in 0.07s。
 - `PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q`
   - 结果：28 passed in 0.02s。
 - `python3 -m compileall -q codegraph tools tests`

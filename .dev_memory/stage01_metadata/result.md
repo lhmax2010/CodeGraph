@@ -5,7 +5,7 @@
 
 ## 测试情况
 - UT 结果：
-  - `PYTHONPATH=.:tools python3 -m pytest tests/ -q`：59 passed in 0.05s。
+  - `PYTHONPATH=.:tools python3 -m pytest tests/ -q`：60 passed in 0.07s。
   - `PYTHONPATH=.:tools python3 -m pytest tests/test_credibility.py -q`：28 passed in 0.02s。
   - `python3 -m compileall -q codegraph tools tests`：通过，无输出。
 - 覆盖率（行/分支）：未生成；`pytest-cov` 未安装，`--cov` 参数不可用。
@@ -13,7 +13,7 @@
   - `ruff check`：`ruff` 命令不存在。
   - `black --check .`：`black` 命令不存在。
   - `mypy codegraph`：`mypy` 命令不存在。
-- 补测内容：新增 `tests/test_phase1_metadata.py`，覆盖 INV13-16/18/19、预留值、`make_error_credibility()`、`QueryMeta` frozen dataclass、`QueryResult`/`Candidate` 默认值、Engine/Syntactic 协议导出。
+- 补测内容：新增 `tests/test_phase1_metadata.py`，覆盖 INV13-16/18/19、预留值、`make_error_credibility()`、`QueryMeta` frozen dataclass、`QueryResult`/`Candidate` 默认值、Engine/Syntactic 协议导出，以及 §2.1 future annotations 守护。
 
 ## PR 与代码
 - PR 链接：N/A（用户明确要求不走 PR，只 push）。
