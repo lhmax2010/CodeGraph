@@ -11,11 +11,13 @@
 做：
 - 新增/扩展 `codegraph/routing.py`，实现 P2 路由核心与容器校验。
 - QR1-9 全部进入 `check_query_result_invariants()`，并测试矛盾容器被拒。
+- QR1 必须按双向 `status==OK ⟺ len(semantic_results)>0` 实现：既拒绝 `OK` 无语义结果，也拒绝有语义结果却标 `UNRESOLVED`/`NOT_FOUND` 等非 OK 状态。
 - 路由所有返回路径强制过单条 `check_invariants()` 与容器 `check_query_result_invariants()`。
 - 用 P1 的 `EngineObservation` / `SyntacticProvider` 协议和测试桩开发，不依赖 P3/P4 真实适配器。
 - 护栏3 只按阈值过滤：精确查询阈值 20，`search_symbol` 阈值 15；分数由 Mock/桩注入。
 - QR7 按 v1.4.2 执行：候选 `relation ∈ {may, n/a}`，entity 候选用 `n/a`，relation 候选用 `may`，绝不 `must`。
 - §4.4 降级规则：缺要素1/2/4 降级入候选；缺要素1 带 `DEPENDENCY_INCOMPLETE`，缺要素4 带 `SYMBOL_AMBIGUOUS`；全部不可信时返回 `UNRESOLVED`，不进入 not_found。
+- 状态机必须把“clangd 返回了但不可信”和“clangd 返回空”分成两个代码分支：非空结果先走降级真值表，全不可信返回 `UNRESOLVED`；只有返回空才进入可能 `NOT_FOUND` 的空结果分支。
 
 不做：
 - 不实现真实 clangd adapter（P3）。
@@ -35,6 +37,16 @@
 7. 实现 syntactic fallback 候选放置、`not_evidence`、QR7 relation `{may,n/a}`、阈值过滤和 suppress note。
 8. 补全不可绕过测试、回归旧 28 测试和全套测试。
 9. 跑 deterministic gate：ruff、black、mypy、pytest、coverage；结果写入 progress/review artifact。
+
+## 测试桩场景清单
+P2 测试桩必须能构造以下 clangd observation 场景，确保降级真值表逐项被测到：
+- 缺要素1：依赖不完整，结果降级为 clangd/syntactic 候选，并记录 `DEPENDENCY_INCOMPLETE`。
+- 缺要素2：宏展开/预处理盲区影响结果，结果降级为 clangd/syntactic 候选，`blind_spot_affects_result=True`。
+- 缺要素4：符号身份歧义，结果降级为 clangd/syntactic 候选，并记录 `SYMBOL_AMBIGUOUS`。
+- 全部不可信：clangd 返回非空，但每条结果都缺 1/2/4 中至少一项，最终 `UNRESOLVED`，不得进入 `NOT_FOUND`。
+- 混合结果：部分可信进入 `semantic_results`，部分不可信降级入 `syntactic_candidates`，不丢弃。
+- clangd 返回空：只在空结果分支内判断 `NOT_FOUND` vs `UNRESOLVED`。
+- 引擎异常：返回 `FAILED`，不触发 tree-sitter 兜底。
 
 ## 依赖前置阶段
 - 已完成并 Merge：stage01_metadata。
