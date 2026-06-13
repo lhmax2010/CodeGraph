@@ -1,6 +1,6 @@
 # Design Change 提案 #2（P1 多路 review 发现的冻结设计矛盾）
 
-> 状态：**待 design owner 决策**
+> 状态：**已接受并应用（design.md v1.4.1）**；项3 的 is_exhaustive 半句经复核缩为"仅 unresolved"，不锁 positive
 > 来源：Phase 1 收口多路 review（ChatGPT / Kimi Code / Gemini 四路），两路独立抓到 QR7×INV9
 >       矛盾（BLOCKER），并经人工在真实代码上验证属实。
 > 性质：**冻结设计（design.md）层面的契约矛盾**，非 P1 实现错误。P1 代码忠实照 design 实现，

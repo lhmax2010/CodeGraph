@@ -96,3 +96,4 @@
 - [2026-06-13] R14 closure：修复 `consumer_hint` MAJOR；用 `uv tool run` 补跑 ruff/black/mypy/pytest-cov gate；P1 核心 coverage `97%`；全量测试 `65 passed`，旧 `test_credibility.py` `28 passed`。
 - [2026-06-13] R14 closure：处理 review MINOR/NIT，已修 PEP604 guard、`clangd_relation_must` docstring、enum/string drift 测试、protocol stub 测试、`validate()` identity、`log_search+syntactic`、invariant order 注释、`__init__.py` docstring；`make_error_credibility source=clangd` 按 design §4.3 保留。
 - [2026-06-13] design 经 R1 变更至 v1.4（`docs/design_changes/change_2.md`），待复核后实现 INV20/21；本次只落文档，不改 P1 实现代码。
+- [2026-06-13] design 修订至 v1.4.1（`docs/design_changes/change_2.md`），待第二轮 AI 复核后实现 INV20/21；本次只核对和记录，不改 P1 实现代码。
