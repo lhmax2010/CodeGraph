@@ -55,4 +55,4 @@ Phase 3 风险档候选：高。
 - 缓解点：本机已安装 clangd 18.1.3；`tools/verify_clangd.py` 已有 PoC 真机验证过的 LSP 客户端资产；P3 可用小型 CDB 开发，不依赖 P5 全局索引。
 
 ## 当前暂停点
-已完成开 stage 准备。实现前等待开发者确认风险档与 restate 计划。
+实现已完成，等待 Phase 3 三路 review 与 R14 闭环；尚未 Merge。

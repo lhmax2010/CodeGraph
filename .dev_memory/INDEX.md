@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：stage03_clangd_adapter（开 stage / 待确认风险档与 restate）
+- 当前活跃 stage：stage03_clangd_adapter（实现完成 / 待三路 review）
 - 最后已确认 stage（已 Merge）：stage02_routing
 - 设计基线：docs/design.md v1.4.3 Frozen（2026-06-13；R1 change_2/change_3 已应用；change_4 已登记待 P6 前决策）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -13,7 +13,7 @@
 |------|------|------|---------|------------|
 | stage01 | metadata | 已 Merge | N/A（按用户要求只 push 不走 PR） | `2e0d0aa` / `checkpoint/phase_1_metadata` |
 | stage02 | routing | 已 Merge | N/A（按用户要求只 push 不走 PR） | `b595157`（P2 代码最终提交） / `checkpoint/phase_2_routing` |
-| stage03 | clangd_adapter | 进行中（开 stage / 待确认） | N/A（按用户要求只 push 不走 PR） | baseline `e87543d` |
+| stage03 | clangd_adapter | 待 Review（三路 review 待跑） | N/A（按用户要求只 push 不走 PR） | baseline `e87543d` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。

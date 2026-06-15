@@ -14,6 +14,21 @@
 - 决策：callers/callees 必须用 clangd callHierarchy，不用 references+AST 近似推导。
   - 原因：设计明确要求调用关系来自 clangd callHierarchy；近似图会产出不可信关系。
   - 排除的方案：用 references 搜调用点再猜 caller/callee。该方案违反 P3/P8 contract。
+- 决策：P3 严格按 P2 已 Merge 的 `EngineObservationResult` 接缝填字段：`locations`、`references`、`call_edges`、`diagnostics.file_not_found`、`diagnostics.fatal`、`diagnostics.soft`、`symbol_ambiguous`、`index_scope_known`。
+  - 原因：P2 `routing.py` 直接消费这些字段；字段名、类型或语义错位会让路由层接不上。
+  - 排除的方案：在 P3 自创字段或提前填 credibility/status。该方案越界且破坏 P2/P3 分层。
+- 决策：clangd 空结果只作为空 observation 返回，P3 不解释成 `not_found`。
+  - 原因：空返回可能是真不存在、索引未覆盖、依赖缺失或其他上下文问题；只有 P2 能综合 dependency/index_health 做结论。
+  - 排除的方案：在 adapter 内把空 definition/references 解释为 not_found。该方案会制造虚假否定风险。
+- 决策：P3 adapter 直接复用 `tools.verify_clangd.LSPClient` / `path_to_uri`，通过 client factory 注入假客户端做单测。
+  - 原因：`verify_clangd.py` 已验证 stdlib stdio LSP、request timeout、diagnostics 收集与 shutdown；P3 只封装查询与结果转换。
+  - 排除的方案：在 `clangd_adapter.py` 重新实现 LSP framing/reader/request loop。该方案违反复用资产约束，并扩大真实引擎风险面。
+- 决策：`clangd_adapter.py` 用动态导入加载 `tools.verify_clangd`，避免 `mypy codegraph` 因静态 import 追进工具脚本内部实现。
+  - 原因：P3 仍复用 verify asset；但类型门针对 `codegraph` 核心模块，不应因为 adapter import 把历史工具脚本变成核心 mypy 检查对象。
+  - 排除的方案：直接静态 import `tools.verify_clangd`。该方案会让 mypy 报告工具脚本中 `subprocess.PIPE` 的可选 stdin 类型问题，扩大本阶段改动范围。
+- 决策：真实 clangd 集成测试使用临时单文件 CDB，覆盖 definition / references / callHierarchy。
+  - 原因：P3 可用小型 CDB 验证真实 LSP，不依赖 P5 离线建库；callHierarchy 是硬要求，必须实际跑一次。
+  - 排除的方案：只用 fake LSP 单测。该方案无法证明本机 clangd 18.1.3 的真实能力和返回形状。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -32,3 +47,9 @@
 - [2026-06-15] 在 `main@e87543d` 跑 baseline：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `80 passed in 0.07s`。
 - [2026-06-15] 从 `main@e87543d` 新建分支 `phase/3-clangd-adapter`。
 - [2026-06-15] 创建 `.dev_memory/stage03_clangd_adapter/` 计划与进度骨架；等待风险档与 restate gate 确认后再实现。
+- [2026-06-15] 开发者确认 Phase 3 高风险档与实现计划；动手前核对 P2 `routing.py` 实际消费 observation 字段，确认 P3 只产观察事实，不判断 not_found。
+- [2026-06-15] 实现 `codegraph/engines/clangd_adapter.py` 与 `tests/test_clangd_adapter.py`；P3 单测含 fake LSP 和真实 clangd 小 CDB，`PYTHONPATH=.:tools python3 -m pytest tests/test_clangd_adapter.py -q` -> `8 passed in 0.13s`。
+- [2026-06-15] 全量测试：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `88 passed in 0.18s`。
+- [2026-06-15] 静态 gate：`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `15 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 8 source files`。
+- [2026-06-15] 覆盖率：`PYTHONPATH=.:tools uv tool run --with pytest-cov pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `88 passed in 0.34s`，total coverage 97%，`codegraph/engines/clangd_adapter.py` coverage 100%。
+- [2026-06-15] 编译检查：`python3 -m compileall -q codegraph tools tests` 通过，无输出。
