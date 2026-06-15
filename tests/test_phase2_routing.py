@@ -317,13 +317,15 @@ def test_route_engine_exceptions_are_failed_without_fallback(
     )
     assert result.status == QueryStatus.FAILED
     assert result.syntactic_candidates == []
-    assert codes(result) == {code}
+    assert codes(result) == {code, IssueCode.INDEX_UNKNOWN}
 
 
 def test_route_nonempty_evidence_classification_and_branch_separation():
     assert (
         route_engine_call(
-            q(), lambda: EngineObservationResult(locations=(loc(),))
+            q(),
+            lambda: EngineObservationResult(locations=(loc(),)),
+            syntactic_provider=FakeSyntacticProvider(),
         ).status
         == QueryStatus.OK
     )
@@ -366,7 +368,9 @@ def test_route_nonempty_evidence_classification_and_branch_separation():
     assert len(mixed.semantic_results) == len(mixed.syntactic_candidates) == 1
 
     unknown_index = route_observation(
-        q(), EngineObservationResult(locations=(loc(),), index_scope_known=False)
+        q(),
+        EngineObservationResult(locations=(loc(),), index_scope_known=False),
+        syntactic_provider=FakeSyntacticProvider(),
     )
     assert (
         unknown_index.semantic_results[0].credibility.coverage.index_scope
@@ -392,7 +396,11 @@ def test_route_reference_call_edge_and_unknown_kind_edges():
 
     weird = loc()
     weird.kind = "compiler_magic"
-    result = route_observation(q(), EngineObservationResult(locations=(weird,)))
+    result = route_observation(
+        q(),
+        EngineObservationResult(locations=(weird,)),
+        syntactic_provider=FakeSyntacticProvider(),
+    )
     assert result.semantic_results[0].credibility.symbol_kind == SymbolKind.UNKNOWN
 
 
@@ -424,6 +432,36 @@ def test_empty_result_not_found_and_unresolved_boundaries():
     )
     assert fatal.status == QueryStatus.UNRESOLVED
     assert fatal.status_credibility.dependency.status.value == "unknown"
+
+
+def test_missing_syntax_helper_downgrades_element2_only():
+    ordinary = route_observation(q(), EngineObservationResult(locations=(loc(),)))
+    assert ordinary.status == QueryStatus.UNRESOLVED
+    assert ordinary.semantic_results == []
+    assert (
+        ordinary.syntactic_candidates[0].credibility.blind_spot_affects_result is True
+    )
+
+    macro = route_observation(
+        q(), EngineObservationResult(locations=(loc(kind=SymbolKind.MACRO.value),))
+    )
+    assert macro.status == QueryStatus.UNRESOLVED
+    assert macro.semantic_results == []
+    assert macro.syntactic_candidates[0].credibility.blind_spot_affects_result is True
+
+
+def test_index_health_notes_are_structured_and_deduplicated():
+    incomplete_index = route_observation(
+        q(), EngineObservationResult(), index_health=IndexHealth.INCOMPLETE
+    )
+    assert incomplete_index.status == QueryStatus.UNRESOLVED
+    assert IssueCode.INDEX_INCOMPLETE in codes(incomplete_index)
+
+    unknown_index = route_observation(
+        q(), EngineObservationResult(), index_health=IndexHealth.UNKNOWN
+    )
+    assert unknown_index.status == QueryStatus.UNRESOLVED
+    assert [n.code for n in unknown_index.notes].count(IssueCode.INDEX_UNKNOWN) == 1
 
 
 def test_fallback_thresholds_switches_and_candidate_normalization():

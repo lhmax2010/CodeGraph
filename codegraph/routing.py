@@ -215,15 +215,17 @@ def route_observation(
         semantic_results: list[Result] = []
         candidates: list[Candidate] = []
         for item in data:
-            preproc = _is_preprocessor_location(syntactic_provider, item)
             item_kind = _symbol_kind_for_data(item, symbol_kind)
+            blind_spot_affects = _has_preprocessor_blind_spot(
+                syntactic_provider, item, item_kind
+            )
             coverage = _positive_coverage(observation, index_scope)
             if observation.symbol_ambiguous:
                 _append_note_once(notes, IssueCode.SYMBOL_AMBIGUOUS)
 
             if (
                 dep.status == DepStatus.COMPLETE
-                and not preproc
+                and not blind_spot_affects
                 and not observation.symbol_ambiguous
             ):
                 relation = Relation.NA if qk == QueryKind.ENTITY else Relation.MUST
@@ -250,7 +252,7 @@ def route_observation(
                         ),
                         coverage=coverage,
                         symbol_kind=item_kind,
-                        blind_spot_affects_result=preproc,
+                        blind_spot_affects_result=blind_spot_affects,
                     ),
                     relevance_score=None,
                 )
@@ -351,6 +353,8 @@ def _query_result(
     total_hits: int | None = None,
     notes: Iterable[Note] = (),
 ) -> QueryResult:
+    normalized_notes = list(notes)
+    _append_index_health_note(normalized_notes, index_health)
     return validate_query_result(
         QueryResult(
             query=query,
@@ -360,7 +364,7 @@ def _query_result(
             syntactic_candidates=list(syntactic_candidates),
             index_health=index_health.value,
             total_hits=total_hits,
-            notes=list(notes),
+            notes=normalized_notes,
         )
     )
 
@@ -496,14 +500,16 @@ def _positive_coverage(
     )
 
 
-def _is_preprocessor_location(
-    syntactic_provider: SyntacticProvider | None, data: ResultData
+def _has_preprocessor_blind_spot(
+    syntactic_provider: SyntacticProvider | None,
+    data: ResultData,
+    symbol_kind: SymbolKind,
 ) -> bool:
-    if syntactic_provider is None:
-        return False
+    if symbol_kind == SymbolKind.MACRO or syntactic_provider is None:
+        return True
     file, pos = _file_and_pos(data)
     return (
-        False
+        True
         if file is None or pos is None
         else syntactic_provider.is_preprocessor_location(file, pos)
     )
@@ -628,3 +634,10 @@ def _is_search_query(query: QueryMeta) -> bool:
 def _append_note_once(notes: list[Note], code: IssueCode) -> None:
     if not any(note.code == code for note in notes):
         notes.append(Note(code))
+
+
+def _append_index_health_note(notes: list[Note], index_health: IndexHealth) -> None:
+    if index_health == IndexHealth.INCOMPLETE:
+        _append_note_once(notes, IssueCode.INDEX_INCOMPLETE)
+    elif index_health == IndexHealth.UNKNOWN:
+        _append_note_once(notes, IssueCode.INDEX_UNKNOWN)

@@ -26,6 +26,12 @@
 - 决策：实现与测试从初版约 1507 物理行压缩到约 1118 物理行后停止继续压缩，保留可读性与关键路径覆盖。
   - 原因：继续压缩需要把路由状态机和测试场景过度折叠，降低三路 review 可读性；当前 `routing.py` 代码语句覆盖 94%，关键分支均有测试。
   - 排除的方案：为贴近 800 行预算继续做高密度代码/测试压缩。该方案会牺牲可维护性，且 P2 已被确认高风险、需要清晰 review 面。
+- 决策：P2 review 闭环时，`syntactic_provider is None` 按要素2不满足处理，该条 clangd 结果降级为候选；依赖、歧义、index_scope 三项判定保持独立。
+  - 原因：修复 review 指出的“宏伪位置被误升为 semantic”风险，对齐 design §7 P6 “P4 缺失时要素2保守标不满足并降级”；有 helper 且确认普通源码位置时仍可产出 OK。
+  - 排除的方案：helper 缺失时仍返回 False 当作真实源码。该方案会把无法核验的宏/预处理器伪位置误升为 semantic。
+- 决策：`INDEX_INCOMPLETE` / `INDEX_UNKNOWN` note 在 `_query_result()` 集中补齐，并通过 `_append_note_once` 去重。
+  - 原因：index health 是 QueryResult 容器字段，集中补齐能覆盖 OK/UNRESOLVED/NOT_FOUND/FAILED 等返回路径，消费方可稳定按 notes 分支。
+  - 排除的方案：只在空结果 not_found/unresolved 分支手工添加。该方案容易漏掉非空结果和 FAILED 路径。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -51,3 +57,5 @@
 - [2026-06-13] 全量测试：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `77 passed in 0.06s`。
 - [2026-06-13] 静态 gate：`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `13 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 7 source files`。
 - [2026-06-13] 覆盖率：`PYTHONPATH=.:tools uv tool run --with pytest-cov pytest --cov=codegraph --cov-branch tests/ -q` -> `77 passed in 0.22s`，total coverage 96%，`codegraph/routing.py` coverage 94%。
+- [2026-06-15] P2 review 闭环：修复已知 macro/preprocessor 位置在 syntax helper 缺失时的要素2乐观误升，并为 `index_health=incomplete/unknown` 发结构化 `INDEX_INCOMPLETE` / `INDEX_UNKNOWN` notes；新增 P2 回归测试，P2 单测 `12 passed`。
+- [2026-06-15] P2 review gate：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `79 passed in 0.06s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `13 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 7 source files`。
