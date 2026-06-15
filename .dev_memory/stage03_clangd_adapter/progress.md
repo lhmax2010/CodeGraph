@@ -35,6 +35,12 @@
 - 决策：补 P3 observation 到 P2 `route_observation()` 的端到端接缝测试，使用 include-not-found 诊断验证 `UNRESOLVED + DEPENDENCY_INCOMPLETE`。
   - 原因：P3 字段形状测试不足以防止语义漂移；直接喂 P2 可锁住 diagnostics.file_not_found 的跨层含义。
   - 排除的方案：只断言 adapter 返回 `EngineObservationResult`。该方案无法证明 P2 会按预期消费该 observation。
+- 决策：初始化失败清理捕获扩大到 `BaseException`，但仅限外层 `_initialize()` 清理；内层 `shutdown()` 错误吞掉仍只捕获 `Exception`。
+  - 原因：`KeyboardInterrupt` / `SystemExit` 不继承 `Exception`，用户 Ctrl+C 也必须清理已启动 clangd；清理后原异常继续抛出，不吞中断。
+  - 排除的方案：保持 `except Exception`。该方案在 Ctrl+C 初始化窗口仍可能泄漏 clangd 子进程。
+- 决策：对复用资产 `tools/verify_clangd.py` 做最小 bug 修复：`kill()` 后追加 `wait(timeout=5)` 回收进程。
+  - 原因：两路 review 指出 kill 后不 wait 会短暂留下僵尸进程；这是一行级收僵尸修复，未改动 LSP/验证逻辑。
+  - 排除的方案：重写 shutdown 流程。该方案超出“复用资产最小修复”边界。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -61,3 +67,6 @@
 - [2026-06-15] 编译检查：`python3 -m compileall -q codegraph tools tests` 通过，无输出。
 - [2026-06-15] P3 review 闭环：修复 init 失败泄漏 clangd client 的 MAJOR；补 P3→P2 include-not-found 接缝测试；P3 单测 `PYTHONPATH=.:tools python3 -m pytest tests/test_clangd_adapter.py -q` -> `10 passed in 0.14s`。
 - [2026-06-15] P3 review fix gate：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `90 passed in 0.18s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `15 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 8 source files`；`python3 -m compileall -q codegraph tools tests` 通过；coverage `90 passed in 0.34s`，total 97%，`codegraph/engines/clangd_adapter.py` 100%。
+- [2026-06-15] P3 hardening：初始化清理外层捕获改为 `BaseException` 并补 `KeyboardInterrupt` 测试；`tools/verify_clangd.py` 的 `kill()` 后补 `wait()` 回收被 kill 的 clangd。
+- [2026-06-15] P3 hardening gate：`PYTHONPATH=.:tools python3 -m pytest tests/test_clangd_adapter.py -q` -> `10 passed in 0.14s`；`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `90 passed in 0.19s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `15 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 8 source files`；coverage `90 passed in 0.38s`，total 97%，`codegraph/engines/clangd_adapter.py` 100%；`python3 -m compileall -q codegraph tools tests` 通过。
+- [2026-06-15] mypy 门口径确认：项目既有静态 gate 是 `uv tool run mypy codegraph`；`uv tool run mypy codegraph tests` 会把未配置 pytest stubs 和 `tools/verify_clangd.py` 历史可选 stdin 类型问题纳入检查，不作为本阶段确定性门。

@@ -19,7 +19,7 @@
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
 - Baseline：`e87543d [Phase 2] docs: close routing stage`。
 - 当前分支：`phase/3-clangd-adapter`。
-- P3 代码最终提交：`89b0e3d [Phase 3] fix: clean up clangd subprocess on init failure + add P2 seam test`。
+- P3 代码最终提交：`89b0e3d [Phase 3] fix: clean up clangd subprocess on init failure + add P2 seam test`，并追加 hardening 收尾提交 `[Phase 3] harden: BaseException cleanup on init + reap killed clangd`。
 - Checkpoint：`checkpoint/phase_3_clangd_adapter`。
 
 ## 遗留问题 / 风险

@@ -48,7 +48,7 @@ class FakeClient:
         self.requests.append((method, params, timeout))
         queue = self.responses.setdefault(method, [None])
         response = queue.pop(0) if queue else None
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
         return response
 
@@ -165,6 +165,11 @@ def test_init_failure_shuts_down_started_client(tmp_path: Path):
     with pytest.raises(TimeoutError, match="init timeout"):
         make_adapter(noisy_shutdown, tmp_path)
     assert noisy_shutdown.shutdown_called is True
+
+    interrupted = FakeClient({"initialize": [KeyboardInterrupt()]})
+    with pytest.raises(KeyboardInterrupt):
+        make_adapter(interrupted, tmp_path)
+    assert interrupted.shutdown_called is True
 
 
 def test_definition_conversion_and_diagnostics_match_p2_contract(tmp_path: Path):

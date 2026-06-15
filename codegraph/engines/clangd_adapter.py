@@ -72,7 +72,7 @@ class ClangdAdapter:
         self._opened: set[str] = set()
         try:
             self._initialize()
-        except Exception:
+        except BaseException:
             try:
                 self._client.shutdown()
             except Exception:

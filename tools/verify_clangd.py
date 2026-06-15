@@ -146,6 +146,7 @@ class LSPClient:
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+            self.proc.wait(timeout=5)
 
 
 def path_to_uri(p: str) -> str:
