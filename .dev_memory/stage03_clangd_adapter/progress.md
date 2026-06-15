@@ -29,6 +29,12 @@
 - 决策：真实 clangd 集成测试使用临时单文件 CDB，覆盖 definition / references / callHierarchy。
   - 原因：P3 可用小型 CDB 验证真实 LSP，不依赖 P5 离线建库；callHierarchy 是硬要求，必须实际跑一次。
   - 排除的方案：只用 fake LSP 单测。该方案无法证明本机 clangd 18.1.3 的真实能力和返回形状。
+- 决策：`ClangdAdapter.__init__` 在 `_initialize()` 失败时立即调用 `shutdown()` 清理已启动的 LSP client，然后原样抛出初始化异常。
+  - 原因：client factory 已经启动 clangd 子进程；构造过程抛异常时对象不会进入 context manager，必须在构造函数内清理，避免子进程泄漏。
+  - 排除的方案：只要求调用方捕获异常后 close。该方案不可行，因为对象未构造完成，调用方拿不到 adapter 实例。
+- 决策：补 P3 observation 到 P2 `route_observation()` 的端到端接缝测试，使用 include-not-found 诊断验证 `UNRESOLVED + DEPENDENCY_INCOMPLETE`。
+  - 原因：P3 字段形状测试不足以防止语义漂移；直接喂 P2 可锁住 diagnostics.file_not_found 的跨层含义。
+  - 排除的方案：只断言 adapter 返回 `EngineObservationResult`。该方案无法证明 P2 会按预期消费该 observation。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -53,3 +59,5 @@
 - [2026-06-15] 静态 gate：`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `15 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 8 source files`。
 - [2026-06-15] 覆盖率：`PYTHONPATH=.:tools uv tool run --with pytest-cov pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `88 passed in 0.34s`，total coverage 97%，`codegraph/engines/clangd_adapter.py` coverage 100%。
 - [2026-06-15] 编译检查：`python3 -m compileall -q codegraph tools tests` 通过，无输出。
+- [2026-06-15] P3 review 闭环：修复 init 失败泄漏 clangd client 的 MAJOR；补 P3→P2 include-not-found 接缝测试；P3 单测 `PYTHONPATH=.:tools python3 -m pytest tests/test_clangd_adapter.py -q` -> `10 passed in 0.14s`。
+- [2026-06-15] P3 review fix gate：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `90 passed in 0.18s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `15 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 8 source files`；`python3 -m compileall -q codegraph tools tests` 通过；coverage `90 passed in 0.34s`，total 97%，`codegraph/engines/clangd_adapter.py` 100%。

@@ -70,7 +70,14 @@ class ClangdAdapter:
             config.clangd_path, extra_args, self.compile_dir, config.verbose
         )
         self._opened: set[str] = set()
-        self._initialize()
+        try:
+            self._initialize()
+        except Exception:
+            try:
+                self._client.shutdown()
+            except Exception:
+                pass
+            raise
 
     def __enter__(self) -> "ClangdAdapter":
         return self

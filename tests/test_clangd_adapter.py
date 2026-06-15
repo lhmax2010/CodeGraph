@@ -19,7 +19,15 @@ from codegraph.engines.clangd_adapter import (
     _uri_to_path,
 )
 from codegraph.engines.protocol import EngineObservationResult
-from codegraph.types import LocationResult, Pos, ReferenceResult
+from codegraph.routing import route_observation
+from codegraph.types import (
+    IssueCode,
+    LocationResult,
+    Pos,
+    QueryMeta,
+    QueryStatus,
+    ReferenceResult,
+)
 from tools.verify_clangd import path_to_uri
 
 
@@ -34,6 +42,7 @@ class FakeClient:
         self.requests: list[tuple[str, dict, float]] = []
         self.notifications: list[tuple[str, dict]] = []
         self.shutdown_called = False
+        self.shutdown_error: Exception | None = None
 
     def request(self, method: str, params: dict, timeout: float = 30.0) -> Any:
         self.requests.append((method, params, timeout))
@@ -51,6 +60,8 @@ class FakeClient:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
 
 
 def source_file(tmp_path: Path) -> Path:
@@ -141,6 +152,21 @@ def test_empty_definition_is_only_an_empty_observation(tmp_path: Path):
     assert not hasattr(result, "status")
 
 
+def test_init_failure_shuts_down_started_client(tmp_path: Path):
+    fake = FakeClient({"initialize": [TimeoutError("init timeout")]})
+
+    with pytest.raises(TimeoutError, match="init timeout"):
+        make_adapter(fake, tmp_path)
+
+    assert fake.shutdown_called is True
+
+    noisy_shutdown = FakeClient({"initialize": [TimeoutError("init timeout")]})
+    noisy_shutdown.shutdown_error = RuntimeError("shutdown failed")
+    with pytest.raises(TimeoutError, match="init timeout"):
+        make_adapter(noisy_shutdown, tmp_path)
+    assert noisy_shutdown.shutdown_called is True
+
+
 def test_definition_conversion_and_diagnostics_match_p2_contract(tmp_path: Path):
     src = source_file(tmp_path)
     uri = path_to_uri(str(src))
@@ -169,6 +195,27 @@ def test_definition_conversion_and_diagnostics_match_p2_contract(tmp_path: Path)
     assert loc.symbol_id.name == "add"
     assert loc.symbol_id.file == str(src)
     assert loc.symbol_id.pos == Pos(0, 4)
+
+
+def test_adapter_observation_routes_through_p2_dependency_incomplete(tmp_path: Path):
+    src = source_file(tmp_path)
+    uri = path_to_uri(str(src))
+    fake = FakeClient(
+        {
+            "initialize": [{}],
+            "textDocument/definition": [[location(uri, 0, 4, 7)]],
+        },
+        diagnostics={uri: [{"severity": 1, "message": "'missing.h' file not found"}]},
+    )
+    adapter = make_adapter(fake, tmp_path)
+    observation = adapter.get_definition("add", str(src), Pos(5, 9))
+
+    routed = route_observation(QueryMeta("entity", "add", "arm"), observation)
+
+    assert routed.status == QueryStatus.UNRESOLVED
+    assert routed.semantic_results == []
+    assert len(routed.syntactic_candidates) == 1
+    assert IssueCode.DEPENDENCY_INCOMPLETE in {note.code for note in routed.notes}
 
 
 def test_search_symbol_and_references_mapping(tmp_path: Path):
