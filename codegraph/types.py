@@ -100,7 +100,7 @@ class ImpactResult:
 
 
 ResultData = LocationResult | ReferenceResult | CallEdgeResult | ImpactResult
-CandidateData = LocationResult | ReferenceResult
+CandidateData = LocationResult | ReferenceResult | CallEdgeResult
 
 
 @dataclass

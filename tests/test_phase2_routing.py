@@ -21,6 +21,7 @@ from codegraph.credibility import (
 from codegraph.engines.protocol import EngineDiagnostics, EngineObservationResult
 from codegraph.routing import (
     QueryResultInvariantError,
+    _candidate_data,
     check_query_result_invariants,
     route_engine_call,
     route_observation,
@@ -29,6 +30,7 @@ from codegraph.routing import (
 from codegraph.types import (
     CallEdgeResult,
     Candidate,
+    ImpactResult,
     IssueCode,
     LocationResult,
     Pos,
@@ -97,6 +99,11 @@ def edge(line: int = 1) -> CallEdgeResult:
     caller = SymbolId("usr:caller", "caller", "/tmp/caller.c", Pos(0, 0))
     callee = SymbolId("usr:fn", "fn", "/tmp/callee.c", Pos(10, 0))
     return CallEdgeResult(caller, callee, Range(Pos(line, 4), Pos(line, 8)))
+
+
+def impact() -> ImpactResult:
+    symbol = SymbolId("usr:affected", "affected", "/tmp/impact.c", Pos(20, 0))
+    return ImpactResult(symbol, 1)
 
 
 def cred(
@@ -282,6 +289,12 @@ def test_qr7_accepts_may_or_na_candidates_and_rejects_other_shapes():
         )
         assert_qr("QR7", bad)
 
+    bad = QueryResult(
+        q(), QueryStatus.UNRESOLVED, unresolved(), syntactic_candidates=[cand()]
+    )
+    bad.syntactic_candidates[0].consumer_warning = "evidence"
+    assert_qr("QR7", bad)
+
 
 def test_validate_query_result_runs_single_credibility_invariants():
     result = ok_result()
@@ -391,7 +404,10 @@ def test_route_reference_call_edge_and_unknown_kind_edges():
         q(QueryKind.RELATION),
         EngineObservationResult(call_edges=(edge(7),), symbol_ambiguous=True),
     )
-    assert isinstance(relation.syntactic_candidates[0].data, ReferenceResult)
+    edge_data = relation.syntactic_candidates[0].data
+    assert isinstance(edge_data, CallEdgeResult)
+    assert edge_data.from_symbol.name == "caller"
+    assert edge_data.to_symbol.name == "fn"
     assert relation.syntactic_candidates[0].credibility.relation == Relation.MAY
 
     weird = loc()
@@ -402,6 +418,11 @@ def test_route_reference_call_edge_and_unknown_kind_edges():
         syntactic_provider=FakeSyntacticProvider(),
     )
     assert result.semantic_results[0].credibility.symbol_kind == SymbolKind.UNKNOWN
+
+
+def test_impact_result_never_enters_candidate_data():
+    with pytest.raises(TypeError, match="ImpactResult"):
+        _candidate_data(impact())
 
 
 def test_empty_result_not_found_and_unresolved_boundaries():

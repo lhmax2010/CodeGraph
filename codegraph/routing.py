@@ -112,6 +112,8 @@ def check_query_result_invariants(result: QueryResult) -> None:
             raise QueryResultInvariantError("QR7", "candidate relation must not must")
         if c.certainty != Certainty.SYNTACTIC:
             raise QueryResultInvariantError("QR7", "candidate must be syntactic")
+        if candidate.consumer_warning != "not_evidence":
+            raise QueryResultInvariantError("QR7", "candidate must be not_evidence")
 
     query_kind = _query_kind(result.query)
     for credibility in _item_credibilities(result):
@@ -537,10 +539,8 @@ def _symbol_kind_for_data(data: ResultData, default: SymbolKind) -> SymbolKind:
 
 
 def _candidate_data(data: ResultData) -> CandidateData:
-    if isinstance(data, (LocationResult, ReferenceResult)):
+    if isinstance(data, (LocationResult, ReferenceResult, CallEdgeResult)):
         return data
-    if isinstance(data, CallEdgeResult):
-        return ReferenceResult(data.call_site, data.from_symbol.file, "reference")
     raise TypeError(
         f"Unsupported candidate data for Phase 2 routing: {type(data).__name__}"
     )

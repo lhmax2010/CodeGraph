@@ -1,7 +1,7 @@
 # CodeGraph 设计文档
 
 ## 0. 元信息
-- 版本：v1.4.2（规范版；前身规范外迭代版至 DESIGN v1.3）
+- 版本：v1.4.3（规范版；前身规范外迭代版至 DESIGN v1.3）
 - 创建时间：2026-06-11
 - 状态：**Frozen**（v1.3 冻结于 2026-06-11；v1.4 为 P1 实现期经 R1 变更后的修订，2026-06-13）
 - 成熟度说明：本设计经三轮多 AI 架构 review + 一轮主系统对接 + 三轮规范化评审冻结为 v1.3；
@@ -17,9 +17,14 @@
     把 INV12（tree-sitter 不能 not_found）泛化为系统立身之本：只有 clangd 语义无盲区才能
     断言"不存在"。补全了 log_search/exact_syntactic 预留只守 certainty（INV19）没守 not_found
     的半截漏洞——原本 clangd+syntactic、log_search 等三种虚假否定能过校验。
-  - **[MINOR 修正] 新增 INV21**：resolved≠not_found ⟹ negative_scope=none；附 unresolved ⟹
-    ¬is_exhaustive。锁 negative_scope 负证明字段只在 not_found 有意义；is_exhaustive 仅对
-    unresolved 强制 False（positive 结果允许 exhaustive=True，保留 P7 find_references 穷尽信号）。
+- **v1.4.3 相对 v1.4.2 的变更**（R1 变更 change_3.md，P2 多路 review 发现）：
+  - **[MAJOR·P8前必修] CandidateData 加 CallEdgeResult**：原 `LocationResult|ReferenceResult`
+    装不下调用边，find_callers/callees 的边降级入候选时被有损转 ReferenceResult（丢 to_symbol
+    /方向）。加 CallEdgeResult 后调用边可无损降级。P2 同步删除有损转换。
+  - **[MINOR 加固] QR7 增 consumer_warning=="not_evidence"**：候选的 consumer_warning 原是
+    Literal 静态标注、运行时不强制，能被改成 "evidence" 绕过护栏。QR7 容器级兜底校验。
+  - 两项均为 P2 真实消费暴露的字段/校验缺口，非 P2 实现错误（P2 的 syntax-helper 乐观误升
+    与 index_health 漏 note 是实现 bug，已在 commit 7ee69ec 修复）。
   - 三条修订均不破坏现有工厂/测试（唯一合法 not_found 工厂 clangd_not_found 本就
     clangd+semantic+¬blindspot）；P1 代码随之加 INV20/21 检查 + 测试。
   - change_1.md 的两项（INV14a 冗余、make_error source 占位）仍按"零改动加注"处理，与本次无关。
@@ -343,7 +348,10 @@ class Result:
 
 @dataclass
 class Candidate:
-    data: "LocationResult | ReferenceResult"
+    data: "LocationResult | ReferenceResult | CallEdgeResult"
+                                     # [契约·change_3] 含 CallEdgeResult：find_callers/callees 的
+                                     #   调用边因盲区/歧义降级入候选时，必须保留 from/to_symbol 和
+                                     #   方向（不可有损转 ReferenceResult，那会丢被调方和方向）。
     credibility: Credibility         # [契约] 候选 credibility 恒为：resolved=resolved（候选是
                                      #   "找到的疑似项"非负证明，避 INV3/4）、relation ∈ {may, n/a}
                                      #   （relation 候选用 may、entity 候选用 n/a；绝不 must）、
@@ -391,8 +399,10 @@ class ImpactResult:     # get_impact（二期），MVP 桩不产出此结构
   - QR6: 所有 Result/Candidate 的 build_config_id 与 query.build_config_id 一致
   - QR7（护栏4 + 候选身份约束，**取代原 INV17**）: `∀c ∈ syntactic_candidates:
          c.credibility.resolved==resolved ∧ c.credibility.relation ∈ {may, n/a}
-         ∧ c.credibility.certainty==syntactic`
-         （候选恒为"找到的疑似项"：不参与负证明、**绝不声称 must（必然关系）**、永远语法级。
+         ∧ c.credibility.certainty==syntactic ∧ c.consumer_warning=="not_evidence"`
+         （候选恒为"找到的疑似项"：不参与负证明、**绝不声称 must（必然关系）**、永远语法级，
+          且【显式标 not_evidence】——consumer_warning 是 Literal 静态标注，Candidate 又可变，
+          运行时不强制，故 QR7 在容器级兜底校验，防候选被改成 "evidence" 绕过护栏（change_3 项2）。
           relation 取 {may, n/a}：relation 候选用 may，entity 候选用 n/a——因 entity 查询
           受 INV9 约束必须 relation=n/a，故 QR7 不能强求 may，只能禁 must。
           为何在容器级而非 check_invariants：单条 Credibility 不知自己是否属候选，

@@ -32,6 +32,12 @@
 - 决策：`INDEX_INCOMPLETE` / `INDEX_UNKNOWN` note 在 `_query_result()` 集中补齐，并通过 `_append_note_once` 去重。
   - 原因：index health 是 QueryResult 容器字段，集中补齐能覆盖 OK/UNRESOLVED/NOT_FOUND/FAILED 等返回路径，消费方可稳定按 notes 分支。
   - 排除的方案：只在空结果 not_found/unresolved 分支手工添加。该方案容易漏掉非空结果和 FAILED 路径。
+- 决策：R1 批准 design v1.4.3 后，`CallEdgeResult` 原样允许进入 `Candidate.data`，但 `ImpactResult` 仍由候选数据门拒绝。
+  - 原因：调用边候选必须保留 `from_symbol` / `to_symbol` 方向信息；`ImpactResult` 属 get_impact 结果，不是 P2/P8 调用边候选数据。
+  - 排除的方案：继续把 `CallEdgeResult` 有损转换成 `ReferenceResult`。该方案会丢 callee/to_symbol 和方向。
+- 决策：QR7 运行时强制 `candidate.consumer_warning == "not_evidence"`。
+  - 原因：`Literal["not_evidence"]` 只是静态标注，`Candidate` 可变；容器校验必须兜底防止候选被篡改成 evidence 后绕过护栏。
+  - 排除的方案：只依赖 dataclass 默认值。该方案无法防运行时 mutation。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -59,3 +65,5 @@
 - [2026-06-13] 覆盖率：`PYTHONPATH=.:tools uv tool run --with pytest-cov pytest --cov=codegraph --cov-branch tests/ -q` -> `77 passed in 0.22s`，total coverage 96%，`codegraph/routing.py` coverage 94%。
 - [2026-06-15] P2 review 闭环：修复已知 macro/preprocessor 位置在 syntax helper 缺失时的要素2乐观误升，并为 `index_health=incomplete/unknown` 发结构化 `INDEX_INCOMPLETE` / `INDEX_UNKNOWN` notes；新增 P2 回归测试，P2 单测 `12 passed`。
 - [2026-06-15] P2 review gate：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `79 passed in 0.06s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `13 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 7 source files`。
+- [2026-06-15] R1 design change_3 同步：`docs/design.md` 更新至 v1.4.3，新增 `docs/design_changes/change_3.md`；代码同步 CandidateData 加 `CallEdgeResult`、删除调用边候选有损转换、QR7 加 `consumer_warning` 运行时校验；P2 单测 `13 passed`。
+- [2026-06-15] change_3 gate：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `80 passed in 0.05s`；`uv tool run ruff check .` -> `All checks passed!`；`uv tool run black --check .` -> `13 files would be left unchanged`；`uv tool run mypy codegraph` -> `Success: no issues found in 7 source files`。
