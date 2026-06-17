@@ -1,57 +1,51 @@
-# Design Change 提案 #4（P2 最终 review 发现的 design 内部矛盾）
+# Design Change 提案 #4（P2 review 发现的 design 内部矛盾）
 
-> 状态：**待 design owner 决策**
-> 来源：Phase 2 最终收口 review，一路（最较真路）抓到 §7 P6 与 R-依1 两条冻结陈述矛盾，
->       经人工在代码+design 双向核实属实。
-> 性质：**design.md 两处冻结陈述互相矛盾**，非 P2 实现错误（P2 忠实实现了 §7 P6）。
-> 与 P2 merge 的关系：**不阻塞 P2 merge**（P2 桩开发、不接真实 tree-sitter，不触发此矛盾）；
->       **必须在 P6（首次真实集成 clangd+tree-sitter）前解决**，否则 P6 行为不确定。
+> 状态：**已决策并应用（design.md v1.4.4）** —— 项1 采纳方案 A，项2 采纳澄清。
+> 来源：Phase 2 最终 review 抓到 §7 P6 与 R-依1 矛盾；Phase 3 后、Phase 4 前决策。
+> 决策依据：tree-sitter 内网可用性验证通过（见下）。
 
 ---
 
-## 项 1【MAJOR · P6 前必修】§7 P6「无 helper 降级一切」与 R-依1「功能不受损只是少候选」矛盾
-
-**矛盾两方**（design.md）：
-- §7 P6 (line 859)：「P4 缺失时要素2 保守标'不满足'并降级」
-- R-依1 (line 723) / line 705：tree-sitter binding 不可得时「功能不受损只是少候选」
-
-**矛盾推理**：要素2 的 preproc 判定由 tree-sitter 实现（MVP 用 tree-sitter AST preproc_* 判定）。
-故「无 syntax helper」≡「tree-sitter 不可用」。于是：
-- 按 §7 P6：tree-sitter 不可用 → 要素2 全判盲区 → 所有语义结果降级入候选 → **P6 永远出不了 OK**。
-- 但 R-依1 承诺：tree-sitter 不可用 → 功能不受损，**只是少候选**（仍应能出 OK 语义结果）。
-
-两者不可能同时成立：丢 tree-sitter 要么「只丢候选」（R-依1），要么「连 OK 都没了」（§7 P6 后果）。
-P2 已忠实实现 §7 P6（_has_preprocessor_blind_spot: provider is None → True），内部安全，
-但这使 R-依1 的承诺无法兑现。
-
-**修法（二选一，design owner 定）**：
-- A：接受 tree-sitter 为「语义 OK」的硬依赖。修 R-依1 措辞为「tree-sitter 不可用时无法
-  确认要素2，语义结果降级为候选；clangd 仍工作但不产 OK 语义」。诚实但削弱可用性。
-- B：提供一个最小的 stdlib preproc 启发式（不依赖 tree-sitter，如基于行内 `#`/已知宏名的
-  粗判），使 syntax helper「总是存在」。tree-sitter 仅增强候选能力。保住 R-依1 承诺。
-- 倾向 B：保住「丢 tree-sitter 只丢候选」的设计承诺，代价是写一个粗糙但纯 stdlib 的 preproc
-  判定。具体取舍由 design owner 在 P6 前定。
+## 验证前提（决策的支点）
+在目标 x86 开发环境实测：tree-sitter 0.25.2 + tree-sitter-c 0.24.2/cpp 0.23.4 直连 pip 可装、
+可 import、能解析 C 并正确识别 preproc_def 节点。CodeGraph 跑在 x86 开发机，syntax helper
+在此运行，不涉及 ARM 板。**结论：tree-sitter 内网可用。**
 
 ---
 
-## 项 2【MINOR · P6 前厘清】MACRO symbol_kind 一律降级，宏定义永远 OK 不了
+## 项 1【MAJOR】§7 P6「无 helper 降级」与 R-依1「功能不受损只是少候选」矛盾
 
-**现状**：routing.py `_has_preprocessor_blind_spot`：`symbol_kind == MACRO → return True`（一律盲区）。
+**矛盾**：要素2（宏伪位置判定）由 tree-sitter 实现。§7 P6 说无 helper 就降级（P2 已实现），
+意味着无 tree-sitter 时所有需要素2 的语义结果降级为候选、出不了 OK；但 R-依1 承诺无 tree-sitter
+「功能不受损只是少候选」。二者不可能同真——丢 tree-sitter 不只丢候选，还丢 OK 语义。
 
-**问题**：这混淆了两件事——
-- 「符号本身是宏」（get_definition 查一个宏的定义）：宏的**定义位置**是真实源码行，应能 OK；
-- 「位置是宏展开伪位置」（要素2 真正关心的）：clangd 把某符号解析到宏展开处，不可信。
-当前一刀切：只要 symbol_kind==MACRO 就降级，导致 get_definition/search 一个宏永远返回
-UNRESOLVED+候选，出不了 OK。这比 §4.4 要素2 的本意更严，且 design 未写明此行为。
+**决策：方案 A —— 采纳 §7 P6 行为（已实现、安全），修正 R-依1 等处的过度乐观措辞。**
+理由：tree-sitter 内网已验证可得，"硬依赖"不会让 CodeGraph 在实际环境残废；为不会发生的
+"装不上"场景写 stdlib 兜底（方案 B）是解决不存在的问题，且 B 的糙启发式本身是 bug 源/维护负担。
+保留 B 作为后备：**若 P6 实战发现 tree-sitter 有意外问题，再启 B。**（用户决策："先 A，实战有问题再定"）
 
-**修法**：design owner 厘清 MACRO 的预期——
-- 若「宏定义可以是 OK 语义结果」：去掉 symbol_kind==MACRO 短路，只靠位置判定要素2；
-- 若「宏一律保守降级」是有意为之：在 design §4.4 写明此约定。
-建议前者（宏定义是真实源码，应可 OK），但由 design owner 定。
+**修法（design.md v1.4.4，行为不变只改措辞 + 一处实现约束）**：
+- §1.4 [ASSUMPTION]→[VERIFIED]：tree-sitter 内网已验证可得，作要素2 语义依赖；不可得时诚实降级。
+- §5.4 / §6 R-依1 / §4.3 IssueCode 表：把"功能不受损只是少候选"改为诚实的两层降级语义
+  （失候选 + 要素2 无 helper 致语义降级为候选，clangd 仍工作但不产 OK 语义）。
+- §7 P6 行为不动（P2 已正确实现）。不写 stdlib 兜底代码。
 
 ---
 
-## 处理建议
-- 两项均 **P6 前必须解决**（P6 首次真实集成 tree-sitter 才触发），**不阻塞 P2 merge**。
-- 项1 是真矛盾必须二选一；项2 是行为澄清。
-- P2 代码无需为此改动（它忠实于现行 §7 P6）；解决方案在 P6 实现 tree-sitter adapter 时落地。
+## 项 2【MINOR】要素2 应按位置判、不按 symbol_kind
+
+**问题**：P2 的保守要素2 修复在 routing.py 引入 symbol_kind==MACRO 短路一律判盲区降级（注：短路在 P2 routing.py:510，非 P3；P3 的 clangd adapter 不产 MACRO，只在 P6 API 传 kind_filter=macro 时触发），导致 get_definition 查宏定义永远 OK 不了。
+但宏的**定义位置**（#define 那行）是真实源码，与"位置落在宏展开伪位置"是两回事。
+
+**决策：澄清要素2 判定对象是"位置"，非"符号类型"。**
+
+**修法（design.md v1.4.4）**：§4.4 要素2 加 [change_4 澄清]：syntax helper 按 position 判 preproc
+归属，不得用 symbol_kind==MACRO 短路；宏定义位置应可 OK。P4/P6 实现据此（P2 routing.py:510 现有的
+symbol_kind==MACRO 短路在 P4 接真实 helper 时移除）。
+
+---
+
+## 处理
+- 两项已应用至 design.md v1.4.4，均不改 §4 代码契约（接口/不变量/QR 不动）。
+- 项1 是措辞自洽化（行为 P2 已实现）；项2 是要素2 语义澄清 + P4 实现约束。
+- 本变更又改了 frozen design，应过一轮 AI review 确认措辞自洽、无新矛盾。
