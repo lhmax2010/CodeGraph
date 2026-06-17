@@ -47,12 +47,13 @@
   - 当前系统 `python3` 直接 `import tree_sitter` 失败，说明裸环境尚未安装 binding。
   - `uv tool run --with tree-sitter==0.25.2 --with tree-sitter-c==0.24.2 --with tree-sitter-cpp==0.23.4 python ...` 可成功 import。
   - 微型 parse 验证通过：C grammar 可解析 `#define FOO 1`，AST 中出现 `preproc_def` / `preproc_arg`。
+  - 已用 `uv venv --allow-existing --seed .venv` 建立项目本地 `.venv`，并安装 `tree-sitter==0.25.2`、`tree-sitter-c==0.24.2`、`tree-sitter-cpp==0.23.4`、`pytest`、`pytest-cov`；`.venv/bin/python` 可直接 import tree-sitter 并跑现有 90 测试。
 
 ## 风险档判断
 Phase 4 风险档候选：高。
 
 理由：
-- P4 第一次引入允许的第三方 runtime 例外，且当前裸 `python3` 未安装 binding；需要明确运行/测试依赖口径。
+- P4 第一次引入允许的第三方 runtime 例外；当前裸系统 `python3` 受 PEP 668 管理，P4 开发/测试改用项目本地 `.venv`，最终部署也应使用装有 tree-sitter binding 的服务 Python/venv。
 - change_4 要求回头修改已 Merge 的 P2 核心路由代码，必须只移除 `symbol_kind==MACRO` 一个短路条件，避免影响 QR1-9 和状态机。
 - syntax helper 是 P6 产出 OK 语义结果的前置；要素2误判会直接导致虚假可信或误降级。
 - tree-sitter AST 节点、坐标和 C/C++ grammar 差异会影响候选抽取与 preproc 位置判断，需要真实集成测试锁住。

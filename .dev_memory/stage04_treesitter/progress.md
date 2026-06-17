@@ -26,3 +26,5 @@
 - [2026-06-17] tree-sitter 环境预检：裸 `python3` 不能 import `tree_sitter`；`uv tool run --with tree-sitter==0.25.2 --with tree-sitter-c==0.24.2 --with tree-sitter-cpp==0.23.4` 可 import；微型 C parse 能识别 `preproc_def` / `preproc_arg`。
 - [2026-06-17] 从 `main@46ed936` 新建分支 `phase/4-treesitter`。
 - [2026-06-17] 创建 `.dev_memory/stage04_treesitter/` 计划与进度骨架；等待风险档与 restate gate 确认后再实现。
+- [2026-06-17] 环境确认：系统 `/usr/bin/python3` 受 PEP 668 管理，`python3 -m pip install --dry-run tree-sitter...` 被拒；`python3 -m venv .venv` 因缺 `ensurepip` 失败；改用 `uv venv --allow-existing --seed .venv` 建立项目本地 venv 并安装 `tree-sitter==0.25.2`、`tree-sitter-c==0.24.2`、`tree-sitter-cpp==0.23.4`、`pytest`、`pytest-cov`。
+- [2026-06-17] `.venv/bin/python` 直接 import tree-sitter 成功，微型 C parse 识别 `preproc_def` / `preproc_arg`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `90 passed in 0.24s`。
