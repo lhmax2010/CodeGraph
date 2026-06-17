@@ -23,6 +23,12 @@
 - 决策：syntax helper 对 `preproc_def` / `preproc_function_def` 先处理宏定义名例外，再处理一般 `preproc_*` 盲区。
   - 原因：`#define` 宏定义名本身是真实源码，应非伪位置；宏体 `preproc_arg` 等生成/展开区域才标盲区。
   - 排除的方案：所有 `preproc_*` 祖先一律盲区。该方案会重新误杀宏定义查询，违反 change_4。
+- 决策：`is_preprocessor_location()` 在文件无法读取/解析时返回 `True`。
+  - 原因：`False` 表示“确认非宏伪位置”，会让 P2 保留 OK；无法解析属于要素2无法确认，应按 change_4 安全原则保守降级。
+  - 排除的方案：继续返回 `False`。该方案会让 clangd 指向已删除或不可读文件的位置误升为可信语义结果。
+- 决策：清理 `_has_preprocessor_blind_spot()` 的 `symbol_kind` 死参，但保留 `item_kind` 局部变量。
+  - 原因：删 MACRO 短路后 blind-spot helper 不再需要 symbol_kind；但 `item_kind` 仍用于 semantic/candidate credibility，不能一并删除。
+  - 排除的方案：删除 `item_kind`。该方案会丢失结果真实 symbol_kind 标注。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -52,3 +58,5 @@
 - [2026-06-17] 静态 gate（均在 `.venv`）：`.venv/bin/ruff check .` -> `All checks passed!`；`.venv/bin/black --check .` -> `17 files would be left unchanged`；`.venv/bin/mypy codegraph` -> `Success: no issues found in 9 source files`。
 - [2026-06-17] 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `96 passed in 0.33s`，total coverage 92%，`codegraph/engines/treesitter_adapter.py` coverage 82%。
 - [2026-06-17] 编译检查：`.venv/bin/python -m compileall -q codegraph tools tests` 通过；系统 Python smoke：`tree_sitter_available()` 为 False、`create_treesitter_provider(...)` 返回 None，确认无 binding 时 import 不崩溃。
+- [2026-06-17] P4 review fix：修复 `is_preprocessor_location()` 文件无法解析时误返回 `False` 的 MAJOR，改为 `True` 保守降级；补不可解析文件 location 的 route_observation 回归。顺手删除 `_has_preprocessor_blind_spot()` 的 `symbol_kind` 死参和调用实参，确认 `item_kind` 仍用于 credibility。
+- [2026-06-17] P4 review fix gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_phase2_routing.py -q` -> `14 passed in 0.02s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_treesitter_adapter.py -q` -> `6 passed in 0.03s`；全量 `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `97 passed in 0.19s`；`.venv/bin/ruff check .` -> `All checks passed!`；`.venv/bin/black --check .` -> `17 files would be left unchanged`；`.venv/bin/mypy codegraph` -> `Success: no issues found in 9 source files`；coverage `97 passed in 0.34s`，total 93%，`codegraph/engines/treesitter_adapter.py` 83%；`.venv/bin/python -m compileall -q codegraph tools tests` 通过。

@@ -144,7 +144,7 @@ class TreeSitterProvider:
     def is_preprocessor_location(self, file: str, pos: Pos) -> bool:
         parsed = self._parse_file(file)
         if parsed is None:
-            return False
+            return True
         node = self._smallest_named_node_at(parsed.tree.root_node, pos)
         while node is not None:
             if node.type in {"preproc_def", "preproc_function_def"}:

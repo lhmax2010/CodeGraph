@@ -162,3 +162,21 @@ def test_no_helper_still_conservatively_downgrades_macro_definition(tmp_path: Pa
     assert result.status == QueryStatus.UNRESOLVED
     assert result.semantic_results == []
     assert result.syntactic_candidates[0].credibility.blind_spot_affects_result is True
+
+
+def test_unparsable_file_is_conservative_blind_spot(tmp_path: Path):
+    missing = tmp_path / "deleted.c"
+    provider = TreeSitterProvider((tmp_path,))
+    pos = Pos(0, 0)
+
+    assert provider.is_preprocessor_location(str(missing), pos) is True
+
+    result = route_observation(
+        query(missing),
+        EngineObservationResult(locations=(macro_location(missing, pos),)),
+        syntactic_provider=provider,
+    )
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.semantic_results == []
+    assert result.syntactic_candidates[0].credibility.blind_spot_affects_result is True

@@ -218,9 +218,7 @@ def route_observation(
         candidates: list[Candidate] = []
         for item in data:
             item_kind = _symbol_kind_for_data(item, symbol_kind)
-            blind_spot_affects = _has_preprocessor_blind_spot(
-                syntactic_provider, item, item_kind
-            )
+            blind_spot_affects = _has_preprocessor_blind_spot(syntactic_provider, item)
             coverage = _positive_coverage(observation, index_scope)
             if observation.symbol_ambiguous:
                 _append_note_once(notes, IssueCode.SYMBOL_AMBIGUOUS)
@@ -505,7 +503,6 @@ def _positive_coverage(
 def _has_preprocessor_blind_spot(
     syntactic_provider: SyntacticProvider | None,
     data: ResultData,
-    symbol_kind: SymbolKind,
 ) -> bool:
     if syntactic_provider is None:
         return True
