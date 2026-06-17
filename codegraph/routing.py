@@ -507,7 +507,7 @@ def _has_preprocessor_blind_spot(
     data: ResultData,
     symbol_kind: SymbolKind,
 ) -> bool:
-    if symbol_kind == SymbolKind.MACRO or syntactic_provider is None:
+    if syntactic_provider is None:
         return True
     file, pos = _file_and_pos(data)
     return (

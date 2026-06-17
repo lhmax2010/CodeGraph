@@ -471,6 +471,17 @@ def test_missing_syntax_helper_downgrades_element2_only():
     assert macro.syntactic_candidates[0].credibility.blind_spot_affects_result is True
 
 
+def test_macro_definition_can_be_semantic_when_helper_says_position_is_source():
+    result = route_observation(
+        q(),
+        EngineObservationResult(locations=(loc(kind=SymbolKind.MACRO.value),)),
+        syntactic_provider=FakeSyntacticProvider(),
+    )
+    assert result.status == QueryStatus.OK
+    assert len(result.semantic_results) == 1
+    assert result.semantic_results[0].credibility.symbol_kind == SymbolKind.MACRO
+
+
 def test_index_health_notes_are_structured_and_deduplicated():
     incomplete_index = route_observation(
         q(), EngineObservationResult(), index_health=IndexHealth.INCOMPLETE

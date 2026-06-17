@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：stage04_treesitter（进行中）
+- 当前活跃 stage：stage04_treesitter（待 Review）
 - 最后已确认 stage（已 Merge）：stage03_clangd_adapter
 - 设计基线：docs/design.md v1.4.4 Frozen（2026-06-17；R1 change_2/change_3/change_4 已应用；P4 以 change_4 为基线）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -14,7 +14,7 @@
 | stage01 | metadata | 已 Merge | N/A（按用户要求只 push 不走 PR） | `2e0d0aa` / `checkpoint/phase_1_metadata` |
 | stage02 | routing | 已 Merge | N/A（按用户要求只 push 不走 PR） | `b595157`（P2 代码最终提交） / `checkpoint/phase_2_routing` |
 | stage03 | clangd_adapter | 已 Merge | N/A（按用户要求只 push 不走 PR） | `3bb864c`（P3 含 hardening 收口点） / `checkpoint/phase_3_clangd_adapter` |
-| stage04 | treesitter | 进行中 | N/A（按用户要求只 push 不走 PR） | baseline `46ed936` |
+| stage04 | treesitter | 待 Review | N/A（按用户要求只 push 不走 PR） | baseline `46ed936` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
