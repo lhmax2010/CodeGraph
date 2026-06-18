@@ -107,6 +107,47 @@ def test_compile_commands_summary_resolves_relative_files_from_entry_directory(
     assert summary.existing_files == 2
 
 
+def test_compile_commands_summary_canonicalizes_symlink_and_parent_paths(
+    tmp_path: Path,
+):
+    src = tmp_path / "src"
+    nested = tmp_path / "nested"
+    src.mkdir()
+    nested.mkdir()
+    source = src / "main.c"
+    source.write_text("int main(void) { return 0; }", encoding="utf-8")
+    link = tmp_path / "link-src"
+    try:
+        link.symlink_to(src, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    (tmp_path / "compile_commands.json").write_text(
+        json.dumps(
+            [
+                {"directory": str(tmp_path), "file": "src/main.c", "arguments": ["cc"]},
+                {
+                    "directory": str(nested),
+                    "file": "../src/./main.c",
+                    "arguments": ["cc"],
+                },
+                {
+                    "directory": str(tmp_path),
+                    "file": "link-src/main.c",
+                    "arguments": ["cc"],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_compile_commands(tmp_path)
+
+    assert summary.entries == 3
+    assert summary.unique_tu_count == 1
+    assert summary.existing_files == 1
+
+
 def test_index_health_lower_bound_complete_incomplete_and_unknown(tmp_path: Path):
     one = tmp_path / "one.c"
     two = tmp_path / "two.c"
@@ -136,6 +177,18 @@ def test_index_health_lower_bound_complete_incomplete_and_unknown(tmp_path: Path
     complete = evaluate_index_health(cdb, scan_index_shards(index_dir))
     assert complete.health == IndexHealth.COMPLETE
     assert complete.reason == "shards_ge_unique_tu"
+
+
+def test_index_health_no_translation_units_is_unknown(tmp_path: Path):
+    (tmp_path / "compile_commands.json").write_text("[]", encoding="utf-8")
+    cdb = summarize_compile_commands(tmp_path)
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+
+    report = evaluate_index_health(cdb, scan_index_shards(index_dir))
+
+    assert report.health == IndexHealth.UNKNOWN
+    assert report.reason == "no_translation_units"
 
 
 def test_rewrite_cdb_for_index_reuses_existing_rewriter(tmp_path: Path):
@@ -171,6 +224,51 @@ def test_rewrite_cdb_for_index_reuses_existing_rewriter(tmp_path: Path):
     assert rewritten[0]["file"] == str(source_dir / "a.c")
     assert "--target=armv7l-tizen-linux-gnueabi" in rewritten[0]["arguments"]
     assert "--sysroot=" + str(buildroot) in rewritten[0]["arguments"]
+
+
+def test_rewrite_cdb_for_index_finds_tools_without_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    tools_dir = repo_root / "tools"
+    monkeypatch.delitem(sys.modules, "cdb_rewriter", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [
+            entry
+            for entry in sys.path
+            if Path(entry or ".").resolve() != tools_dir.resolve()
+        ],
+    )
+    buildroot = tmp_path / "buildroot"
+    source_dir = buildroot / "home" / "abuild" / "project"
+    source_dir.mkdir(parents=True)
+    (source_dir / "a.c").write_text("int a;", encoding="utf-8")
+    (buildroot / "usr" / "lib" / "gcc" / "armv7l-tizen-linux-gnueabi").mkdir(
+        parents=True
+    )
+    input_cdb = tmp_path / "input.json"
+    input_cdb.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": "/home/abuild/project",
+                    "file": "a.c",
+                    "arguments": ["cc", "-c", "a.c"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = rewrite_cdb_for_index(
+        input_cdb, tmp_path / "rewritten", buildroot=buildroot
+    )
+
+    assert result.entries_out == 1
+    assert str(tools_dir) in sys.path
 
 
 def test_background_index_smoke_builds_idx_shard(tmp_path: Path):
@@ -265,6 +363,56 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
 
     assert payload["health"]["health"] == IndexHealth.COMPLETE
     assert payload["health"]["idx_shards"] == 1
+
+
+def test_build_index_cli_invalid_input_reports_json(tmp_path: Path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "tools/build_index.py",
+            "--compile-commands-dir",
+            str(tmp_path / "missing"),
+            "--inspect-only",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 1
+    assert payload["health"] == IndexHealth.UNKNOWN
+    assert payload["reason"] == "invalid_input"
+    assert "FileNotFoundError" in payload["error"]
+    assert "Traceback" not in completed.stderr
+
+
+def test_build_index_cli_malformed_json_reports_json(tmp_path: Path):
+    (tmp_path / "compile_commands.json").write_text("{", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "tools/build_index.py",
+            "--compile-commands-dir",
+            str(tmp_path),
+            "--inspect-only",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 1
+    assert payload["health"] == IndexHealth.UNKNOWN
+    assert payload["reason"] == "invalid_input"
+    assert "JSONDecodeError" in payload["error"]
+    assert "Traceback" not in completed.stderr
 
 
 def test_build_index_cli_rewrites_cdb_and_builds_shards(tmp_path: Path):

@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -163,7 +164,7 @@ def rewrite_cdb_for_index(
 ) -> RewriteCdbResult:
     """Rewrite a GBS CDB by delegating to the existing tools/cdb_rewriter asset."""
 
-    rewriter = importlib.import_module("cdb_rewriter")
+    rewriter = _load_cdb_rewriter()
     buildroot_path = str(Path(buildroot).resolve())
     detected_target = target or rewriter.detect_triple(buildroot_path)
     cfg = rewriter.RewriteConfig(
@@ -273,6 +274,13 @@ def _entry_args(entry: dict[str, Any]) -> tuple[str, ...]:
         return tuple(str(arg) for arg in args)
     command = entry.get("command")
     return tuple(shlex.split(str(command))) if command else ()
+
+
+def _load_cdb_rewriter() -> Any:
+    tools_dir = Path(__file__).resolve().parents[1] / "tools"
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+    return importlib.import_module("cdb_rewriter")
 
 
 def _entry_file_path(entry: dict[str, Any], cdb_dir: Path) -> Path | None:

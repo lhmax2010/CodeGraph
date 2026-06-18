@@ -24,6 +24,11 @@ from codegraph.indexing import (  # noqa: E402 - script bootstraps repo root fir
 )
 
 
+def _dump_json(payload: object) -> None:
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build CodeGraph clangd background-index and emit index_health."
@@ -55,47 +60,61 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.input_cdb:
-        if not args.output_dir or not args.buildroot:
-            parser.error("--input-cdb requires --output-dir and --buildroot")
-        rewrite = rewrite_cdb_for_index(
-            args.input_cdb,
-            args.output_dir,
-            buildroot=args.buildroot,
-            target=args.target,
-        )
-        compile_dir = str(Path(rewrite.output_cdb).parent)
-    else:
-        compile_dir = str(Path(args.compile_commands_dir).resolve())
-        rewrite = None
-
-    if args.inspect_only:
-        cdb = summarize_compile_commands(compile_dir)
-        shards = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
-        payload = {
-            "rewrite": asdict(rewrite) if rewrite is not None else None,
-            "compile_commands": asdict(cdb),
-            "shards": asdict(shards),
-            "health": asdict(evaluate_index_health(cdb, shards)),
-        }
-    else:
-        result = run_background_index(
-            BackgroundIndexConfig(
-                compile_commands_dir=compile_dir,
-                clangd_path=args.clangd,
-                jobs=args.jobs,
-                max_wait_seconds=args.max_wait,
-                poll_interval_seconds=args.poll_interval,
-                stable_rounds=args.stable_rounds,
+    try:
+        if args.input_cdb:
+            if not args.output_dir or not args.buildroot:
+                parser.error("--input-cdb requires --output-dir and --buildroot")
+            rewrite = rewrite_cdb_for_index(
+                args.input_cdb,
+                args.output_dir,
+                buildroot=args.buildroot,
+                target=args.target,
             )
-        )
-        payload = {
-            "rewrite": asdict(rewrite) if rewrite is not None else None,
-            "build": asdict(result),
-        }
+            compile_dir = str(Path(rewrite.output_cdb).parent)
+        else:
+            compile_dir = str(Path(args.compile_commands_dir).resolve())
+            rewrite = None
 
-    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
-    sys.stdout.write("\n")
+        if args.inspect_only:
+            cdb = summarize_compile_commands(compile_dir)
+            shards = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
+            payload = {
+                "rewrite": asdict(rewrite) if rewrite is not None else None,
+                "compile_commands": asdict(cdb),
+                "shards": asdict(shards),
+                "health": asdict(evaluate_index_health(cdb, shards)),
+            }
+        else:
+            result = run_background_index(
+                BackgroundIndexConfig(
+                    compile_commands_dir=compile_dir,
+                    clangd_path=args.clangd,
+                    jobs=args.jobs,
+                    max_wait_seconds=args.max_wait,
+                    poll_interval_seconds=args.poll_interval,
+                    stable_rounds=args.stable_rounds,
+                )
+            )
+            payload = {
+                "rewrite": asdict(rewrite) if rewrite is not None else None,
+                "build": asdict(result),
+            }
+    except (
+        FileNotFoundError,
+        NotADirectoryError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        _dump_json(
+            {
+                "error": f"{type(exc).__name__}: {exc}",
+                "health": "unknown",
+                "reason": "invalid_input",
+            }
+        )
+        return 1
+
+    _dump_json(payload)
     return 0
 
 

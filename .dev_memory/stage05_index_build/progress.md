@@ -32,6 +32,9 @@
 - 决策：clangd 启动或 LSP 阶段异常应结构化降级为 `index_health=unknown`，而不是让 CLI traceback。
   - 原因：P5 只产出索引健康事实；构建异常是 unknown 输入，不能变成工具崩溃或隐式无结果。
   - 排除的方案：让异常向上抛给调用方。该方案会让 `tools/build_index.py` 不能稳定产出 JSON。
+- 决策：P5 真机验收前先修 CLI 非法输入与库形态 import 两个 MINOR，但不改下界判据/三态语义。
+  - 原因：缺失/畸形 CDB 和外部库形态调用都是环境健壮性问题，修复后 reviewer/真机脚本不会拿到假失败或 `ModuleNotFoundError`。
+  - 排除的方案：把输入错误也塞进 `run_background_index()`。该方案会混淆 build 失败与输入无效，且扩大 P5 核心逻辑改动面。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -76,3 +79,6 @@
 - [2026-06-18] review fix 后 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `11 passed in 1.28s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `108 passed in 1.42s`；ruff/black/mypy 全绿。
 - [2026-06-18] review fix 后覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `108 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%；`.venv/bin/python -m compileall -q codegraph tools tests` -> 通过。
 - [2026-06-18] 三路最终 review：本机自审、Codex 子代理、Claude CLI 均确认无阻塞问题；结果已记录到 `docs/review/phase_5_review_result.md`。剩余 P5 merge 前 gate 是用户确认窗口后重跑一次 ARM 完整建库并记录耗时。
+- [2026-06-18] 真机验收前 MINOR 修复：`tools/build_index.py` 对缺失/畸形 CDB 输出结构化 JSON `{health: unknown, reason: invalid_input}` 且 exit code 为 1；`rewrite_cdb_for_index()` 在库形态下自行把项目 `tools/` 加入 `sys.path` 后加载 `cdb_rewriter`。
+- [2026-06-18] 顺手补测：空 CDB -> `no_translation_units`；symlink/`..` 路径 canonical 去重；tools 不在 `PYTHONPATH` 仍可 rewrite；不存在目录与畸形 JSON 的 CLI JSON 错误输出。
+- [2026-06-18] MINOR 修复后 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `16 passed in 1.32s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.51s`；ruff/black/mypy/compileall 全绿；覆盖率 `113 passed`，总 92%，`codegraph/indexing.py` 91%。
