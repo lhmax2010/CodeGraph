@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -200,7 +201,7 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
 
     completed = subprocess.run(
         [
-            ".venv/bin/python",
+            sys.executable,
             "tools/build_index.py",
             "--compile-commands-dir",
             str(tmp_path),
@@ -242,7 +243,7 @@ def test_build_index_cli_rewrites_cdb_and_builds_shards(tmp_path: Path):
 
     completed = subprocess.run(
         [
-            ".venv/bin/python",
+            sys.executable,
             "tools/build_index.py",
             "--input-cdb",
             str(input_cdb),

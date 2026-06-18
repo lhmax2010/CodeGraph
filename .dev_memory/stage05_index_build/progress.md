@@ -23,6 +23,9 @@
 - 决策：CLI 同时支持 `--inspect-only` 读取现有分片和 `--input-cdb` 从 GBS CDB 改写后驱动 clangd background-index。
   - 原因：开发期需要快速验证现有 ARM/x86 分片；P5 验收又必须证明从 CDB 到 `.idx` 的完整流程可跑。
   - 排除的方案：只实现读现成 `.idx`。该方案无法满足 Phase 5 DoD 的“可复现建库”要求。
+- 决策：CLI 子进程测试改用 `sys.executable`，不再硬编码 `.venv/bin/python`。
+  - 原因：reviewer/CI 可能不在项目根运行，也可能没有 `.venv`；测试应跟随当前 pytest 解释器，避免环境假失败。
+  - 排除的方案：继续要求从仓库根的 `.venv` 跑测试。该方案与可移植测试要求冲突。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -60,3 +63,4 @@
 - [2026-06-18] 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `105 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%。
 - [2026-06-18] 真实现有分片 inspect-only：ARM `/home/linhao/Toolchain/codes/rw_arm` -> `complete shards_ge_unique_tu 3593 1303`；x86 `/home/linhao/Toolchain/codes/rw_x86` -> `complete shards_ge_unique_tu 1178 157`。
 - [2026-06-18] 小型 CLI 端到端测试已覆盖 `input_cdb -> cdb_rewriter -> clangd background-index -> .idx -> complete`；完整 ARM 50s 重建尚未触发，按用户要求等 P5 收口验收前确认窗口。
+- [2026-06-18] CLI 测试改用 `sys.executable` 保证可移植；已从 `/tmp` 运行 `PYTHONPATH=/home/linhao/Toolchain/development/CodeGraph:/home/linhao/Toolchain/development/CodeGraph/tools /home/linhao/Toolchain/development/CodeGraph/.venv/bin/python -m pytest /home/linhao/Toolchain/development/CodeGraph/tests/test_indexing.py -q -k 'build_index_cli'` -> `2 passed, 6 deselected in 0.59s`。
