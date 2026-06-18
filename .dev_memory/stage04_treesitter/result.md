@@ -1,7 +1,7 @@
 # Stage 04 - Treesitter / Result
 
 ## 最终状态
-待 Review。P4 实现已完成，等待多路 review 与人工核查；按用户指令，本项目只 `git push`，不创建 PR。
+已 Merge。P4 修复确认三路通过，按用户指令 fast-forward merge 到 main；本项目只 `git push`，不创建 PR。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools python3 -m pytest tests/ -q` -> `90 passed in 0.21s`。
@@ -20,7 +20,8 @@
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
 - Baseline：`46ed936 [design] apply change_4 v1.4.4: tree-sitter as 要素2 semantic dependency (方案A)`。
 - 当前分支：`phase/4-treesitter`。
-- 对应 Git Commit：待提交后填写。
+- P4 代码与 review fix 收口提交：`5476699 [Phase 4] fix: conservative blind-spot when file unparsable + drop dead param`。
+- Checkpoint：`checkpoint/phase_4_treesitter`。
 
 ## 遗留问题 / 风险
 - 当前裸 `python3` 未安装 tree-sitter binding；通过 `uv tool run --with tree-sitter==0.25.2 --with tree-sitter-c==0.24.2 --with tree-sitter-cpp==0.23.4` 可运行真实 tree-sitter。P4 实现前需确认依赖运行口径。
@@ -29,7 +30,8 @@
 
 ## 后续待处理
 - [P6前] 候选符号过度采集：`_symbols_from_declaration()` 当前会把初始化表达式里的 identifier 也采成候选，可能产生幻影/错类候选；P6 真实代码前收紧到只采声明的标识符。
-- [P6前] 宏体内保守近似：当前宏体所有位置判伪位置；P6 真机需验证 clangd 实际会返回哪些宏内位置，再决定是否细化。
+- [P6前] 宏体内保守近似：当前宏体所有位置判伪位置。
+- [P6前·新] 真机验证 clangd 实际返回的宏相关位置，确认 helper 的位置判定在真实 Tizen 代码上够用（diagnostics/位置粒度）。
 
 ## 下一阶段计划
-- 进入 Phase 4 review；review 通过后再按收尾流程 merge/tag/checkpoint。
+- 进入 Phase 5：离线建库 + index_health。
