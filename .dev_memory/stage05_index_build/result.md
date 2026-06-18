@@ -17,6 +17,7 @@
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
+- Review 结果：`docs/review/phase_5_review_result.md`，三路最终 review 均无阻塞问题。
 - Baseline：`d2c381b [Phase 4] docs: close treesitter stage before merge`。
 - 当前分支：`phase/5-index-build`。
 - 对应 Git Commit：P5 实现提交位于 `phase/5-index-build` 分支 HEAD；最终收口 commit 待 review/ARM 验收闭环后填写。

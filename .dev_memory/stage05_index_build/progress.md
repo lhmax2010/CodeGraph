@@ -75,3 +75,4 @@
 - [2026-06-18] 补测 review 发现：相对路径同名 TU 去重、missing `file` 不计入 TU、缺失 clangd 直接 API 降级、缺失 clangd CLI 仍输出 JSON/UNKNOWN。
 - [2026-06-18] review fix 后 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `11 passed in 1.28s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `108 passed in 1.42s`；ruff/black/mypy 全绿。
 - [2026-06-18] review fix 后覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `108 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%；`.venv/bin/python -m compileall -q codegraph tools tests` -> 通过。
+- [2026-06-18] 三路最终 review：本机自审、Codex 子代理、Claude CLI 均确认无阻塞问题；结果已记录到 `docs/review/phase_5_review_result.md`。剩余 P5 merge 前 gate 是用户确认窗口后重跑一次 ARM 完整建库并记录耗时。
