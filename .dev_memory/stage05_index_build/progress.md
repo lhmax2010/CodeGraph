@@ -26,6 +26,12 @@
 - 决策：CLI 子进程测试改用 `sys.executable`，不再硬编码 `.venv/bin/python`。
   - 原因：reviewer/CI 可能不在项目根运行，也可能没有 `.venv`；测试应跟随当前 pytest 解释器，避免环境假失败。
   - 排除的方案：继续要求从仓库根的 `.venv` 跑测试。该方案与可移植测试要求冲突。
+- 决策：P5 review 发现相对 `file` 路径必须按 CDB entry 的 `directory` 解析，不能按当前进程 cwd 解析。
+  - 原因：compile_commands 标准允许相对 `file`；按 cwd 解析会把不同目录下同名 TU 错误去重，可能让 `shards >= unique_TU` 变得过于乐观。
+  - 排除的方案：仅依赖 cdb_rewriter 输出绝对路径。该方案覆盖当前主流程，但 inspect-only/外部 CDB 仍可能误判。
+- 决策：clangd 启动或 LSP 阶段异常应结构化降级为 `index_health=unknown`，而不是让 CLI traceback。
+  - 原因：P5 只产出索引健康事实；构建异常是 unknown 输入，不能变成工具崩溃或隐式无结果。
+  - 排除的方案：让异常向上抛给调用方。该方案会让 `tools/build_index.py` 不能稳定产出 JSON。
 
 ## 改动摘要
 - 文件/模块：`.dev_memory/INDEX.md`
@@ -64,3 +70,8 @@
 - [2026-06-18] 真实现有分片 inspect-only：ARM `/home/linhao/Toolchain/codes/rw_arm` -> `complete shards_ge_unique_tu 3593 1303`；x86 `/home/linhao/Toolchain/codes/rw_x86` -> `complete shards_ge_unique_tu 1178 157`。
 - [2026-06-18] 小型 CLI 端到端测试已覆盖 `input_cdb -> cdb_rewriter -> clangd background-index -> .idx -> complete`；完整 ARM 50s 重建尚未触发，按用户要求等 P5 收口验收前确认窗口。
 - [2026-06-18] CLI 测试改用 `sys.executable` 保证可移植；已从 `/tmp` 运行 `PYTHONPATH=/home/linhao/Toolchain/development/CodeGraph:/home/linhao/Toolchain/development/CodeGraph/tools /home/linhao/Toolchain/development/CodeGraph/.venv/bin/python -m pytest /home/linhao/Toolchain/development/CodeGraph/tests/test_indexing.py -q -k 'build_index_cli'` -> `2 passed, 6 deselected in 0.59s`。
+- [2026-06-18] 三路 review 第一轮：本机自审 + Codex 子代理 + Claude CLI。有效发现：相对 `file` 按 cwd 解析可能误去重；clangd 启动/LSP 异常未结构化降级；CLI 测试 `.venv/bin/python` 硬编码已先修。
+- [2026-06-18] 修复 review 发现：新增 `_entry_file_path()` 按 `directory` 解析相对 `file`，`summarize_compile_commands()` 与 `_default_trigger_files()` 共用；`run_background_index()` 捕获构建异常并返回 `UNKNOWN/index_build_failed`。
+- [2026-06-18] 补测 review 发现：相对路径同名 TU 去重、missing `file` 不计入 TU、缺失 clangd 直接 API 降级、缺失 clangd CLI 仍输出 JSON/UNKNOWN。
+- [2026-06-18] review fix 后 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `11 passed in 1.28s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `108 passed in 1.42s`；ruff/black/mypy 全绿。
+- [2026-06-18] review fix 后覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `108 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%；`.venv/bin/python -m compileall -q codegraph tools tests` -> 通过。

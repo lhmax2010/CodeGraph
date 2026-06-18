@@ -5,15 +5,15 @@
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `97 passed in 0.21s`。
-- UT 结果：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `105 passed in 1.37s`。
-- P5 定向：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `8 passed in 1.18s`。
-- 覆盖率（行/分支）：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `105 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%。
+- UT 结果：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `108 passed in 1.42s`。
+- P5 定向：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `11 passed in 1.28s`。
+- 覆盖率（行/分支）：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `108 passed`，总覆盖率 92%，`codegraph/indexing.py` 90%。
 - 静态 gate：
   - `.venv/bin/ruff check .` -> `All checks passed!`
   - `.venv/bin/black --check .` -> `20 files would be left unchanged`
   - `.venv/bin/mypy codegraph` -> `Success: no issues found in 10 source files`
   - `.venv/bin/python -m compileall -q codegraph tools tests` -> 通过
-- 补测内容：unique TU 去重、`command` 字符串解析、complete/incomplete/unknown 三态 health、复用 `cdb_rewriter`、小型真实 clangd 建库、真实 ARM/x86 现有分片 inspect-only、CLI inspect-only、CLI `input_cdb -> rewritten CDB -> clangd background-index -> .idx -> index_health` 端到端。
+- 补测内容：unique TU 去重、相对 `file` 按 entry `directory` 解析、missing `file` 不计入 TU、`command` 字符串解析、complete/incomplete/unknown 三态 health、缺失 clangd 降级为 `UNKNOWN/index_build_failed`、复用 `cdb_rewriter`、小型真实 clangd 建库、真实 ARM/x86 现有分片 inspect-only、CLI inspect-only、CLI `input_cdb -> rewritten CDB -> clangd background-index -> .idx -> index_health` 端到端。
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。

@@ -80,6 +80,33 @@ def test_compile_commands_summary_parses_command_string(tmp_path: Path):
     assert summary.sysroots == ("--sysroot=/opt/tizen",)
 
 
+def test_compile_commands_summary_resolves_relative_files_from_entry_directory(
+    tmp_path: Path,
+):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "main.c").write_text("int left;", encoding="utf-8")
+    (right / "main.c").write_text("int right;", encoding="utf-8")
+    (tmp_path / "compile_commands.json").write_text(
+        json.dumps(
+            [
+                {"directory": str(left), "file": "main.c", "arguments": ["cc"]},
+                {"directory": str(right), "file": "main.c", "arguments": ["cc"]},
+                {"directory": str(right), "arguments": ["cc"]},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_compile_commands(tmp_path)
+
+    assert summary.entries == 3
+    assert summary.unique_tu_count == 2
+    assert summary.existing_files == 2
+
+
 def test_index_health_lower_bound_complete_incomplete_and_unknown(tmp_path: Path):
     one = tmp_path / "one.c"
     two = tmp_path / "two.c"
@@ -171,6 +198,28 @@ def test_background_index_smoke_builds_idx_shard(tmp_path: Path):
     assert result.stable is True
     assert result.shard_report.idx_shards >= 1
     assert result.health_report.health == IndexHealth.COMPLETE
+
+
+def test_background_index_missing_clangd_degrades_to_unknown(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(tmp_path / "missing-clangd"),
+            max_wait_seconds=0.1,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.stable is False
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_build_failed"
+    assert "FileNotFoundError" in result.stderr_tail
 
 
 def test_existing_real_arm_x86_indices_are_complete_when_available():
@@ -274,3 +323,35 @@ def test_build_index_cli_rewrites_cdb_and_builds_shards(tmp_path: Path):
     assert payload["build"]["stable"] is True
     assert payload["build"]["shard_report"]["idx_shards"] >= 1
     assert payload["build"]["health_report"]["health"] == IndexHealth.COMPLETE
+
+
+def test_build_index_cli_reports_unknown_when_clangd_missing(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "tools/build_index.py",
+            "--compile-commands-dir",
+            str(tmp_path),
+            "--clangd",
+            str(tmp_path / "missing-clangd"),
+            "--max-wait",
+            "0.1",
+            "--poll-interval",
+            "0.01",
+            "--stable-rounds",
+            "1",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["build"]["exit_code"] is None
+    assert payload["build"]["health_report"]["health"] == IndexHealth.UNKNOWN
+    assert payload["build"]["health_report"]["reason"] == "index_build_failed"

@@ -91,8 +91,12 @@ def summarize_compile_commands(path_or_dir: str | Path) -> CompileCommandsSummar
     if not isinstance(entries, list):
         raise ValueError(f"compile_commands must be a list: {cdb_path}")
 
-    files = tuple(str(Path(str(entry.get("file", ""))).resolve()) for entry in entries)
-    unique_files = tuple(sorted(set(file for file in files if file)))
+    files = tuple(
+        str(path)
+        for entry in entries
+        if (path := _entry_file_path(entry, cdb_path.parent)) is not None
+    )
+    unique_files = tuple(sorted(set(files)))
     existing = sum(1 for file in unique_files if Path(file).exists())
     targets: set[str] = set()
     sysroots: set[str] = set()
@@ -192,13 +196,16 @@ def rewrite_cdb_for_index(
 def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult:
     compile_dir = Path(config.compile_commands_dir).resolve()
     cdb = summarize_compile_commands(compile_dir)
-    trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
     start = time.monotonic()
-    client = _IndexLspClient(config)
+    client: _IndexLspClient | None = None
     stable = False
     stderr_tail = ""
     exit_code: int | None = None
+    error_reason: str | None = None
+    error_tail = ""
     try:
+        trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
+        client = _IndexLspClient(config)
         client.initialize()
         for file in trigger_files:
             client.open_file(file)
@@ -210,15 +217,27 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
             poll_interval_seconds=config.poll_interval_seconds,
         )
         client.shutdown()
+    except Exception as exc:
+        error_reason = "index_build_failed"
+        error_tail = f"{type(exc).__name__}: {exc}"
     finally:
-        exit_code, stderr_tail = client.close()
+        if client is not None:
+            exit_code, stderr_tail = client.close()
+        if error_tail:
+            stderr_tail = "\n".join(part for part in (stderr_tail, error_tail) if part)
 
     elapsed = time.monotonic() - start
     shard_report = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
     health = (
-        evaluate_index_health(cdb, shard_report)
-        if stable and exit_code == 0
-        else _health(IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report)
+        _health(IndexHealth.UNKNOWN, error_reason, cdb, shard_report)
+        if error_reason is not None
+        else (
+            evaluate_index_health(cdb, shard_report)
+            if stable and exit_code == 0
+            else _health(
+                IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report
+            )
+        )
     )
     return BackgroundIndexResult(
         compile_commands_dir=str(compile_dir),
@@ -256,6 +275,21 @@ def _entry_args(entry: dict[str, Any]) -> tuple[str, ...]:
     return tuple(shlex.split(str(command))) if command else ()
 
 
+def _entry_file_path(entry: dict[str, Any], cdb_dir: Path) -> Path | None:
+    raw_file = str(entry.get("file", ""))
+    if not raw_file:
+        return None
+    file_path = Path(raw_file)
+    if file_path.is_absolute():
+        return file_path.resolve()
+
+    raw_directory = str(entry.get("directory", ""))
+    directory = Path(raw_directory) if raw_directory else cdb_dir
+    if not directory.is_absolute():
+        directory = cdb_dir / directory
+    return (directory / file_path).resolve()
+
+
 def _default_trigger_files(
     compile_dir: Path, cdb: CompileCommandsSummary
 ) -> tuple[str, ...]:
@@ -263,8 +297,8 @@ def _default_trigger_files(
     with (compile_dir / "compile_commands.json").open(encoding="utf-8") as fh:
         entries = json.load(fh)
     for entry in entries:
-        file = Path(str(entry.get("file", ""))).resolve()
-        if file.exists():
+        file = _entry_file_path(entry, compile_dir)
+        if file is not None and file.exists():
             return (str(file),)
     raise ValueError(f"no existing files in compile_commands: {compile_dir}")
 
