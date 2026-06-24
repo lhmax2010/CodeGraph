@@ -82,3 +82,4 @@
 - [2026-06-18] 真机验收前 MINOR 修复：`tools/build_index.py` 对缺失/畸形 CDB 输出结构化 JSON `{health: unknown, reason: invalid_input}` 且 exit code 为 1；`rewrite_cdb_for_index()` 在库形态下自行把项目 `tools/` 加入 `sys.path` 后加载 `cdb_rewriter`。
 - [2026-06-18] 顺手补测：空 CDB -> `no_translation_units`；symlink/`..` 路径 canonical 去重；tools 不在 `PYTHONPATH` 仍可 rewrite；不存在目录与畸形 JSON 的 CLI JSON 错误输出。
 - [2026-06-18] MINOR 修复后 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_indexing.py -q` -> `16 passed in 1.32s`；`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.51s`；ruff/black/mypy/compileall 全绿；覆盖率 `113 passed`，总 92%，`codegraph/indexing.py` 91%。
+- [2026-06-24] ARM 真机完整建库验收完成：从 `/home/linhao/Toolchain/codes/rw_arm/compile_commands.json` 到临时目录 `/tmp/codegraph-p5-arm-index-20260624-154443`，建库 wall 31.701s / elapsed 31.405s，产出 3593 `.idx` / 47M，`unique_tu_count=1303`，`index_health=complete`；加载复用 wall 1.345s / elapsed 1.221s。未覆盖现有 `rw_arm/.cache`。
