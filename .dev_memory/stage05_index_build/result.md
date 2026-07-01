@@ -24,7 +24,7 @@
 - 分片结果：3593 `.idx` / 47M；`unique_tu_count=1303`；`index_health=complete`，reason=`shards_ge_unique_tu`。
 - 加载/复用耗时：`PYTHONPATH=.:tools .venv/bin/python tools/build_index.py --compile-commands-dir /tmp/codegraph-p5-arm-index-20260624-154443 --jobs 8 --max-wait 60 --poll-interval 0.2 --stable-rounds 2` -> wall time 1.345s，`load.elapsed_seconds=1.221s`，3593 `.idx`，`index_health=complete`。
 - DoD 结论：从真实 ARM CDB 到 rewritten CDB 再到 clangd background-index 分片的完整流程已在临时目录复现；未覆盖现有 `/home/linhao/Toolchain/codes/rw_arm/.cache` 分片。
-- P7 留底（非 P5 gate）：`verify_clangd.py` 对 `gstelement.c` 中 `gst_element_set_state` 可完成 definition/references 语义探测，返回 references=2；未复现可行性报告中的 389 refs/62 files，留给 P7 继续核查。
+- [P7 必查·核心] `find_references` 跨 TU 验证（389 refs/62 files for `gst_element_set_state`）：真机 `verify_clangd.py` 只返回 2，因其硬编码 `--background-index=false`（单 TU 模式），结构上消费不了 P5 建的全局分片。可行性报告对照：`--background-index=false` -> 2 refs，`--background-index=true` -> 389 refs/62 files。P7 的 `find_references` 必须用消费 background-index 的方式启动 clangd（`--background-index=true` 或加载 P5 的 3593 分片）才能复现 389/62。这是 P7 核心价值验收。P5 索引本身健康（3593 complete，与拿到 389 的参考索引一致）。
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
