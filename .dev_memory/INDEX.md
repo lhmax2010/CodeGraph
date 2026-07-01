@@ -15,7 +15,7 @@
 | stage02 | routing | 已 Merge | N/A（按用户要求只 push 不走 PR） | `b595157`（P2 代码最终提交） / `checkpoint/phase_2_routing` |
 | stage03 | clangd_adapter | 已 Merge | N/A（按用户要求只 push 不走 PR） | `3bb864c`（P3 含 hardening 收口点） / `checkpoint/phase_3_clangd_adapter` |
 | stage04 | treesitter | 已 Merge | N/A（按用户要求只 push 不走 PR） | `5476699`（P4 review fix 收口） / `checkpoint/phase_4_treesitter` |
-| stage05 | index_build | 已 Merge | N/A（按用户要求只 push 不走 PR） | `cea43d9` / checkpoint 待打 |
+| stage05 | index_build | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_5_index_build`（逻辑收口 `cea43d9`） |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
