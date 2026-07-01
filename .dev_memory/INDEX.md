@@ -3,8 +3,8 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：stage05_index_build（待 Merge，ARM 完整建库验收已完成）
-- 最后已确认 stage（已 Merge）：stage04_treesitter
+- 当前活跃 stage：无（stage05_index_build 已 Merge）
+- 最后已确认 stage（已 Merge）：stage05_index_build
 - 设计基线：docs/design.md v1.4.4 Frozen（2026-06-17；R1 change_2/change_3/change_4 已应用；P4 以 change_4 为基线）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
 
@@ -15,7 +15,7 @@
 | stage02 | routing | 已 Merge | N/A（按用户要求只 push 不走 PR） | `b595157`（P2 代码最终提交） / `checkpoint/phase_2_routing` |
 | stage03 | clangd_adapter | 已 Merge | N/A（按用户要求只 push 不走 PR） | `3bb864c`（P3 含 hardening 收口点） / `checkpoint/phase_3_clangd_adapter` |
 | stage04 | treesitter | 已 Merge | N/A（按用户要求只 push 不走 PR） | `5476699`（P4 review fix 收口） / `checkpoint/phase_4_treesitter` |
-| stage05 | index_build | 待 Merge | N/A（按用户要求只 push 不走 PR） | ARM 验收记录在 `phase/5-index-build` HEAD / 逻辑收口 `6aa3462` |
+| stage05 | index_build | 已 Merge | N/A（按用户要求只 push 不走 PR） | `cea43d9` / checkpoint 待打 |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
