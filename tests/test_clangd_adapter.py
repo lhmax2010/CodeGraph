@@ -110,6 +110,29 @@ def make_adapter(fake: FakeClient, tmp_path: Path) -> ClangdAdapter:
     )
 
 
+def test_background_index_flag_is_opt_in(tmp_path: Path):
+    calls: list[tuple[str, list[str], str, bool, bool]] = []
+
+    def factory(
+        clangd_path: str,
+        extra_args: list[str],
+        cwd: str,
+        verbose: bool,
+        background_index: bool,
+    ) -> FakeClient:
+        calls.append((clangd_path, extra_args, cwd, verbose, background_index))
+        return FakeClient({"initialize": [{}]})
+
+    ClangdAdapter(ClangdAdapterConfig(str(tmp_path)), client_factory=factory).close()
+    ClangdAdapter(
+        ClangdAdapterConfig(str(tmp_path), background_index=True),
+        client_factory=factory,
+    ).close()
+
+    assert calls[0][4] is False
+    assert calls[1][4] is True
+
+
 def lsp_range(
     start_line: int, start_char: int, end_line: int, end_char: int
 ) -> dict[str, dict[str, int]]:

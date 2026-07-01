@@ -33,7 +33,12 @@ from typing import Any, Optional
 
 class LSPClient:
     def __init__(
-        self, clangd_path: str, extra_args: list[str], cwd: str, verbose: bool = False
+        self,
+        clangd_path: str,
+        extra_args: list[str],
+        cwd: str,
+        verbose: bool = False,
+        background_index: bool = False,
     ):
         self.verbose = verbose
         self._id = 0
@@ -42,7 +47,7 @@ class LSPClient:
         self._diagnostics: dict[str, list] = {}
         args = [
             clangd_path,
-            "--background-index=false",  # 同步、可预测
+            f"--background-index={'true' if background_index else 'false'}",
             "--pch-storage=memory",
             "--log=error",
         ] + extra_args

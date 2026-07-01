@@ -11,14 +11,27 @@
 - 决策：P6 必须显式处理 clangd background-index 模式。
   - 原因：当前 `ClangdAdapter` 复用的 `LSPClient` 默认带 `--background-index=false`，与 P5 result 里 2 refs vs 389 refs 的证据一致；真实跨文件查询需要消费 P5 全局索引。
   - 排除的方案：沿用单 TU 模式冒充端到端。
+- 决策：P6 API 在 background-index readiness 未确认时，把本次查询的 `index_health` 降为 `unknown`。
+  - 原因：clangd background-index 异步加载；若空结果发生在索引未 ready 阶段，继续传 P5 `complete` 会让 P2 可能走 not_found，形成虚假否定。
+  - 排除的方案：只看 P5 分片健康就允许空结果进入 not_found 分支。
 
 ## 改动摘要
 - 文件/模块：
   - `.dev_memory/INDEX.md`：登记 stage06 进行中。
   - `.dev_memory/stage05_index_build/result.md`：校正 stage05 已 Merge 事实。
   - `.dev_memory/stage06_e2e/plan.md`：记录 P6 计划、边界、集成问题。
+  - `tools/verify_clangd.py`：对复用资产做最小修改，为 `LSPClient` 增加 `background_index` 可选参数，默认仍为 `False`。
+  - `codegraph/engines/clangd_adapter.py`：`ClangdAdapterConfig` 增加 `background_index` 开关，默认 `False`，并新增 `warm_file()` 供 P6 触发 clangd 加载 CDB/索引。
+  - `codegraph/api.py`：新增 P6 库 API 薄层，组装 P3/P4/P5 后调用 P2 routing。
+  - `tests/test_api.py`：新增 P6 API 端到端/防虚假 not_found/非法输入/engine failure/精确过滤测试。
 
 ## 进度日志
 - 2026-07-01 从 `main` 开 `phase/6-e2e-search-def`，baseline `7717257 [Phase 5] docs: record index build checkpoint`。
 - 2026-07-01 baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
 - 2026-07-01 探测：`/home/linhao/Toolchain/codes/rw_arm/.cache/clangd/index` 存在 3593 个 `.idx`；P5 验收临时 `/tmp/codegraph-p5-arm-index-20260624-154443` 已不可用，P6 可复用现有真实分片。
+- 2026-07-01 P3 回归：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_clangd_adapter.py -q` -> `11 passed in 0.12s`。默认单 TU 模式保持不变，新增显式 background-index 开关测试。
+- 2026-07-01 真实 ARM 实测（复用 vs 重建）：启动 `clangd --background-index=true`，cwd/compile dir 指向 `/home/linhao/Toolchain/codes/rw_arm`，打开真实 TU 后未触发 31s 重建；分片前后均为 3593 个 `.idx`、总大小 39911040 bytes、最新 mtime ns `1781072784911021003`，确认本次查询复用现有分片。
+- 2026-07-01 真实 ARM 实测（索引 ready 时机）：只 initialize 不 open TU 时，`workspace/symbol(gst_element_set_state)` 轮询 12s 仍为 0；打开 `gst-launch.c` 后，`workspace/symbol` 在约 1.213s 返回 `gstelement.c` 命中，`find_references` 在约 5.266s 复现 389 refs。结论：P6 必须先 open/warm 一个 TU，再等待/轮询目标符号确认索引 ready。
+- 2026-07-01 真实 ARM 实测（P6 API）：`CodeGraph(BuildConfig("arm", "/home/linhao/Toolchain/codes/rw_arm", background_index=True))` 下，`search_symbol("gst_element_set_state")` -> 1.638s，`status=OK`，`index_health=complete`，语义结果为 `gstelement.c:2951`；`get_definition` 从 `gst-launch.c:565` 调用点 -> 0.836s，`status=OK`，`index_health=complete`，语义结果为 `gstelement.h:1153`。`get_definition` 在该 C 工程里返回声明位置，单 TU/全局模式无差异；全局索引消费的实证来自 `search_symbol` 返回 source `.c` 定义与 P7 留底的 389 refs 对照。
+- 2026-07-01 P6 定向：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_api.py -q` -> `5 passed in 0.39s`；`tests/test_clangd_adapter.py` 已回归 `11 passed`。
+- 2026-07-01 全量 gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `119 passed in 1.88s`；coverage -> `119 passed`，total 92%，`codegraph/api.py` 83%，`clangd_adapter.py` 100%；`.venv/bin/ruff check .` -> All checks passed；`.venv/bin/black --check .` -> 22 files unchanged；`.venv/bin/mypy codegraph` -> Success；`.venv/bin/python -m compileall -q codegraph tools tests` -> 通过。

@@ -36,7 +36,7 @@ class _Client(Protocol):
     def shutdown(self) -> None: ...
 
 
-ClientFactory = Callable[[str, list[str], str, bool], _Client]
+ClientFactory = Callable[[str, list[str], str, bool, bool], _Client]
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ class ClangdAdapterConfig:
 
     compile_commands_dir: str
     clangd_path: str = "clangd"
+    background_index: bool = False
     extra_args: tuple[str, ...] = ()
     request_timeout: float = 30.0
     diagnostics_wait: float = 0.5
@@ -67,7 +68,11 @@ class ClangdAdapter:
             *config.extra_args,
         ]
         self._client = client_factory(
-            config.clangd_path, extra_args, self.compile_dir, config.verbose
+            config.clangd_path,
+            extra_args,
+            self.compile_dir,
+            config.verbose,
+            config.background_index,
         )
         self._opened: set[str] = set()
         try:
@@ -87,6 +92,11 @@ class ClangdAdapter:
 
     def close(self) -> None:
         self._client.shutdown()
+
+    def warm_file(self, file: str) -> None:
+        """Open a TU so clangd can attach compile flags and load its project index."""
+
+        self._open_document(file)
 
     def search_symbol(
         self,

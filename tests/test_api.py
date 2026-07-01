@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+
+from codegraph.api import (
+    BuildConfig,
+    CodeGraph,
+    clear_build_configs,
+    get_definition as api_get_definition,
+    search_symbol as api_search_symbol,
+)
+from codegraph.engines.protocol import EngineObservationResult
+from codegraph.types import LocationResult, Pos, QueryStatus, Range, SymbolId
+
+
+def write_project(tmp_path: Path) -> tuple[Path, Path]:
+    header = tmp_path / "lib.h"
+    lib = tmp_path / "lib.c"
+    main = tmp_path / "main.c"
+    header.write_text("int add(int x);\n", encoding="utf-8")
+    lib.write_text(
+        '#include "lib.h"\nint add(int x) { return x + 1; }\n',
+        encoding="utf-8",
+    )
+    main.write_text(
+        '#include "lib.h"\nint main(void) { return add(1); }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "compile_commands.json").write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "command": f"/usr/bin/cc -I{tmp_path} -c {lib}",
+                    "file": str(lib),
+                },
+                {
+                    "directory": str(tmp_path),
+                    "command": f"/usr/bin/cc -I{tmp_path} -c {main}",
+                    "file": str(main),
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return lib, main
+
+
+def touch_complete_index(tmp_path: Path) -> None:
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "lib.idx").write_text("idx", encoding="utf-8")
+    (index_dir / "main.idx").write_text("idx", encoding="utf-8")
+
+
+def loc(name: str, file: Path, line: int = 1) -> LocationResult:
+    pos = Pos(line, 4)
+    return LocationResult(
+        SymbolId(None, name, str(file), pos),
+        Range(pos, Pos(line, 7)),
+        "ordinary_function",
+    )
+
+
+@pytest.mark.skipif(shutil.which("clangd") is None, reason="clangd unavailable")
+def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            diagnostics_wait=0,
+            index_ready_timeout=5,
+            index_ready_poll_interval=0.1,
+        )
+    )
+    call_line = main.read_text(encoding="utf-8").splitlines()[1]
+
+    definition = client.get_definition("add", str(main), Pos(1, call_line.index("add")))
+    search = client.search_symbol("add")
+
+    assert definition.status == QueryStatus.OK
+    assert definition.index_health == "complete"
+    assert [r.data.symbol_id.file for r in definition.semantic_results] == [str(lib)]
+    assert search.status == QueryStatus.OK
+    assert search.index_health == "complete"
+    assert [r.data.symbol_id.name for r in search.semantic_results] == ["add"]
+    assert [r.data.symbol_id.file for r in search.semantic_results] == [str(lib)]
+
+
+class NeverReadyEngine:
+    def __enter__(self) -> "NeverReadyEngine":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def warm_file(self, file: str) -> None:
+        self.warmed_file = file
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        return EngineObservationResult()
+
+    def get_definition(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+    ) -> EngineObservationResult:
+        return EngineObservationResult()
+
+
+class ReadyEngine(NeverReadyEngine):
+    def __init__(self, locations: tuple[LocationResult, ...]):
+        self.locations = locations
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        return EngineObservationResult(
+            locations=self.locations[offset : offset + limit]
+        )
+
+    def get_definition(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+    ) -> EngineObservationResult:
+        return EngineObservationResult(locations=self.locations[:1])
+
+
+class FailingEngine(NeverReadyEngine):
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        raise TimeoutError("boom")
+
+
+def test_search_symbol_filters_exact_name_and_supports_background_index_off(
+    tmp_path: Path,
+):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: ReadyEngine(
+            (loc("add", lib), loc("address_like_noise", lib))
+        ),
+    )
+
+    result = client.search_symbol("add")
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert [r.data.symbol_id.name for r in result.semantic_results] == ["add"]
+
+
+def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: FailingEngine(),
+    )
+
+    assert client.search_symbol("add", kind_filter="bad").status == (
+        QueryStatus.INVALID_REQUEST
+    )
+    assert client.get_definition("add", str(main), Pos(99, 0)).status == (
+        QueryStatus.INVALID_REQUEST
+    )
+    failed = client.search_symbol("add")
+    assert failed.status == QueryStatus.FAILED
+
+
+def test_background_index_not_ready_downgrades_health_to_avoid_false_not_found(
+    tmp_path: Path,
+):
+    _lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0,
+        ),
+        engine_factory=lambda _cfg: NeverReadyEngine(),
+    )
+
+    result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+
+
+def test_module_level_registry_reports_unknown_config():
+    clear_build_configs()
+
+    assert api_search_symbol("add", build_config_id="missing").status == (
+        QueryStatus.INVALID_REQUEST
+    )
+    assert (
+        api_get_definition(
+            "add", "/tmp/missing.c", Pos(0, 0), build_config_id="missing"
+        ).status
+        == QueryStatus.INVALID_REQUEST
+    )
