@@ -158,7 +158,7 @@ class CodeGraph:
         health = _index_health(self.config)
         try:
             with self._engine_factory(self._clangd_config()) as engine:
-                ready = _warm_background_index(engine, self.config, symbol)
+                ready = _warm_background_index(engine, self.config)
                 engine_limit = _semantic_search_limit(limit, offset)
                 observation = engine.search_symbol(
                     symbol,
@@ -204,7 +204,7 @@ class CodeGraph:
         health = _index_health(self.config)
         try:
             with self._engine_factory(self._clangd_config()) as engine:
-                ready = _warm_background_index(engine, self.config, symbol, real_file)
+                ready = _warm_background_index(engine, self.config, real_file)
                 observation = engine.get_definition(symbol, real_file, pos)
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
@@ -235,7 +235,6 @@ class CodeGraph:
 def _warm_background_index(
     engine: EngineObservation,
     config: BuildConfig,
-    symbol: str,
     file: str | None = None,
 ) -> bool:
     if not config.background_index:
