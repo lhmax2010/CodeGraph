@@ -1,7 +1,7 @@
 # Stage 05 - Index Build / Result
 
 ## 最终状态
-待 Merge。Phase 5 逻辑实现、review 修复、三路最终 review 与 ARM 真机完整建库验收均已完成。
+已 Merge。Phase 5 逻辑实现、review 修复、三路最终 review 与 ARM 真机完整建库验收均已完成；已合入 `main` 并打 `checkpoint/phase_5_index_build`。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `97 passed in 0.21s`。
@@ -41,4 +41,4 @@
 - Review NIT（不阻塞）：CLI 目前未额外捕获 `PermissionError`；`_load_cdb_rewriter()` 会 mutate 全局 `sys.path`，属于标准 bootstrap，可接受；该修复假设 `tools/` 与 `codegraph/` 在源码树中相邻，pip 打包形态可能需要额外 packaging 规则，与当前部署模型一致。
 
 ## 下一阶段计划
-- 等用户核对 DoD 后 merge `phase/5-index-build` 到 `main`，打 `checkpoint/phase_5_index_build`，再开 Phase 6。
+- 进入 Phase 6：`search_symbol` + `get_definition` 首次端到端集成。
