@@ -11,6 +11,7 @@ from codegraph.api import (
     CodeGraph,
     clear_build_configs,
     get_definition as api_get_definition,
+    register_build_config,
     search_symbol as api_search_symbol,
 )
 from codegraph.engines.protocol import EngineObservationResult
@@ -78,6 +79,9 @@ def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Pa
             diagnostics_wait=0,
             index_ready_timeout=5,
             index_ready_poll_interval=0.1,
+            index_ready_probe_symbol="add",
+            index_ready_probe_path_suffix="lib.c",
+            warmup_file=str(main),
         )
     )
     call_line = main.read_text(encoding="utf-8").splitlines()[1]
@@ -160,6 +164,16 @@ class FailingEngine(NeverReadyEngine):
         raise TimeoutError("boom")
 
 
+class DefinitionFailingEngine(NeverReadyEngine):
+    def get_definition(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+    ) -> EngineObservationResult:
+        raise TimeoutError("definition boom")
+
+
 def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     tmp_path: Path,
 ):
@@ -175,8 +189,118 @@ def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     result = client.search_symbol("add")
 
     assert result.status == QueryStatus.OK
-    assert result.index_health == "complete"
+    assert result.index_health == "unknown"
     assert [r.data.symbol_id.name for r in result.semantic_results] == ["add"]
+
+
+def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: NeverReadyEngine(),
+    )
+
+    result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+
+
+class SentinelEngine(NeverReadyEngine):
+    def __init__(
+        self,
+        header: LocationResult,
+        probe_location: LocationResult,
+        implementation: LocationResult,
+    ):
+        self.header = header
+        self.probe_location = probe_location
+        self.implementation = implementation
+        self.probe_calls = 0
+        self.ready = False
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        if symbol == "target":
+            return EngineObservationResult(locations=(self.header,))
+        if symbol == "sentinel":
+            self.probe_calls += 1
+            if self.probe_calls >= 2:
+                self.ready = True
+                return EngineObservationResult(locations=(self.probe_location,))
+        return EngineObservationResult()
+
+    def get_definition(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+    ) -> EngineObservationResult:
+        return EngineObservationResult(
+            locations=(self.implementation if self.ready else self.header,)
+        )
+
+
+def test_ready_probe_is_not_satisfied_by_target_header_hit(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = SentinelEngine(
+        loc("target", main), loc("sentinel", lib), loc("target", lib)
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.get_definition("target", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.semantic_results[0].data.symbol_id.file == str(lib)
+    assert engine.probe_calls == 2
+
+
+def test_ready_probe_requires_configured_path_suffix(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = SentinelEngine(
+        loc("target", main), loc("sentinel", lib), loc("target", lib)
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="other.c",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.get_definition("target", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "unknown"
+    assert result.semantic_results[0].data.symbol_id.file == str(main)
 
 
 def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: Path):
@@ -194,6 +318,30 @@ def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: 
     )
     failed = client.search_symbol("add")
     assert failed.status == QueryStatus.FAILED
+
+    definition_failed = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: DefinitionFailingEngine(),
+    ).get_definition("add", str(main), Pos(1, 0))
+    assert definition_failed.status == QueryStatus.FAILED
+
+
+def test_get_definition_rejects_invalid_paths_and_positions(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    client = CodeGraph(BuildConfig("test", str(tmp_path), background_index=False))
+
+    assert client.get_definition(
+        "add", str(tmp_path / "missing.c"), Pos(0, 0)
+    ).status == (QueryStatus.INVALID_REQUEST)
+    assert client.get_definition("add", str(main), Pos(-1, 0)).status == (
+        QueryStatus.INVALID_REQUEST
+    )
+    assert client.get_definition("add", str(main), Pos(99, 0)).status == (
+        QueryStatus.INVALID_REQUEST
+    )
+    assert client.get_definition("add", str(main), Pos(0, 999)).status == (
+        QueryStatus.INVALID_REQUEST
+    )
 
 
 def test_background_index_not_ready_downgrades_health_to_avoid_false_not_found(
@@ -230,3 +378,55 @@ def test_module_level_registry_reports_unknown_config():
         ).status
         == QueryStatus.INVALID_REQUEST
     )
+
+
+def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    clear_build_configs()
+    register_build_config(BuildConfig("test", str(tmp_path)))
+    search_marker = object()
+    definition_marker = object()
+    calls: list[tuple[str, object]] = []
+
+    class DummyCodeGraph:
+        def __init__(self, config: BuildConfig):
+            calls.append(("init", config.build_config_id))
+
+        def search_symbol(
+            self,
+            symbol: str,
+            *,
+            kind_filter: str | None = None,
+            limit: int = 100,
+            offset: int = 0,
+        ):
+            calls.append(("search", (symbol, kind_filter, limit, offset)))
+            return search_marker
+
+        def get_definition(
+            self,
+            symbol: str,
+            file: str,
+            pos: Pos,
+            *,
+            allow_syntactic_fallback: bool = False,
+        ):
+            calls.append(("definition", (symbol, file, pos, allow_syntactic_fallback)))
+            return definition_marker
+
+    monkeypatch.setattr("codegraph.api.CodeGraph", DummyCodeGraph)
+
+    assert api_search_symbol(
+        "add", build_config_id="test", kind_filter="bad"
+    ).status == (QueryStatus.INVALID_REQUEST)
+    assert api_search_symbol("add", build_config_id="test", limit=3) is search_marker
+    assert (
+        api_get_definition("add", str(main), Pos(1, 0), build_config_id="test")
+        is definition_marker
+    )
+    assert calls == [
+        ("init", "test"),
+        ("search", ("add", None, 3, 0)),
+        ("init", "test"),
+        ("definition", ("add", str(main), Pos(1, 0), False)),
+    ]

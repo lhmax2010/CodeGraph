@@ -51,6 +51,8 @@ class BuildConfig:
     diagnostics_wait: float = 0.5
     index_ready_timeout: float = 5.0
     index_ready_poll_interval: float = 0.25
+    index_ready_probe_symbol: str | None = None
+    index_ready_probe_path_suffix: str | None = None
     warmup_file: str | None = None
     active_config: ActiveConfig = ActiveConfig.UNKNOWN
     index_scope: IndexScope = IndexScope.INDEXED_PROJECT
@@ -157,16 +159,19 @@ class CodeGraph:
         try:
             with self._engine_factory(self._clangd_config()) as engine:
                 ready = _warm_background_index(engine, self.config, symbol)
+                engine_limit = _semantic_search_limit(limit, offset)
                 observation = engine.search_symbol(
                     symbol,
                     kind_filter=kind.value if kind is not None else None,
-                    limit=limit,
-                    offset=offset,
+                    limit=engine_limit,
+                    offset=0,
                 )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
         health = _health_after_warm(health, self.config, ready)
-        observation = _exact_symbol_observation(observation, symbol)
+        observation = _exact_symbol_observation(
+            observation, symbol, limit=limit, offset=offset
+        )
         return route_observation(
             query,
             observation,
@@ -174,7 +179,7 @@ class CodeGraph:
             kind_filter=kind.value if kind is not None else None,
             limit=limit,
             offset=offset,
-            index_scope=self.config.index_scope,
+            index_scope=_effective_index_scope(self.config, ready),
             index_health=_effective_health(health, self.config, ready),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
@@ -209,7 +214,7 @@ class CodeGraph:
             observation,
             syntactic_provider=provider,
             allow_syntactic_fallback=allow_syntactic_fallback,
-            index_scope=self.config.index_scope,
+            index_scope=_effective_index_scope(self.config, ready),
             index_health=_effective_health(health, self.config, ready),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
@@ -234,13 +239,17 @@ def _warm_background_index(
     file: str | None = None,
 ) -> bool:
     if not config.background_index:
-        return True
+        return False
     warm_file = file or config.warmup_file or _first_existing_tu(config)
     if warm_file is not None and hasattr(engine, "warm_file"):
         getattr(engine, "warm_file")(warm_file)
+    probe_symbol = config.index_ready_probe_symbol
+    if probe_symbol is None:
+        return False
     deadline = time.monotonic() + config.index_ready_timeout
     while time.monotonic() <= deadline:
-        if engine.search_symbol(symbol, limit=1).locations:
+        observation = engine.search_symbol(probe_symbol, limit=20)
+        if _index_ready_probe_matches(observation, probe_symbol, config):
             return True
         time.sleep(config.index_ready_poll_interval)
     return False
@@ -249,9 +258,15 @@ def _warm_background_index(
 def _effective_health(
     health: IndexHealth, config: BuildConfig, index_ready: bool
 ) -> IndexHealth:
-    if config.background_index and not index_ready:
+    if not config.background_index or not index_ready:
         return IndexHealth.UNKNOWN
     return health
+
+
+def _effective_index_scope(config: BuildConfig, index_ready: bool) -> IndexScope:
+    if not config.background_index or not index_ready:
+        return IndexScope.CURRENT_TU
+    return config.index_scope
 
 
 def _health_after_warm(
@@ -263,14 +278,34 @@ def _health_after_warm(
 
 
 def _exact_symbol_observation(
-    observation: EngineObservationResult, symbol: str
+    observation: EngineObservationResult,
+    symbol: str,
+    *,
+    limit: int,
+    offset: int,
 ) -> EngineObservationResult:
+    exact = tuple(loc for loc in observation.locations if loc.symbol_id.name == symbol)
     return replace(
         observation,
-        locations=tuple(
-            loc for loc in observation.locations if loc.symbol_id.name == symbol
-        ),
+        locations=exact[offset : offset + limit],
     )
+
+
+def _index_ready_probe_matches(
+    observation: EngineObservationResult, probe_symbol: str, config: BuildConfig
+) -> bool:
+    suffix = config.index_ready_probe_path_suffix
+    for location in observation.locations:
+        if location.symbol_id.name != probe_symbol:
+            continue
+        if suffix is not None and not location.symbol_id.file.endswith(suffix):
+            continue
+        return True
+    return False
+
+
+def _semantic_search_limit(limit: int, offset: int) -> int:
+    return max(100, limit + offset)
 
 
 def _index_health(config: BuildConfig) -> IndexHealth:
