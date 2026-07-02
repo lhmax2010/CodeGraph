@@ -80,3 +80,31 @@ Claude 另提到 `workspace/symbol` exact 结果可能受 clangd fuzzy 排序窗
 - `.venv/bin/black --check .` -> 22 files unchanged。
 - `.venv/bin/mypy codegraph` -> Success。
 - `.venv/bin/python -m compileall -q codegraph tools tests` -> 通过。
+
+## 2026-07-02 - Four-way review follow-up BLOCKER
+
+用户异构四路 review 后，Codex 抓到一个属实 BLOCKER：`search_symbol` 的 `total_hits` 是
+`engine_limit=max(100, limit+offset)` 返回窗口内的 exact 计数，不是全局真实 total。若 clangd
+`workspace/symbol` 前 100 条均为 fuzzy 近似、真实 exact 排在第 101 条之后，窗口内 exact 为 0，
+P2 会在 ready+complete 下把真实存在的符号误判为 `not_found`。
+
+### 处理
+
+- 选择方案 A：窗口可能截断时禁止项目级 `not_found`。
+- 实现：P6 API 层记录原始 `workspace/symbol` 返回数；当返回数 `>= engine_limit` 且窗口内 exact
+  为 0 时，本次查询不再把 ready+complete 传给 P2，而是降为 `unknown/current_tu`，结果为
+  `UNRESOLVED`。
+- 边界：不再改 P2 `routing.py`；`route_observation` 的 QR/状态机保持不变。
+- 回归：新增“前 100 条 fuzzy、exact 在第 101 条之外”的 fake engine 测试，断言不是 `not_found`。
+
+### Gate
+
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_api.py -q` -> `23 passed`。
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_phase2_routing.py -q` -> `14 passed`。
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `139 passed in 3.70s`。
+- coverage -> `139 passed`，total `93%`。
+- ruff / black --check / mypy / compileall / diff-check 全绿。
+
+### 状态
+
+该修复是安全逻辑修改，仍需用户异构多路 review 复核；复核前不进入 P6 真机验收。

@@ -200,6 +200,34 @@ class ReadyNoDefinitionEngine(NeverReadyEngine):
         return EngineObservationResult()
 
 
+class TruncatedSearchEngine(NeverReadyEngine):
+    def __init__(
+        self,
+        probe_location: LocationResult,
+        fuzzy_locations: tuple[LocationResult, ...],
+        exact_location: LocationResult,
+    ):
+        self.probe_location = probe_location
+        self.fuzzy_locations = fuzzy_locations
+        self.exact_location = exact_location
+        self.search_limits: list[int] = []
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        request_timeout: float | None = None,
+    ) -> EngineObservationResult:
+        if symbol == "sentinel":
+            return EngineObservationResult(locations=(self.probe_location,))
+        self.search_limits.append(limit)
+        locations = (*self.fuzzy_locations, self.exact_location)
+        return EngineObservationResult(locations=locations[offset : offset + limit])
+
+
 def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     tmp_path: Path,
 ):
@@ -265,6 +293,32 @@ def test_search_symbol_empty_page_with_matches_is_not_not_found(tmp_path: Path):
     assert result.status == QueryStatus.UNRESOLVED
     assert result.total_hits == 2
     assert result.index_health == "complete"
+
+
+def test_search_symbol_truncated_fuzzy_window_cannot_assert_not_found(
+    tmp_path: Path,
+):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    fuzzy = tuple(loc(f"other_{idx}", lib) for idx in range(100))
+    engine = TruncatedSearchEngine(loc("sentinel", lib), fuzzy, loc("needle", lib))
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.search_symbol("needle", limit=1)
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.total_hits == 0
+    assert engine.search_limits == [100]
 
 
 def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path: Path):

@@ -193,11 +193,17 @@ class CodeGraph:
                     limit=engine_limit,
                     offset=0,
                 )
+                search_window_may_be_truncated = _search_window_may_be_truncated(
+                    observation, engine_limit
+                )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
         health = _health_after_warm(health, self.config, ready)
         observation, total_hits = _exact_symbol_observation(
             observation, symbol, limit=limit, offset=offset
+        )
+        ready_for_negative_proof = ready and not (
+            search_window_may_be_truncated and total_hits == 0
         )
         return route_observation(
             query,
@@ -206,8 +212,10 @@ class CodeGraph:
             kind_filter=kind.value if kind is not None else None,
             limit=limit,
             offset=offset,
-            index_scope=_effective_index_scope(self.config, ready),
-            index_health=_effective_health(health, self.config, ready),
+            index_scope=_effective_index_scope(self.config, ready_for_negative_proof),
+            index_health=_effective_health(
+                health, self.config, ready_for_negative_proof
+            ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=kind or SymbolKind.ORDINARY_FUNCTION,
@@ -359,6 +367,12 @@ def _index_ready_probe_matches(
 
 def _semantic_search_limit(limit: int, offset: int) -> int:
     return max(100, limit + offset)
+
+
+def _search_window_may_be_truncated(
+    observation: EngineObservationResult, engine_limit: int
+) -> bool:
+    return len(observation.locations) >= engine_limit
 
 
 def _index_health(config: BuildConfig) -> IndexHealth:
