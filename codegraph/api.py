@@ -74,13 +74,12 @@ class ManagedEngine(EngineObservation, Protocol):
     ) -> None: ...
 
 
-def register_build_config(config: BuildConfig, *, prewarm: bool = False) -> bool:
+def register_build_config(config: BuildConfig, *, prewarm: bool = False) -> None:
     """Register a build config for the module-level API functions."""
 
     _BUILD_CONFIGS[config.build_config_id] = config
     if prewarm:
-        return prewarm_build_config(config.build_config_id)
-    return False
+        prewarm_build_config(config.build_config_id)
 
 
 def prewarm_build_config(build_config_id: str) -> bool:
@@ -197,7 +196,7 @@ class CodeGraph:
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
         health = _health_after_warm(health, self.config, ready)
-        observation = _exact_symbol_observation(
+        observation, total_hits = _exact_symbol_observation(
             observation, symbol, limit=limit, offset=offset
         )
         return route_observation(
@@ -212,7 +211,7 @@ class CodeGraph:
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=kind or SymbolKind.ORDINARY_FUNCTION,
-            total_hits=len(observation.locations),
+            total_hits=total_hits,
         )
 
     def get_definition(
@@ -273,7 +272,7 @@ def _warm_background_index(
     if warm_file is not None and hasattr(engine, "warm_file"):
         getattr(engine, "warm_file")(warm_file)
     probe_symbol = config.index_ready_probe_symbol
-    if probe_symbol is None:
+    if probe_symbol is None or config.index_ready_probe_path_suffix is None:
         return False
     ready_timeout = config.index_ready_timeout if timeout is None else timeout
     deadline = time.monotonic() + ready_timeout
@@ -332,11 +331,14 @@ def _exact_symbol_observation(
     *,
     limit: int,
     offset: int,
-) -> EngineObservationResult:
+) -> tuple[EngineObservationResult, int]:
     exact = tuple(loc for loc in observation.locations if loc.symbol_id.name == symbol)
-    return replace(
-        observation,
-        locations=exact[offset : offset + limit],
+    return (
+        replace(
+            observation,
+            locations=exact[offset : offset + limit],
+        ),
+        len(exact),
     )
 
 
@@ -344,10 +346,12 @@ def _index_ready_probe_matches(
     observation: EngineObservationResult, probe_symbol: str, config: BuildConfig
 ) -> bool:
     suffix = config.index_ready_probe_path_suffix
+    if suffix is None:
+        return False
     for location in observation.locations:
         if location.symbol_id.name != probe_symbol:
             continue
-        if suffix is not None and not location.symbol_id.file.endswith(suffix):
+        if not location.symbol_id.file.endswith(suffix):
             continue
         return True
     return False

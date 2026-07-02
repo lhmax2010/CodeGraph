@@ -10,6 +10,7 @@ import pytest
 from codegraph.api import (
     BuildConfig,
     CodeGraph,
+    _index_ready_probe_matches,
     _prewarm_index_ready_timeout,
     _warm_background_index,
     clear_build_configs,
@@ -181,6 +182,24 @@ class DefinitionFailingEngine(NeverReadyEngine):
         raise TimeoutError("definition boom")
 
 
+class ReadyNoDefinitionEngine(NeverReadyEngine):
+    def __init__(self, probe_location: LocationResult):
+        self.probe_location = probe_location
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        request_timeout: float | None = None,
+    ) -> EngineObservationResult:
+        if symbol == "sentinel":
+            return EngineObservationResult(locations=(self.probe_location,))
+        return EngineObservationResult()
+
+
 def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     tmp_path: Path,
 ):
@@ -200,6 +219,54 @@ def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     assert [r.data.symbol_id.name for r in result.semantic_results] == ["add"]
 
 
+def test_search_symbol_offset_keeps_exact_total_hits(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: ReadyEngine(
+            (
+                loc("needle", lib),
+                loc("other", lib),
+                loc("needle", main),
+                loc("needle", lib, line=0),
+            )
+        ),
+    )
+
+    result = client.search_symbol("needle", limit=1, offset=1)
+
+    assert result.status == QueryStatus.OK
+    assert result.total_hits == 3
+    assert [item.data.symbol_id.file for item in result.semantic_results] == [str(main)]
+
+
+def test_search_symbol_empty_page_with_matches_is_not_not_found(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: ReadyEngine(
+            (
+                loc("sentinel", lib),
+                loc("needle", lib),
+                loc("needle", main),
+            )
+        ),
+    )
+
+    result = client.search_symbol("needle", limit=1, offset=3)
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.total_hits == 2
+    assert result.index_health == "complete"
+
+
 def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path: Path):
     _lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
@@ -213,6 +280,28 @@ def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path:
 
     assert result.status == QueryStatus.UNRESOLVED
     assert result.index_health == "unknown"
+
+
+def test_get_definition_not_found_still_reachable_with_ready_index(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
+    )
+
+    result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.NOT_FOUND
+    assert result.index_health == "complete"
+    assert result.total_hits == 0
 
 
 class SentinelEngine(NeverReadyEngine):
@@ -311,6 +400,42 @@ def test_ready_probe_requires_configured_path_suffix(tmp_path: Path):
     assert result.semantic_results[0].data.symbol_id.file == str(main)
 
 
+def test_ready_probe_without_path_suffix_is_not_ready(tmp_path: Path):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = SentinelEngine(
+        loc("target", lib), loc("sentinel", lib), loc("target", lib)
+    )
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.search_symbol("missing")
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert engine.probe_calls == 0
+
+
+def test_index_ready_probe_match_requires_path_suffix(tmp_path: Path):
+    lib, _main = write_project(tmp_path)
+    observation = EngineObservationResult(locations=(loc("sentinel", lib),))
+    config = BuildConfig(
+        "test",
+        str(tmp_path),
+        background_index=True,
+        index_ready_probe_symbol="sentinel",
+    )
+
+    assert _index_ready_probe_matches(observation, "sentinel", config) is False
+
+
 def test_prewarm_warms_cache_but_query_still_proves_readiness(tmp_path: Path):
     lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
@@ -401,6 +526,7 @@ def test_warm_background_index_passes_remaining_deadline_to_probe(tmp_path: Path
         index_ready_timeout=0.03,
         index_ready_poll_interval=0,
         index_ready_probe_symbol="sentinel",
+        index_ready_probe_path_suffix="lib.c",
         request_timeout=5,
         warmup_file=str(main),
     )
@@ -426,6 +552,7 @@ def test_prewarm_uses_independent_longer_timeout(tmp_path: Path):
         prewarm_index_ready_timeout=0.2,
         index_ready_poll_interval=0,
         index_ready_probe_symbol="sentinel",
+        index_ready_probe_path_suffix="lib.c",
         request_timeout=5,
         warmup_file=str(main),
     )
@@ -467,6 +594,7 @@ def test_query_warm_still_uses_query_timeout_not_prewarm_timeout(tmp_path: Path)
             prewarm_index_ready_timeout=0.2,
             index_ready_poll_interval=0,
             index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
             request_timeout=5,
         ),
         engine_factory=lambda _cfg: engine,
@@ -625,7 +753,9 @@ def test_register_build_config_can_explicitly_prewarm(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr("codegraph.api.CodeGraph", DummyCodeGraph)
 
-    assert register_build_config(BuildConfig("test", str(tmp_path)), prewarm=True)
+    assert (
+        register_build_config(BuildConfig("test", str(tmp_path)), prewarm=True) is None
+    )
     assert prewarm_build_config("test")
     assert calls == [
         ("init", "test"),

@@ -8,8 +8,8 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
-- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `131 passed in 1.96s`。
-- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `131 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
+- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `138 passed in 2.05s`。
+- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `138 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
 - 静态 gate：
   - `.venv/bin/ruff check .` -> All checks passed。
   - `.venv/bin/black --check .` -> 22 files unchanged。
@@ -30,6 +30,9 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 - 预热语义：预热只焐热 cache，不授予后续查询跳过 `_warm_background_index` 的特权；后续查询仍每次证明本次 clangd ready。
 - 预热 timeout：`BuildConfig.prewarm_index_ready_timeout=None` 时采用 `max(index_ready_timeout, 30.0)`；只影响预热，用户查询仍使用 `index_ready_timeout`。
 - timeout 语义：sentinel `workspace/symbol` 使用剩余 wall-clock timeout，避免单次慢 LSP 请求无限顶穿等待窗口；`TimeoutError` 只表示 not-ready，查询继续安全降级。
+- ready 语义硬化：`index_ready_probe_symbol` 必须与 `index_ready_probe_path_suffix` 配套；缺 suffix 直接 not-ready，不允许单 TU/header 命中把 `complete` health 带进 P2。
+- `search_symbol` 分页硬化：exact 总命中数与当前页分开计算，`total_hits>0` 的空页不得落入项目级 `not_found`。
+- P3 兼容性硬化：`ClangdAdapterConfig` 恢复旧位置参数顺序，并运行时拒绝把 `background_index` 误传到第三个位置参数。
 
 ## 真机 ARM / P5 全局索引复现
 - 环境：`clangd 18.1.3`；真实 ARM CDB `/home/linhao/Toolchain/codes/rw_arm/compile_commands.json`；P5 索引目录含 `3593` 个 `.idx` 分片。
@@ -60,6 +63,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
   - `2e1a9d1 [Phase 6] fix: prevent false negatives before global index ready`
   - `9774bdc [Phase 6] docs: record blocker review follow-up`
   - 本次提交：`[Phase 6] fix: prewarm background index and bound sentinel wait`
+  - 本次 follow-up：`[Phase 6] fix: require ready probe suffix and preserve search totals`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -70,7 +74,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 - `change_4` tree-sitter 要素2集成：P6 已经通过 P4 provider 参与 fallback 和降级路径；宏定义/宏展开的真实 clangd 位置仍按上一条保留。
 
 ## 遗留问题 / 风险
-- [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
+- [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 或未配置 `index_ready_probe_path_suffix` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
 - [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。

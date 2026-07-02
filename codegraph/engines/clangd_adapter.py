@@ -45,11 +45,19 @@ class ClangdAdapterConfig:
 
     compile_commands_dir: str
     clangd_path: str = "clangd"
-    background_index: bool = False
     extra_args: tuple[str, ...] = ()
+    background_index: bool = False
     request_timeout: float = 30.0
     diagnostics_wait: float = 0.5
     verbose: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.extra_args, tuple) or not all(
+            isinstance(arg, str) for arg in self.extra_args
+        ):
+            raise TypeError(
+                "extra_args must be tuple[str, ...]; pass background_index by keyword"
+            )
 
 
 class ClangdAdapter:

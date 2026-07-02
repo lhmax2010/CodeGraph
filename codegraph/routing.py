@@ -295,7 +295,7 @@ def route_observation(
             notes=notes,
         )
 
-    if _can_assert_not_found(
+    if (total_hits is None or total_hits == 0) and _can_assert_not_found(
         dep, observation, index_scope, index_health, index_backend, symbol_kind
     ):
         return _query_result(

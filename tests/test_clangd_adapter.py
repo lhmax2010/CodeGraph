@@ -133,6 +133,19 @@ def test_background_index_flag_is_opt_in(tmp_path: Path):
     assert calls[1][4] is True
 
 
+def test_config_positional_extra_args_keep_background_default(tmp_path: Path):
+    config = ClangdAdapterConfig(str(tmp_path), "clangd-custom", ("--flag",))
+
+    assert config.clangd_path == "clangd-custom"
+    assert config.extra_args == ("--flag",)
+    assert config.background_index is False
+
+
+def test_config_rejects_positional_background_index_misbind(tmp_path: Path):
+    with pytest.raises(TypeError, match="extra_args"):
+        ClangdAdapterConfig(str(tmp_path), "clangd-custom", True)  # type: ignore[arg-type]
+
+
 def lsp_range(
     start_line: int, start_char: int, end_line: int, end_char: int
 ) -> dict[str, dict[str, int]]:
