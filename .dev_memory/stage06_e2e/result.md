@@ -8,8 +8,8 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
-- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `124 passed in 1.94s`。
-- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `124 passed`，total `91%`，`codegraph/api.py` `82%`，`codegraph/engines/clangd_adapter.py` `100%`。
+- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `131 passed in 1.96s`。
+- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `131 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
 - 静态 gate：
   - `.venv/bin/ruff check .` -> All checks passed。
   - `.venv/bin/black --check .` -> 22 files unchanged。
@@ -26,6 +26,10 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
   - sentinel path suffix 不匹配时不标 ready。
 - `search_symbol` 精确过滤：先过量拉取再 exact filter + 用户侧 `limit/offset`，避免 fuzzy 命中挤掉 exact。
 - 非法输入、engine failure、module-level registry 分支补测。
+- 显式预热：`CodeGraph.prewarm()`、`prewarm_build_config()`、`register_build_config(..., prewarm=True)`。
+- 预热语义：预热只焐热 cache，不授予后续查询跳过 `_warm_background_index` 的特权；后续查询仍每次证明本次 clangd ready。
+- 预热 timeout：`BuildConfig.prewarm_index_ready_timeout=None` 时采用 `max(index_ready_timeout, 30.0)`；只影响预热，用户查询仍使用 `index_ready_timeout`。
+- timeout 语义：sentinel `workspace/symbol` 使用剩余 wall-clock timeout，避免单次慢 LSP 请求无限顶穿等待窗口；`TimeoutError` 只表示 not-ready，查询继续安全降级。
 
 ## 真机 ARM / P5 全局索引复现
 - 环境：`clangd 18.1.3`；真实 ARM CDB `/home/linhao/Toolchain/codes/rw_arm/compile_commands.json`；P5 索引目录含 `3593` 个 `.idx` 分片。
@@ -43,6 +47,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
     - `get_definition(gst_buffer_ref)` -> `OK/complete`，语义结果 `gstbuffer.c:3014`。
   - `get_definition(gst_buffer_ref)` 连续 3 次均稳定命中 `gstbuffer.c:3014`，每次约 `1.57-1.59s`。
 - 无 sentinel 复现：`background_index=True` 但未配置 `index_ready_probe_symbol` 时，`search_symbol`/`get_definition` 均保守为 `UNRESOLVED/index_unknown`，只给 syntactic candidates，不给语义 OK 或 not_found。
+- 预热后首查复现：`CodeGraph(config).prewarm()` 后立即执行第一条用户查询 `get_definition(gst_buffer_ref @ gstbufferlist.c:91)`；最终默认 prewarm timeout 为 `30.0s`，本次 prewarm 1.408s 且 ready=True，紧接着第一条用户查询 1.581s -> `OK/complete`，语义结果 `gstbuffer.c:3014`；分片前后均为 `(3593, 39911040, 1781072784911021003)`，未重建。
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
@@ -54,6 +59,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
   - `9eafba4 [Phase 6] docs: record get_definition background-index proof`
   - `2e1a9d1 [Phase 6] fix: prevent false negatives before global index ready`
   - `9774bdc [Phase 6] docs: record blocker review follow-up`
+  - 本次提交：`[Phase 6] fix: prewarm background index and bound sentinel wait`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -67,7 +73,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 - [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
-- [P7 前] `codegraph/api.py` 覆盖率为 `82%`，低于核心 90% 目标；BLOCKER 路径已覆盖，剩余主要是异常/边界分支。真机验收后补异常分支测试。
+- [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。
 - [NIT] ready 后 `_health_after_warm()` 会重新读取 index health，存在轻微重复 IO，不影响正确性。
 - [NIT] `search_symbol` 已修复“先分页再 exact”的主要问题；若极端场景中 fuzzy 结果超过过量窗口，仍可能漏掉更靠后的 exact，后续可观察。
 

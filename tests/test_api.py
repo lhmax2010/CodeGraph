@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,11 @@ import pytest
 from codegraph.api import (
     BuildConfig,
     CodeGraph,
+    _prewarm_index_ready_timeout,
+    _warm_background_index,
     clear_build_configs,
     get_definition as api_get_definition,
+    prewarm_build_config,
     register_build_config,
     search_symbol as api_search_symbol,
 )
@@ -115,6 +119,7 @@ class NeverReadyEngine:
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult:
         return EngineObservationResult()
 
@@ -138,6 +143,7 @@ class ReadyEngine(NeverReadyEngine):
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult:
         return EngineObservationResult(
             locations=self.locations[offset : offset + limit]
@@ -160,6 +166,7 @@ class FailingEngine(NeverReadyEngine):
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult:
         raise TimeoutError("boom")
 
@@ -228,6 +235,7 @@ class SentinelEngine(NeverReadyEngine):
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult:
         if symbol == "target":
             return EngineObservationResult(locations=(self.header,))
@@ -303,6 +311,176 @@ def test_ready_probe_requires_configured_path_suffix(tmp_path: Path):
     assert result.semantic_results[0].data.symbol_id.file == str(main)
 
 
+def test_prewarm_warms_cache_but_query_still_proves_readiness(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = SentinelEngine(
+        loc("target", main), loc("sentinel", lib), loc("target", lib)
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    assert client.prewarm() is True
+    prewarm_probe_calls = engine.probe_calls
+    result = client.get_definition("target", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.semantic_results[0].data.symbol_id.file == str(lib)
+    assert engine.probe_calls > prewarm_probe_calls
+
+
+def test_prewarm_failure_does_not_disable_later_query_warm(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    ready_engine = SentinelEngine(
+        loc("target", main), loc("sentinel", lib), loc("target", lib)
+    )
+    engines = iter((NeverReadyEngine(), ready_engine))
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=1,
+            prewarm_index_ready_timeout=0,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: next(engines),
+    )
+
+    assert client.prewarm() is False
+    result = client.get_definition("target", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.semantic_results[0].data.symbol_id.file == str(lib)
+    assert ready_engine.probe_calls == 2
+
+
+class TimeoutProbeEngine(NeverReadyEngine):
+    def __init__(self):
+        self.request_timeouts: list[float | None] = []
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        request_timeout: float | None = None,
+    ) -> EngineObservationResult:
+        self.request_timeouts.append(request_timeout)
+        time.sleep(min(request_timeout or 0.0, 0.02))
+        raise TimeoutError("probe timed out")
+
+
+def test_warm_background_index_passes_remaining_deadline_to_probe(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    engine = TimeoutProbeEngine()
+    config = BuildConfig(
+        "test",
+        str(tmp_path),
+        background_index=True,
+        index_ready_timeout=0.03,
+        index_ready_poll_interval=0,
+        index_ready_probe_symbol="sentinel",
+        request_timeout=5,
+        warmup_file=str(main),
+    )
+
+    start = time.monotonic()
+    ready = _warm_background_index(engine, config)
+    elapsed = time.monotonic() - start
+
+    assert ready is False
+    assert elapsed < 0.1
+    assert engine.request_timeouts
+    assert 0 < engine.request_timeouts[0] <= config.index_ready_timeout
+
+
+def test_prewarm_uses_independent_longer_timeout(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    engine = TimeoutProbeEngine()
+    config = BuildConfig(
+        "test",
+        str(tmp_path),
+        background_index=True,
+        index_ready_timeout=0.03,
+        prewarm_index_ready_timeout=0.2,
+        index_ready_poll_interval=0,
+        index_ready_probe_symbol="sentinel",
+        request_timeout=5,
+        warmup_file=str(main),
+    )
+    client = CodeGraph(config, engine_factory=lambda _cfg: engine)
+
+    assert client.prewarm() is False
+
+    assert engine.request_timeouts
+    assert engine.request_timeouts[0] is not None
+    assert config.index_ready_timeout < engine.request_timeouts[0] <= 0.2
+
+
+def test_prewarm_default_timeout_is_at_least_thirty_seconds(tmp_path: Path):
+    short = BuildConfig("short", str(tmp_path), index_ready_timeout=8)
+    long = BuildConfig("long", str(tmp_path), index_ready_timeout=45)
+    explicit = BuildConfig(
+        "explicit",
+        str(tmp_path),
+        index_ready_timeout=8,
+        prewarm_index_ready_timeout=12,
+    )
+
+    assert _prewarm_index_ready_timeout(short) == 30.0
+    assert _prewarm_index_ready_timeout(long) == 45
+    assert _prewarm_index_ready_timeout(explicit) == 12
+
+
+def test_query_warm_still_uses_query_timeout_not_prewarm_timeout(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = TimeoutProbeEngine()
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0.03,
+            prewarm_index_ready_timeout=0.2,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            request_timeout=5,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert engine.request_timeouts
+    assert engine.request_timeouts[0] is not None
+    assert 0 < engine.request_timeouts[0] <= 0.03
+
+
 def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: Path):
     _lib, main = write_project(tmp_path)
     client = CodeGraph(
@@ -369,6 +547,7 @@ def test_background_index_not_ready_downgrades_health_to_avoid_false_not_found(
 def test_module_level_registry_reports_unknown_config():
     clear_build_configs()
 
+    assert prewarm_build_config("missing") is False
     assert api_search_symbol("add", build_config_id="missing").status == (
         QueryStatus.INVALID_REQUEST
     )
@@ -429,4 +608,28 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
         ("search", ("add", None, 3, 0)),
         ("init", "test"),
         ("definition", ("add", str(main), Pos(1, 0), False)),
+    ]
+
+
+def test_register_build_config_can_explicitly_prewarm(monkeypatch, tmp_path: Path):
+    clear_build_configs()
+    calls: list[tuple[str, object]] = []
+
+    class DummyCodeGraph:
+        def __init__(self, config: BuildConfig):
+            calls.append(("init", config.build_config_id))
+
+        def prewarm(self):
+            calls.append(("prewarm", None))
+            return True
+
+    monkeypatch.setattr("codegraph.api.CodeGraph", DummyCodeGraph)
+
+    assert register_build_config(BuildConfig("test", str(tmp_path)), prewarm=True)
+    assert prewarm_build_config("test")
+    assert calls == [
+        ("init", "test"),
+        ("prewarm", None),
+        ("init", "test"),
+        ("prewarm", None),
     ]

@@ -36,6 +36,7 @@ _KIND_FILTERS = {
     "type": SymbolKind.TYPE,
     "macro": SymbolKind.MACRO,
 }
+_DEFAULT_PREWARM_INDEX_READY_TIMEOUT = 30.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class BuildConfig:
     request_timeout: float = 30.0
     diagnostics_wait: float = 0.5
     index_ready_timeout: float = 5.0
+    prewarm_index_ready_timeout: float | None = None
     index_ready_poll_interval: float = 0.25
     index_ready_probe_symbol: str | None = None
     index_ready_probe_path_suffix: str | None = None
@@ -72,10 +74,22 @@ class ManagedEngine(EngineObservation, Protocol):
     ) -> None: ...
 
 
-def register_build_config(config: BuildConfig) -> None:
+def register_build_config(config: BuildConfig, *, prewarm: bool = False) -> bool:
     """Register a build config for the module-level API functions."""
 
     _BUILD_CONFIGS[config.build_config_id] = config
+    if prewarm:
+        return prewarm_build_config(config.build_config_id)
+    return False
+
+
+def prewarm_build_config(build_config_id: str) -> bool:
+    """Warm a registered build config without granting future queries readiness."""
+
+    config = _BUILD_CONFIGS.get(build_config_id)
+    if config is None:
+        return False
+    return CodeGraph(config).prewarm()
 
 
 def clear_build_configs() -> None:
@@ -141,6 +155,20 @@ class CodeGraph:
     ):
         self.config = config
         self._engine_factory = engine_factory or (lambda cfg: ClangdAdapter(cfg))
+
+    def prewarm(self, file: str | None = None) -> bool:
+        """Warm clangd/index caches; each user query still proves readiness itself."""
+
+        try:
+            with self._engine_factory(self._clangd_config()) as engine:
+                return _warm_background_index(
+                    engine,
+                    self.config,
+                    file,
+                    timeout=_prewarm_index_ready_timeout(self.config),
+                )
+        except Exception:
+            return False
 
     def search_symbol(
         self,
@@ -236,6 +264,8 @@ def _warm_background_index(
     engine: EngineObservation,
     config: BuildConfig,
     file: str | None = None,
+    *,
+    timeout: float | None = None,
 ) -> bool:
     if not config.background_index:
         return False
@@ -245,13 +275,33 @@ def _warm_background_index(
     probe_symbol = config.index_ready_probe_symbol
     if probe_symbol is None:
         return False
-    deadline = time.monotonic() + config.index_ready_timeout
-    while time.monotonic() <= deadline:
-        observation = engine.search_symbol(probe_symbol, limit=20)
+    ready_timeout = config.index_ready_timeout if timeout is None else timeout
+    deadline = time.monotonic() + ready_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            observation = engine.search_symbol(
+                probe_symbol,
+                limit=20,
+                request_timeout=min(remaining, config.request_timeout),
+            )
+        except TimeoutError:
+            return False
         if _index_ready_probe_matches(observation, probe_symbol, config):
             return True
-        time.sleep(config.index_ready_poll_interval)
-    return False
+        sleep_for = min(
+            config.index_ready_poll_interval, max(0.0, deadline - time.monotonic())
+        )
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+def _prewarm_index_ready_timeout(config: BuildConfig) -> float:
+    if config.prewarm_index_ready_timeout is not None:
+        return config.prewarm_index_ready_timeout
+    return max(config.index_ready_timeout, _DEFAULT_PREWARM_INDEX_READY_TIMEOUT)
 
 
 def _effective_health(

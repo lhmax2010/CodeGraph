@@ -419,6 +419,7 @@ def test_engine_protocol_shape_accepts_minimal_stubs():
             kind_filter: str | None = None,
             limit: int = 100,
             offset: int = 0,
+            request_timeout: float | None = None,
         ) -> EngineObservationResult:
             return EngineObservationResult()
 

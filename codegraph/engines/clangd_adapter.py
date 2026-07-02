@@ -105,8 +105,11 @@ class ClangdAdapter:
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult:
-        result = self._request("workspace/symbol", {"query": symbol})
+        result = self._request(
+            "workspace/symbol", {"query": symbol}, timeout=request_timeout
+        )
         locations = [
             loc
             for loc in (
@@ -257,8 +260,11 @@ class ClangdAdapter:
         self._opened.add(uri)
         return uri
 
-    def _request(self, method: str, params: dict) -> Any:
-        return self._client.request(method, params, timeout=self.config.request_timeout)
+    def _request(
+        self, method: str, params: dict, *, timeout: float | None = None
+    ) -> Any:
+        request_timeout = self.config.request_timeout if timeout is None else timeout
+        return self._client.request(method, params, timeout=request_timeout)
 
     def _prepare_call_hierarchy(self, uri: str, pos: Pos) -> list[JsonObject]:
         result = self._call_hierarchy_request(

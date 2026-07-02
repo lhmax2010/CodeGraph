@@ -41,6 +41,7 @@ class EngineObservation(Protocol):
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        request_timeout: float | None = None,
     ) -> EngineObservationResult: ...
 
     def get_definition(
