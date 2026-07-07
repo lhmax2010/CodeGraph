@@ -1,12 +1,12 @@
 # Stage 06 - E2E Search/Definition / Result
 
 ## 最终状态
-待真机验收 / 待 Merge。
+已 Merge。
 
 P6 `search_symbol` + `get_definition` 端到端集成已实现，并按 design v1.4.5 / change_5 对齐：
 MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_found`，空结果一律
-`UNRESOLVED`。change_5 代码对齐已过用户异构 review；真机查询级验收数据已记录，待用户最终核对后
-merge。
+`UNRESOLVED`。change_5 代码对齐已过用户异构 review；真机查询级验收两路确认有效达标，
+未误伤正常查询能力，已收口 merge。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
@@ -88,7 +88,8 @@ merge。
   - `d859849 [Phase 6] fix: prevent not_found from truncated symbol windows`
   - `eb6e865 [Phase 6] fix: prevent unfiltered symbol searches from asserting not_found`
   - `284dfd9 [Phase 6] align: change_5 no not_found under background-index`
-  - 本轮 HEAD：`[Phase 6] chore: record change_5 true-machine acceptance`
+  - 验收提交：`c1fb2f2 [Phase 6] chore: record change_5 true-machine acceptance`
+  - 收口：`checkpoint/phase_6_e2e`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -102,11 +103,14 @@ merge。
 - [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 或未配置 `index_ready_probe_path_suffix` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
-- [核对前] P6 真机查询级验收已完成并记录，待用户最终核对后 merge。
+- [P7 必查·核心] `find_references` 跨 TU 验证（389 refs/62 files for `gst_element_set_state`）：P5 已记录 `--background-index=false` -> 2 refs、`--background-index=true` -> 389 refs/62 files 的对照；P6 已证明 `background_index=True` + warm TU + sentinel 可消费 P5 的全局索引。P7 的 `find_references` 必须沿用可消费 background-index 的启动/ready 方式，并以 389 refs/62 files 作为核心价值验收。
 - [P7 前·harden] 截断判据目前比较 P6 `engine_limit` 与 adapter 返回数，依赖 `engine_limit=100` 与 clangd `workspace/symbol` 实际返回 cap 对齐；offset>0、kind_filter 本地缩小计数、换引擎/换 clangd 行为时可能漏检 clangd 层截断。P7 前应让截断判据对齐真实 engine cap/原始返回规模，不依赖 100==100 的巧合。
+- [P7 前] `api.py` 覆盖率已恢复到 `93%`，但异常分支/故障注入仍可继续补测，特别是真实 clangd failure、sentinel 配错可观测性、registry/config 边界。
 - [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。
 - [NIT] ready 后 `_health_after_warm()` 会重新读取 index health，存在轻微重复 IO，不影响正确性。
 - [NIT] `search_symbol` 已修复“先分页再 exact”的主要问题；若极端场景中 fuzzy 结果超过过量窗口，仍可能漏掉更靠后的 exact，后续可观察。
 
 ## 下一阶段计划
-- 约 P6 真机验收，确认最终 DoD 后 merge `phase/6-e2e-search-def` 到 `main`。
+- 开始 P7：在 P6 已打通 search/definition 全局索引消费的基础上，实现并真机验收
+  `find_references`，重点复现 `gst_element_set_state` 389 refs/62 files，并处理 P7 前结转的
+  diagnostics、sentinel 可观测性、截断判据和异常分支补测。
