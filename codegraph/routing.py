@@ -551,10 +551,7 @@ def _can_assert_not_found(
     index_backend: IndexBackend,
     symbol_kind: SymbolKind,
 ) -> bool:
-    if (
-        index_backend == IndexBackend.BACKGROUND_INDEX
-        and index_scope == IndexScope.GLOBAL
-    ):
+    if index_backend == IndexBackend.BACKGROUND_INDEX:
         return False
     return (
         dependency.status == DepStatus.COMPLETE

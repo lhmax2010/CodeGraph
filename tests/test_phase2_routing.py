@@ -431,22 +431,24 @@ def test_empty_result_not_found_and_unresolved_boundaries():
         EngineObservationResult(),
         index_scope=IndexScope.INDEXED_PROJECT,
         index_health=IndexHealth.COMPLETE,
+        index_backend=IndexBackend.CLANGD_INDEXER,
         symbol_kind=SymbolKind.ORDINARY_FUNCTION,
     )
     assert not_found.status == QueryStatus.NOT_FOUND
     assert (
-        not_found.status_credibility.coverage.negative_scope == NegativeScope.CURRENT_TU
+        not_found.status_credibility.coverage.negative_scope
+        == NegativeScope.INDEXED_PROJECT
     )
 
-    global_background = route_observation(
+    background_index = route_observation(
         q(),
         EngineObservationResult(),
-        index_scope=IndexScope.GLOBAL,
+        index_scope=IndexScope.INDEXED_PROJECT,
         index_health=IndexHealth.COMPLETE,
         index_backend=IndexBackend.BACKGROUND_INDEX,
         symbol_kind=SymbolKind.ORDINARY_FUNCTION,
     )
-    assert global_background.status == QueryStatus.UNRESOLVED
+    assert background_index.status == QueryStatus.UNRESOLVED
 
     fatal = route_observation(
         q(), EngineObservationResult(diagnostics=EngineDiagnostics(fatal=("fatal",)))

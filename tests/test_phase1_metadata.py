@@ -96,7 +96,13 @@ def test_inv13_not_found_requires_exhaustive_negative_scope():
             negative_scope=NegativeScope.NONE,
         ),
     )
-    check_invariants(mk(resolved=Resolved.NOT_FOUND, coverage=NF_CURRENT_TU))
+    check_invariants(
+        mk(
+            resolved=Resolved.NOT_FOUND,
+            coverage=NF_CURRENT_TU,
+            index_backend=IndexBackend.CLANGD_INDEXER,
+        )
+    )
 
 
 def test_inv14_indexed_project_negative_scope_is_clamped_by_health_and_backend():
@@ -129,6 +135,24 @@ def test_inv14_indexed_project_negative_scope_is_clamped_by_health_and_backend()
     )
 
 
+def test_inv14d_background_index_forbids_not_found_but_indexer_allows():
+    assert_violates(
+        "INV14D",
+        resolved=Resolved.NOT_FOUND,
+        coverage=NF_CURRENT_TU,
+        index_health=IndexHealth.COMPLETE,
+        index_backend=IndexBackend.BACKGROUND_INDEX,
+    )
+    check_invariants(
+        mk(
+            resolved=Resolved.NOT_FOUND,
+            coverage=NF_CURRENT_TU,
+            index_health=IndexHealth.COMPLETE,
+            index_backend=IndexBackend.CLANGD_INDEXER,
+        )
+    )
+
+
 def test_negative_scope_index_scope_matrix():
     assert_violates(
         "INV14_MATRIX",
@@ -138,6 +162,7 @@ def test_negative_scope_index_scope_matrix():
             is_exhaustive_within_scope=True,
             negative_scope=NegativeScope.CURRENT_TU,
         ),
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
     check_invariants(
         mk(
@@ -147,6 +172,7 @@ def test_negative_scope_index_scope_matrix():
                 is_exhaustive_within_scope=True,
                 negative_scope=NegativeScope.CURRENT_TU,
             ),
+            index_backend=IndexBackend.CLANGD_INDEXER,
         )
     )
 
@@ -157,6 +183,7 @@ def test_inv15_not_found_only_for_exhaustive_symbol_kinds():
         resolved=Resolved.NOT_FOUND,
         coverage=NF_CURRENT_TU,
         symbol_kind=SymbolKind.MACRO,
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
     for kind in (
         SymbolKind.ORDINARY_FUNCTION,
@@ -168,6 +195,7 @@ def test_inv15_not_found_only_for_exhaustive_symbol_kinds():
                 resolved=Resolved.NOT_FOUND,
                 coverage=NF_CURRENT_TU,
                 symbol_kind=kind,
+                index_backend=IndexBackend.CLANGD_INDEXER,
             )
         )
 
@@ -212,6 +240,7 @@ def test_inv18_dependency_missing_consistency_and_na_not_found_guard():
         resolved=Resolved.NOT_FOUND,
         coverage=NF_CURRENT_TU,
         dependency=DependencyScope.not_applicable(),
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
 
 
@@ -257,6 +286,7 @@ def test_inv20_not_found_requires_clangd_semantic_without_blind_spot():
         resolved=Resolved.NOT_FOUND,
         coverage=NF_CURRENT_TU,
         blind_spot_affects_result=True,
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
     assert_violates(
         "INV20",
@@ -264,12 +294,14 @@ def test_inv20_not_found_requires_clangd_semantic_without_blind_spot():
         certainty=Certainty.SYNTACTIC,
         resolved=Resolved.NOT_FOUND,
         coverage=NF_CURRENT_TU,
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
     assert_violates(
         "INV20",
         certainty=Certainty.SYNTACTIC,
         resolved=Resolved.NOT_FOUND,
         coverage=NF_CURRENT_TU,
+        index_backend=IndexBackend.CLANGD_INDEXER,
     )
     check_invariants(F.clangd_not_found(QueryKind.ENTITY, DEP_OK))
 

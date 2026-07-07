@@ -147,9 +147,9 @@ def clangd_not_found(
     active_config: ActiveConfig = ActiveConfig.UNKNOWN,
     symbol_kind: SymbolKind = SymbolKind.ORDINARY_FUNCTION,
     index_health: IndexHealth = IndexHealth.COMPLETE,
-    index_backend: IndexBackend = IndexBackend.BACKGROUND_INDEX,
+    index_backend: IndexBackend = IndexBackend.CLANGD_INDEXER,
 ) -> Credibility:
-    """clangd 确认不存在(诚实的 not_found)。仅当依赖闭包 complete 才合法(INV6)。"""
+    """clangd-indexer 二期诚实 not_found；MVP background-index 不产 not_found."""
     return validate(
         Credibility(
             source=Source.CLANGD,

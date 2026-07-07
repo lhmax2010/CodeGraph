@@ -412,6 +412,13 @@ def _check_inv14c(c: Credibility) -> None:
         )
 
 
+def _check_inv14d(c: Credibility) -> None:
+    if c.resolved != Resolved.NOT_FOUND:
+        return
+    if c.index_backend == IndexBackend.BACKGROUND_INDEX:
+        raise InvariantError("INV14D", "background-index forbids not_found in MVP")
+
+
 def _check_inv21(c: Credibility) -> None:
     if (
         c.resolved != Resolved.NOT_FOUND
@@ -516,6 +523,7 @@ _INVARIANT_CHECKS: tuple[Callable[[Credibility], None], ...] = (
     _check_inv14a,
     _check_inv14b,
     _check_inv14c,
+    _check_inv14d,
     _check_inv21,
     _check_negative_scope_index_scope,
     _check_inv15,

@@ -205,6 +205,8 @@ class CodeGraph:
         ready_for_negative_proof = ready and not (
             search_window_may_be_truncated and total_hits == 0
         )
+        if self.config.background_index and not observation.locations:
+            ready_for_negative_proof = False
         return route_observation(
             query,
             observation,
@@ -244,13 +246,18 @@ class CodeGraph:
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
         health = _health_after_warm(health, self.config, ready)
+        ready_for_negative_proof = ready
+        if self.config.background_index and not observation.locations:
+            ready_for_negative_proof = False
         return route_observation(
             query,
             observation,
             syntactic_provider=provider,
             allow_syntactic_fallback=allow_syntactic_fallback,
-            index_scope=_effective_index_scope(self.config, ready),
-            index_health=_effective_health(health, self.config, ready),
+            index_scope=_effective_index_scope(self.config, ready_for_negative_proof),
+            index_health=_effective_health(
+                health, self.config, ready_for_negative_proof
+            ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=SymbolKind.UNKNOWN,

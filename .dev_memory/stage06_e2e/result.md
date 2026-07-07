@@ -3,14 +3,14 @@
 ## 最终状态
 待真机验收 / 待 Merge。
 
-P6 `search_symbol` + `get_definition` 端到端集成已实现，并持续修复 review 抓到的多层虚假否定问题。
-当前最新第四层 `kind_filter=None` 修复已落地并通过本地 gate；仍需用户异构多路 review 复核后，
-才能进入 P6 真机验收收口。
+P6 `search_symbol` + `get_definition` 端到端集成已实现，并按 design v1.4.5 / change_5 对齐：
+MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_found`，空结果一律
+`UNRESOLVED`。本地 gate 已全绿；仍需用户异构多路 review 复核后，才能进入 P6 真机验收收口。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
-- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `141 passed in 2.36s`。
-- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `141 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
+- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `142 passed in 1.98s`。
+- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `142 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/credibility.py` `96%`，`codegraph/engines/clangd_adapter.py` `100%`。
 - 静态 gate：
   - `.venv/bin/ruff check .` -> All checks passed。
   - `.venv/bin/black --check .` -> 22 files unchanged。
@@ -34,7 +34,10 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现，并持续修复
 - ready 语义硬化：`index_ready_probe_symbol` 必须与 `index_ready_probe_path_suffix` 配套；缺 suffix 直接 not-ready，不允许单 TU/header 命中把 `complete` health 带进 P2。
 - `search_symbol` 分页硬化：exact 总命中数与当前页分开计算，`total_hits>0` 的空页不得落入项目级 `not_found`。
 - `search_symbol` 截断窗口硬化：engine 返回数达到 `engine_limit` 且窗口内 exact 为 0 时，认为 fuzzy 窗口可能截断并保守降 `unknown/current_tu`，防 exact 排在窗口外时虚假 `not_found`。
-- kind 语义硬化：`search_symbol(kind_filter=None)` 表示不过滤、任意符号，传 `SymbolKind.UNKNOWN`，不得项目级 `not_found`；只有显式 `function/variable/type` filter 才传可穷尽 kind 并保留 not_found 能力。`get_definition` 无 kind filter，同样用 `UNKNOWN`，避免把宏/类型/变量位置的空结果误判成普通函数不存在。
+- change_5 对齐：MVP `background-index` 下 `search_symbol` / `get_definition` 空结果一律 `UNRESOLVED`，不产 `not_found`。
+- kind 元数据诚实性：`search_symbol(kind_filter=None)` 表示不过滤、任意符号，传 `SymbolKind.UNKNOWN`；显式 `function/variable/type` filter 保留真实 symbol_kind（如 function -> `ORDINARY_FUNCTION`），但空结果仍通过 health/scope guard 返回 `UNRESOLVED`，不失真元数据也不产 not_found。`get_definition` 无 kind filter，空结果用 `UNKNOWN`。
+- P1 物理兜底：新增 INV14d，`index_backend=background-index ∧ resolved=not_found` 直接抛 `InvariantError("INV14D")`；`clangd-indexer + not_found` 放行，保留二期恢复条件。
+- 工厂对齐：`clangd_not_found` 默认改为 `IndexBackend.CLANGD_INDEXER`，作为二期 not_found 工厂；MVP background-index 不再默认造非法 not_found。
 - P3 兼容性硬化：`ClangdAdapterConfig` 恢复旧位置参数顺序，并运行时拒绝把 `background_index` 误传到第三个位置参数。
 
 ## 真机 ARM / P5 全局索引复现
@@ -68,7 +71,8 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现，并持续修复
   - 本次提交：`[Phase 6] fix: prewarm background index and bound sentinel wait`
   - 本次 follow-up：`[Phase 6] fix: require ready probe suffix and preserve search totals`
   - `d859849 [Phase 6] fix: prevent not_found from truncated symbol windows`
-  - 待提交：`[Phase 6] fix: prevent unfiltered symbol searches from asserting not_found`
+  - `eb6e865 [Phase 6] fix: prevent unfiltered symbol searches from asserting not_found`
+  - 待提交：`[Phase 6] fix: align background-index not_found behavior with change_5`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -82,7 +86,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现，并持续修复
 - [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 或未配置 `index_ready_probe_path_suffix` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
-- [Review 前] `search_symbol` kind_filter=None / `get_definition` symbol_kind=UNKNOWN 修复是安全逻辑修改，需过用户异构多路 review 后才能进入最终真机验收。
+- [Review 前] change_5 对齐是虚假否定核心修改：MVP background-index 下 search_symbol/get_definition 均不产 not_found，且 P1 INV14d fail-loud 拦 background-index+not_found。需过用户异构多路 review 后才能进入最终真机验收。
 - [P7 前·harden] 截断判据目前比较 P6 `engine_limit` 与 adapter 返回数，依赖 `engine_limit=100` 与 clangd `workspace/symbol` 实际返回 cap 对齐；offset>0、kind_filter 本地缩小计数、换引擎/换 clangd 行为时可能漏检 clangd 层截断。P7 前应让截断判据对齐真实 engine cap/原始返回规模，不依赖 100==100 的巧合。
 - [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。
 - [NIT] ready 后 `_health_after_warm()` 会重新读取 index health，存在轻微重复 IO，不影响正确性。

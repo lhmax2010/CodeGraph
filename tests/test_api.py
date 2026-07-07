@@ -292,7 +292,7 @@ def test_search_symbol_empty_page_with_matches_is_not_not_found(tmp_path: Path):
 
     assert result.status == QueryStatus.UNRESOLVED
     assert result.total_hits == 2
-    assert result.index_health == "complete"
+    assert result.index_health == "unknown"
 
 
 def test_search_symbol_truncated_fuzzy_window_cannot_assert_not_found(
@@ -338,11 +338,13 @@ def test_search_symbol_without_kind_filter_cannot_assert_not_found(tmp_path: Pat
     result = client.search_symbol("missing")
 
     assert result.status == QueryStatus.UNRESOLVED
-    assert result.index_health == "complete"
+    assert result.index_health == "unknown"
     assert result.status_credibility.symbol_kind.value == "unknown"
 
 
-def test_search_symbol_function_filter_can_assert_not_found(tmp_path: Path):
+def test_search_symbol_function_filter_keeps_kind_but_cannot_assert_not_found(
+    tmp_path: Path,
+):
     lib, _main = write_project(tmp_path)
     touch_complete_index(tmp_path)
     client = CodeGraph(
@@ -358,8 +360,8 @@ def test_search_symbol_function_filter_can_assert_not_found(tmp_path: Path):
 
     result = client.search_symbol("missing", kind_filter="function")
 
-    assert result.status == QueryStatus.NOT_FOUND
-    assert result.index_health == "complete"
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
     assert result.status_credibility.symbol_kind.value == "ordinary_function"
 
 
@@ -396,7 +398,7 @@ def test_get_definition_without_kind_filter_cannot_assert_not_found(tmp_path: Pa
     result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
 
     assert result.status == QueryStatus.UNRESOLVED
-    assert result.index_health == "complete"
+    assert result.index_health == "unknown"
     assert result.total_hits == 0
     assert result.status_credibility.symbol_kind.value == "unknown"
 
