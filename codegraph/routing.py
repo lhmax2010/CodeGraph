@@ -417,11 +417,6 @@ def _not_found_cred(
     index_health: IndexHealth,
     index_backend: IndexBackend,
 ) -> Credibility:
-    negative_scope = (
-        NegativeScope.CURRENT_TU
-        if index_backend == IndexBackend.BACKGROUND_INDEX
-        else NegativeScope.INDEXED_PROJECT
-    )
     return _cred(
         query_kind,
         dependency,
@@ -430,7 +425,7 @@ def _not_found_cred(
         coverage=Coverage(
             index_scope=index_scope,
             is_exhaustive_within_scope=True,
-            negative_scope=negative_scope,
+            negative_scope=NegativeScope.INDEXED_PROJECT,
         ),
         active_config=active_config,
         symbol_kind=symbol_kind,

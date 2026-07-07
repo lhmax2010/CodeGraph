@@ -5,7 +5,8 @@
 
 P6 `search_symbol` + `get_definition` 端到端集成已实现，并按 design v1.4.5 / change_5 对齐：
 MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_found`，空结果一律
-`UNRESOLVED`。本地 gate 已全绿；仍需用户异构多路 review 复核后，才能进入 P6 真机验收收口。
+`UNRESOLVED`。change_5 代码对齐已过用户异构 review；真机查询级验收数据已记录，待用户最终核对后
+merge。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
@@ -57,6 +58,20 @@ MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_f
   - `get_definition(gst_buffer_ref)` 连续 3 次均稳定命中 `gstbuffer.c:3014`，每次约 `1.57-1.59s`。
 - 无 sentinel 复现：`background_index=True` 但未配置 `index_ready_probe_symbol` 时，`search_symbol`/`get_definition` 均保守为 `UNRESOLVED/index_unknown`，只给 syntactic candidates，不给语义 OK 或 not_found。
 - 预热后首查复现：`CodeGraph(config).prewarm()` 后立即执行第一条用户查询 `get_definition(gst_buffer_ref @ gstbufferlist.c:91)`；最终默认 prewarm timeout 为 `30.0s`，本次 prewarm 1.408s 且 ready=True，紧接着第一条用户查询 1.581s -> `OK/complete`，语义结果 `gstbuffer.c:3014`；分片前后均为 `(3593, 39911040, 1781072784911021003)`，未重建。
+- change_5 最终真机验收（2026-07-07，复用现有 3593 分片，不重建）：
+  - 环境：真实 CDB `/home/linhao/Toolchain/codes/rw_arm`；query file 为 CDB 中的 `gstbufferlist.c`；`gst_buffer_ref` 调用点 zero-based `[90, 23]`；空 definition 验证用注释位置 `[88, 5]`；prewarm timeout 生效值 `30.0s`。
+  - 索引快照：验收前 `(3593, 39911040, 1781072784911021003)`，验收后相同，确认复用分片、未触发重建。
+  - Prewarm：`CodeGraph.prewarm()` -> `ready=True`，`1.331s`。
+  - change_5 核心，真实不存在符号 `__codegraph_missing_symbol_20260707_change5__`：
+    - `search_symbol(kind_filter=None)` -> `UNRESOLVED`，health=`unknown`，symbol_kind=`unknown`，`total_hits=0`。
+    - `search_symbol(kind_filter=function)` -> `UNRESOLVED`，health=`unknown`，symbol_kind=`ordinary_function`，`total_hits=0`。
+    - `search_symbol(kind_filter=variable)` -> `UNRESOLVED`，health=`unknown`，symbol_kind=`ordinary_variable`，`total_hits=0`。
+    - `search_symbol(kind_filter=type)` -> `UNRESOLVED`，health=`unknown`，symbol_kind=`type`，`total_hits=0`。
+    - `search_symbol(kind_filter=macro)` -> `UNRESOLVED`，health=`unknown`，symbol_kind=`macro`，`total_hits=0`。
+    - `get_definition` 在注释位置空结果 -> `UNRESOLVED`，health=`unknown`，symbol_kind=`unknown`，`total_hits=0`。
+  - 降 health/scope 不降 kind 真机确认：`kind_filter=function` 的空 search 保留 `symbol_kind=ordinary_function`，同时通过 health=`unknown` 阻断 not_found。
+  - P6 端到端价值仍在：`search_symbol(gst_buffer_ref)` -> `OK/complete`，`1.429s`，语义结果 `gstbuffer.c:3014`；`get_definition(gst_buffer_ref)` 连续 3 次 -> `OK/complete`，约 `1.429-1.431s`，均命中 `gstbuffer.c:3014`，h→c 稳定不 miss。
+  - bg=False 安全底线：`search_symbol(gst_buffer_ref)` -> `UNRESOLVED/unknown`，非 not_found；`get_definition(gst_buffer_ref)` -> `UNRESOLVED/unknown`，非 not_found。
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
@@ -72,7 +87,8 @@ MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_f
   - 本次 follow-up：`[Phase 6] fix: require ready probe suffix and preserve search totals`
   - `d859849 [Phase 6] fix: prevent not_found from truncated symbol windows`
   - `eb6e865 [Phase 6] fix: prevent unfiltered symbol searches from asserting not_found`
-  - 待提交：`[Phase 6] fix: align background-index not_found behavior with change_5`
+  - `284dfd9 [Phase 6] align: change_5 no not_found under background-index`
+  - 本轮 HEAD：`[Phase 6] chore: record change_5 true-machine acceptance`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -86,7 +102,7 @@ MVP `background-index` 下 `search_symbol` 与 `get_definition` 均不产 `not_f
 - [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 或未配置 `index_ready_probe_path_suffix` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
-- [Review 前] change_5 对齐是虚假否定核心修改：MVP background-index 下 search_symbol/get_definition 均不产 not_found，且 P1 INV14d fail-loud 拦 background-index+not_found。需过用户异构多路 review 后才能进入最终真机验收。
+- [核对前] P6 真机查询级验收已完成并记录，待用户最终核对后 merge。
 - [P7 前·harden] 截断判据目前比较 P6 `engine_limit` 与 adapter 返回数，依赖 `engine_limit=100` 与 clangd `workspace/symbol` 实际返回 cap 对齐；offset>0、kind_filter 本地缩小计数、换引擎/换 clangd 行为时可能漏检 clangd 层截断。P7 前应让截断判据对齐真实 engine cap/原始返回规模，不依赖 100==100 的巧合。
 - [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。
 - [NIT] ready 后 `_health_after_warm()` 会重新读取 index health，存在轻微重复 IO，不影响正确性。
