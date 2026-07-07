@@ -321,6 +321,48 @@ def test_search_symbol_truncated_fuzzy_window_cannot_assert_not_found(
     assert engine.search_limits == [100]
 
 
+def test_search_symbol_without_kind_filter_cannot_assert_not_found(tmp_path: Path):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
+    )
+
+    result = client.search_symbol("missing")
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "complete"
+    assert result.status_credibility.symbol_kind.value == "unknown"
+
+
+def test_search_symbol_function_filter_can_assert_not_found(tmp_path: Path):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
+    )
+
+    result = client.search_symbol("missing", kind_filter="function")
+
+    assert result.status == QueryStatus.NOT_FOUND
+    assert result.index_health == "complete"
+    assert result.status_credibility.symbol_kind.value == "ordinary_function"
+
+
 def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path: Path):
     _lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
@@ -336,7 +378,7 @@ def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path:
     assert result.index_health == "unknown"
 
 
-def test_get_definition_not_found_still_reachable_with_ready_index(tmp_path: Path):
+def test_get_definition_without_kind_filter_cannot_assert_not_found(tmp_path: Path):
     lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
     line = main.read_text(encoding="utf-8").splitlines()[1]
@@ -353,9 +395,10 @@ def test_get_definition_not_found_still_reachable_with_ready_index(tmp_path: Pat
 
     result = client.get_definition("missing", str(main), Pos(1, line.index("add")))
 
-    assert result.status == QueryStatus.NOT_FOUND
+    assert result.status == QueryStatus.UNRESOLVED
     assert result.index_health == "complete"
     assert result.total_hits == 0
+    assert result.status_credibility.symbol_kind.value == "unknown"
 
 
 class SentinelEngine(NeverReadyEngine):

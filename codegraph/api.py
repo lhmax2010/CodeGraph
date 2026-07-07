@@ -218,7 +218,7 @@ class CodeGraph:
             ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
-            symbol_kind=kind or SymbolKind.ORDINARY_FUNCTION,
+            symbol_kind=_search_symbol_kind(kind),
             total_hits=total_hits,
         )
 
@@ -253,7 +253,7 @@ class CodeGraph:
             index_health=_effective_health(health, self.config, ready),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
-            symbol_kind=SymbolKind.ORDINARY_FUNCTION,
+            symbol_kind=SymbolKind.UNKNOWN,
             total_hits=len(observation.locations),
         )
 
@@ -367,6 +367,10 @@ def _index_ready_probe_matches(
 
 def _semantic_search_limit(limit: int, offset: int) -> int:
     return max(100, limit + offset)
+
+
+def _search_symbol_kind(kind_filter: SymbolKind | None) -> SymbolKind:
+    return kind_filter if kind_filter is not None else SymbolKind.UNKNOWN
 
 
 def _search_window_may_be_truncated(

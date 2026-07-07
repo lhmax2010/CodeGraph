@@ -108,3 +108,41 @@ P2 会在 ready+complete 下把真实存在的符号误判为 `not_found`。
 ### 状态
 
 该修复是安全逻辑修改，仍需用户异构多路 review 复核；复核前不进入 P6 真机验收。
+
+## 2026-07-07 - Four-way review fourth-layer BLOCKER
+
+用户异构四路 review 后，Codex 抓到新的属实 BLOCKER：`search_symbol(kind_filter=None)` 被
+P6 API 默认传成 `SymbolKind.ORDINARY_FUNCTION`，而 ordinary function 在 P2 `_EXHAUSTIVE_KINDS`
+中。结果是“不带 kind filter 的任意符号查询”在 ready+complete+空结果下可断言项目级
+`not_found`，把“没有普通函数 foo”误报成“任何 foo 都不存在”。这会对宏、类型、变量造成虚假否定。
+
+### 处理
+
+- `search_symbol(kind_filter=None)` 改传 `SymbolKind.UNKNOWN`，表示不过滤、任意符号，P2 不允许
+  项目级 `not_found`。
+- `search_symbol(kind_filter="function")` 继续传 `ORDINARY_FUNCTION`，保留明确函数查询的 not_found 能力；
+  variable/type 同理仍走可穷尽 kind，macro 不在 `_EXHAUSTIVE_KINDS` 内，仍不能 not_found。
+- `get_definition` 没有 kind filter 参数，用户未明确限定 ordinary function；空结果路径也改传
+  `SymbolKind.UNKNOWN`，避免对宏/类型/变量位置做函数级负证明。
+- 回归：
+  - ready+complete+空结果 + `kind_filter=None` -> `UNRESOLVED`，非 `not_found`。
+  - ready+complete+空结果 + `kind_filter="function"` -> 仍可 `NOT_FOUND`。
+  - ready+complete+空 `get_definition` -> `UNRESOLVED`，非 `not_found`。
+
+### 登记但不改
+
+- Claude Code 提到的 MINOR：截断判据目前比较 P6 `engine_limit` 与 adapter 返回数，依赖
+  `engine_limit=100` 与 clangd 实际 cap 对齐；offset/kind_filter/换引擎时可能漏检底层截断。
+  已登记到 stage06 result.md 的 P7 前 harden 项，不阻塞本轮 P6 修复。
+
+### Gate
+
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_api.py -q` -> `25 passed`。
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/test_phase2_routing.py -q` -> `14 passed`。
+- `PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `141 passed in 2.36s`。
+- coverage -> `141 passed`，total `93%`。
+- ruff / black --check / mypy / compileall / diff-check 全绿。
+
+### 状态
+
+该修复是虚假否定核心修改，仍需用户异构多路 review 复核；复核前不进入 P6 真机验收。

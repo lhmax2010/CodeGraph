@@ -3,13 +3,14 @@
 ## 最终状态
 待真机验收 / 待 Merge。
 
-P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 review BLOCKER。四路异构 review
-与真机复现确认两个虚假否定问题已堵住；merge 前剩余事项是 P6 真机验收收口。
+P6 `search_symbol` + `get_definition` 端到端集成已实现，并持续修复 review 抓到的多层虚假否定问题。
+当前最新第四层 `kind_filter=None` 修复已落地并通过本地 gate；仍需用户异构多路 review 复核后，
+才能进入 P6 真机验收收口。
 
 ## 测试情况
 - Baseline：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `113 passed in 1.99s`。
-- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `139 passed in 3.70s`。
-- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `139 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
+- 最新 UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `141 passed in 2.36s`。
+- 覆盖率：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch --cov-report=term-missing` -> `141 passed`，total `93%`，`codegraph/api.py` `93%`，`codegraph/engines/clangd_adapter.py` `100%`。
 - 静态 gate：
   - `.venv/bin/ruff check .` -> All checks passed。
   - `.venv/bin/black --check .` -> 22 files unchanged。
@@ -33,6 +34,7 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 - ready 语义硬化：`index_ready_probe_symbol` 必须与 `index_ready_probe_path_suffix` 配套；缺 suffix 直接 not-ready，不允许单 TU/header 命中把 `complete` health 带进 P2。
 - `search_symbol` 分页硬化：exact 总命中数与当前页分开计算，`total_hits>0` 的空页不得落入项目级 `not_found`。
 - `search_symbol` 截断窗口硬化：engine 返回数达到 `engine_limit` 且窗口内 exact 为 0 时，认为 fuzzy 窗口可能截断并保守降 `unknown/current_tu`，防 exact 排在窗口外时虚假 `not_found`。
+- kind 语义硬化：`search_symbol(kind_filter=None)` 表示不过滤、任意符号，传 `SymbolKind.UNKNOWN`，不得项目级 `not_found`；只有显式 `function/variable/type` filter 才传可穷尽 kind 并保留 not_found 能力。`get_definition` 无 kind filter，同样用 `UNKNOWN`，避免把宏/类型/变量位置的空结果误判成普通函数不存在。
 - P3 兼容性硬化：`ClangdAdapterConfig` 恢复旧位置参数顺序，并运行时拒绝把 `background_index` 误传到第三个位置参数。
 
 ## 真机 ARM / P5 全局索引复现
@@ -65,7 +67,8 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
   - `9774bdc [Phase 6] docs: record blocker review follow-up`
   - 本次提交：`[Phase 6] fix: prewarm background index and bound sentinel wait`
   - 本次 follow-up：`[Phase 6] fix: require ready probe suffix and preserve search totals`
-  - 待提交：`[Phase 6] fix: prevent not_found from truncated symbol windows`
+  - `d859849 [Phase 6] fix: prevent not_found from truncated symbol windows`
+  - 待提交：`[Phase 6] fix: prevent unfiltered symbol searches from asserting not_found`
 - Review artifact：`docs/review/phase_6_review_result.md`。
 
 ## P6 前的账验证情况
@@ -79,7 +82,8 @@ P6 `search_symbol` + `get_definition` 端到端集成已实现并修复两处 re
 - [P7 前·调用说明] sentinel 必须配置：`background_index=True` 但未配置 `index_ready_probe_symbol` 或未配置 `index_ready_probe_path_suffix` 时会恒 `unknown`，拿不到项目级 not_found/complete 语义结论。这是 secure-by-default；调用方应配置稳定的 `index_ready_probe_symbol` + `index_ready_probe_path_suffix` + `warmup_file`。
 - [P7 前] sentinel 配错会静默降级：错 symbol 或错 suffix 会导致每次查询轮询到 `index_ready_timeout` 后降为 `unknown`。本轮不顺手加 `log.warning`，避免四路 review 后再引入未经复核的新代码路径；建议 P7 前补 warning 或调用侧可观测信号。
 - [P7 前] sentinel probe 当前 `limit=20` 硬编码；极端 common symbol 前 20 条可能不含期望 suffix。后续可配置化或分页探测。
-- [Review 前] `search_symbol` 截断窗口虚假否定修复是安全逻辑修改，需过用户异构多路 review 后才能进入最终真机验收。
+- [Review 前] `search_symbol` kind_filter=None / `get_definition` symbol_kind=UNKNOWN 修复是安全逻辑修改，需过用户异构多路 review 后才能进入最终真机验收。
+- [P7 前·harden] 截断判据目前比较 P6 `engine_limit` 与 adapter 返回数，依赖 `engine_limit=100` 与 clangd `workspace/symbol` 实际返回 cap 对齐；offset>0、kind_filter 本地缩小计数、换引擎/换 clangd 行为时可能漏检 clangd 层截断。P7 前应让截断判据对齐真实 engine cap/原始返回规模，不依赖 100==100 的巧合。
 - [后续架构优化] 当前 `CodeGraph` 每次查询新起 clangd；显式预热只能焐热 OS page cache / `.idx` 读取路径，不能让后续查询跳过 ready 证明。clangd 常驻/进程池可作为独立后续优化，不纳入 P6。
 - [NIT] ready 后 `_health_after_warm()` 会重新读取 index health，存在轻微重复 IO，不影响正确性。
 - [NIT] `search_symbol` 已修复“先分页再 exact”的主要问题；若极端场景中 fuzzy 结果超过过量窗口，仍可能漏掉更靠后的 exact，后续可观察。
