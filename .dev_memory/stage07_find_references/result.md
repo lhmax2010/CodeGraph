@@ -89,7 +89,19 @@
 - [后续待留意] `engine_limit` vs clangd 实际 cap 的截断判据对齐：P6 search_symbol 的截断 guard 仍应在后续 harden，避免依赖当前 clangd 100-cap 巧合。
 - [后续待留意] P3 `diagnostics_wait=0.5s` 在 broken / 大型 TU 上仍可能漏报 diagnostics；P7 未覆盖 broken TU，后续真机场景继续验证。
 - [后续待留意] sentinel 配置错误目前主要表现为保守降级/等待超时；后续可加 warning，让调用方更容易发现配置错符号或错 suffix。
+- [后续待留意] 空 `find_references` 目前会轮询到 `index_ready_timeout` 才返回 `UNRESOLVED/unknown`；后续可加 early-exit：引用集稳定为空时提前返回，避免无意义等待。
+- [后续待留意] 冷启动首查延迟存在波动：Codex 复跑时第 1 次约 `15.7s`、后续约 `2.3s`。P7 热态功能验收数据成立；若未来写性能 SLA，应另开冷态/性能验收口径。
 - [后续待留意] `codegraph/api.py` 覆盖率已达 94%，但部分异常分支仍可后续补测。
 
 ## 下一阶段计划
 - P7 已过 review 与真机验收，等待用户核对后按收尾流程 merge / checkpoint。
+
+## Merge Gate 复核（2026-07-08，针对 `cd009c2`）
+- 执行者：Kimi Code CLI
+- UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `150 passed in 2.94s`
+- 静态 gate：ruff / black --check / mypy codegraph / compileall / git diff --check 全绿
+- Spot-check 真机复现：
+  - 默认 `warmup_file=None`：`389 refs / 62 files / 381 semantic + 8 candidates / OK/complete/indexed_project / is_exhaustive=False`
+  - `bg=False`：`2 refs / current_tu / unknown`
+  - 真实非符号位置：`UNRESOLVED/unknown/total_hits=0`
+- 结论：result.md 六项验收数据自洽、与上轮 review 复现一致，P7 满足 merge 条件。
