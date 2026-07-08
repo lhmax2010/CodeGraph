@@ -173,6 +173,7 @@ class ClangdAdapter:
         return EngineObservationResult(
             diagnostics=self._diagnostics(uri),
             references=tuple(refs[offset : offset + limit]),
+            total_results=len(refs),
         )
 
     def find_callers(

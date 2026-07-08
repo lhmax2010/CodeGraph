@@ -1,4 +1,4 @@
-"""Public CodeGraph library API for search and definition queries."""
+"""Public CodeGraph library API for semantic code queries."""
 
 from __future__ import annotations
 
@@ -143,8 +143,35 @@ def get_definition(
     )
 
 
+def find_references(
+    symbol: str,
+    file: str,
+    pos: Pos,
+    *,
+    build_config_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    allow_syntactic_fallback: bool = False,
+) -> QueryResult:
+    """Return references for a symbol in a registered build config."""
+
+    query = QueryMeta("entity", symbol, build_config_id, str(file), pos)
+    config = _BUILD_CONFIGS.get(build_config_id)
+    if config is None:
+        return _invalid_result(query, f"unknown build_config_id: {build_config_id}")
+    client = CodeGraph(config)
+    return client.find_references(
+        symbol,
+        file,
+        pos,
+        limit=limit,
+        offset=offset,
+        allow_syntactic_fallback=allow_syntactic_fallback,
+    )
+
+
 class CodeGraph:
-    """Thin P6 API facade that wires P3/P4/P5 into the P2 router."""
+    """API facade that wires P3/P4/P5 into the P2 router."""
 
     def __init__(
         self,
@@ -263,6 +290,65 @@ class CodeGraph:
             symbol_kind=SymbolKind.UNKNOWN,
             total_hits=len(observation.locations),
         )
+
+    def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        allow_syntactic_fallback: bool = False,
+    ) -> QueryResult:
+        real_file = str(Path(file).resolve())
+        query = QueryMeta("entity", symbol, self.config.build_config_id, real_file, pos)
+        invalid = _validate_file_pos(real_file, pos)
+        if invalid is not None:
+            return _invalid_result(query, invalid)
+        provider = create_treesitter_provider(self.config.source_roots)
+        health = _index_health(self.config)
+        observation = EngineObservationResult()
+        ready = False
+        try:
+            with self._engine_factory(self._clangd_config()) as engine:
+                ready = _warm_background_index(
+                    engine, self.config, self.config.warmup_file or real_file
+                )
+                if ready:
+                    observation = engine.find_references(
+                        symbol,
+                        real_file,
+                        pos,
+                        limit=limit,
+                        offset=offset,
+                    )
+        except Exception as exc:  # noqa: BLE001 - API reports engine failures.
+            return _engine_failure(query, exc)
+        health = _health_after_warm(health, self.config, ready)
+        total_hits = (
+            observation.total_results
+            if observation.total_results is not None
+            else len(observation.references)
+        )
+        ready_for_references = ready
+        if self.config.background_index and total_hits == 0:
+            ready_for_references = False
+        result = route_observation(
+            query,
+            observation,
+            syntactic_provider=provider,
+            allow_syntactic_fallback=allow_syntactic_fallback,
+            limit=limit,
+            offset=offset,
+            index_scope=_effective_index_scope(self.config, ready_for_references),
+            index_health=_effective_health(health, self.config, ready_for_references),
+            index_backend=IndexBackend.BACKGROUND_INDEX,
+            active_config=self.config.active_config,
+            symbol_kind=SymbolKind.UNKNOWN,
+            total_hits=total_hits,
+        )
+        return _ensure_background_index_references_are_non_exhaustive(result)
 
     def _clangd_config(self) -> ClangdAdapterConfig:
         return ClangdAdapterConfig(
@@ -384,6 +470,19 @@ def _search_window_may_be_truncated(
     observation: EngineObservationResult, engine_limit: int
 ) -> bool:
     return len(observation.locations) >= engine_limit
+
+
+def _ensure_background_index_references_are_non_exhaustive(
+    result: QueryResult,
+) -> QueryResult:
+    for item in result.semantic_results:
+        credibility = item.credibility
+        if (
+            credibility.index_backend == IndexBackend.BACKGROUND_INDEX
+            and credibility.coverage.is_exhaustive_within_scope
+        ):
+            raise RuntimeError("background-index references must not assert exhaustive")
+    return result
 
 
 def _index_health(config: BuildConfig) -> IndexHealth:

@@ -489,9 +489,17 @@ def _positive_coverage(
     observation: EngineObservationResult, index_scope: IndexScope
 ) -> Coverage:
     return (
-        Coverage(index_scope=index_scope)
+        Coverage(
+            index_scope=index_scope,
+            is_exhaustive_within_scope=False,
+            negative_scope=NegativeScope.NONE,
+        )
         if observation.index_scope_known
-        else Coverage(index_scope=IndexScope.EXTERNAL_UNKNOWN)
+        else Coverage(
+            index_scope=IndexScope.EXTERNAL_UNKNOWN,
+            is_exhaustive_within_scope=False,
+            negative_scope=NegativeScope.NONE,
+        )
     )
 
 

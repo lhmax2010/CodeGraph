@@ -288,6 +288,7 @@ def test_search_symbol_and_references_mapping(tmp_path: Path):
     assert [loc.symbol_id.name for loc in symbols.locations] == ["add"]
     assert symbols.locations[0].kind == "ordinary_function"
     assert len(refs.references) == 1
+    assert refs.total_results == 3
     assert isinstance(refs.references[0], ReferenceResult)
     assert refs.references[0].range.start == Pos(5, 9)
 

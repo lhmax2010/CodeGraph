@@ -14,13 +14,21 @@ from codegraph.api import (
     _prewarm_index_ready_timeout,
     _warm_background_index,
     clear_build_configs,
+    find_references as api_find_references,
     get_definition as api_get_definition,
     prewarm_build_config,
     register_build_config,
     search_symbol as api_search_symbol,
 )
 from codegraph.engines.protocol import EngineObservationResult
-from codegraph.types import LocationResult, Pos, QueryStatus, Range, SymbolId
+from codegraph.types import (
+    LocationResult,
+    Pos,
+    QueryStatus,
+    Range,
+    ReferenceResult,
+    SymbolId,
+)
 
 
 def write_project(tmp_path: Path) -> tuple[Path, Path]:
@@ -72,6 +80,11 @@ def loc(name: str, file: Path, line: int = 1) -> LocationResult:
     )
 
 
+def ref(file: Path, line: int = 1) -> ReferenceResult:
+    pos = Pos(line, 9)
+    return ReferenceResult(Range(pos, Pos(line, 12)), str(file), "reference")
+
+
 @pytest.mark.skipif(shutil.which("clangd") is None, reason="clangd unavailable")
 def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Path):
     lib, main = write_project(tmp_path)
@@ -93,6 +106,9 @@ def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Pa
 
     definition = client.get_definition("add", str(main), Pos(1, call_line.index("add")))
     search = client.search_symbol("add")
+    references = client.find_references(
+        "add", str(main), Pos(1, call_line.index("add")), limit=10
+    )
 
     assert definition.status == QueryStatus.OK
     assert definition.index_health == "complete"
@@ -101,6 +117,14 @@ def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Pa
     assert search.index_health == "complete"
     assert [r.data.symbol_id.name for r in search.semantic_results] == ["add"]
     assert [r.data.symbol_id.file for r in search.semantic_results] == [str(lib)]
+    assert references.status == QueryStatus.OK
+    assert references.index_health == "complete"
+    assert references.total_hits is not None
+    assert references.total_hits >= 2
+    assert all(
+        not item.credibility.coverage.is_exhaustive_within_scope
+        for item in references.semantic_results
+    )
 
 
 class NeverReadyEngine:
@@ -129,6 +153,17 @@ class NeverReadyEngine:
         symbol: str,
         file: str,
         pos: Pos,
+    ) -> EngineObservationResult:
+        return EngineObservationResult()
+
+    def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
     ) -> EngineObservationResult:
         return EngineObservationResult()
 
@@ -182,6 +217,19 @@ class DefinitionFailingEngine(NeverReadyEngine):
         raise TimeoutError("definition boom")
 
 
+class ReferencesFailingEngine(NeverReadyEngine):
+    def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        raise TimeoutError("references boom")
+
+
 class ReadyNoDefinitionEngine(NeverReadyEngine):
     def __init__(self, probe_location: LocationResult):
         self.probe_location = probe_location
@@ -198,6 +246,45 @@ class ReadyNoDefinitionEngine(NeverReadyEngine):
         if symbol == "sentinel":
             return EngineObservationResult(locations=(self.probe_location,))
         return EngineObservationResult()
+
+
+class ReadyReferencesEngine(NeverReadyEngine):
+    def __init__(
+        self,
+        probe_location: LocationResult,
+        references: tuple[ReferenceResult, ...],
+    ):
+        self.probe_location = probe_location
+        self.references = references
+        self.find_references_calls = 0
+
+    def search_symbol(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        request_timeout: float | None = None,
+    ) -> EngineObservationResult:
+        if symbol == "sentinel":
+            return EngineObservationResult(locations=(self.probe_location,))
+        return EngineObservationResult()
+
+    def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        self.find_references_calls += 1
+        return EngineObservationResult(
+            references=self.references[offset : offset + limit],
+            total_results=len(self.references),
+        )
 
 
 class TruncatedSearchEngine(NeverReadyEngine):
@@ -401,6 +488,118 @@ def test_get_definition_without_kind_filter_cannot_assert_not_found(tmp_path: Pa
     assert result.index_health == "unknown"
     assert result.total_hits == 0
     assert result.status_credibility.symbol_kind.value == "unknown"
+
+
+def test_find_references_returns_positive_non_exhaustive_background_index_results(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    references = (ref(lib), ref(main), ref(lib, line=0))
+    engine = ReadyReferencesEngine(loc("sentinel", lib), references)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+            warmup_file=str(lib),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references(
+        "add", str(main), Pos(1, line.index("add")), limit=1, offset=1
+    )
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 3
+    assert len(result.semantic_results) == 1
+    credibility = result.semantic_results[0].credibility
+    assert credibility.coverage.index_scope.value == "indexed_project"
+    assert credibility.coverage.is_exhaustive_within_scope is False
+    assert credibility.coverage.negative_scope.value == "none"
+    assert result.status_credibility.coverage.is_exhaustive_within_scope is False
+    assert result.semantic_results[0].data.file == str(main)
+    assert engine.warmed_file == str(lib)
+
+
+def test_find_references_empty_background_index_result_is_unresolved(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyReferencesEngine(loc("sentinel", lib), ())
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references("missing", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.total_hits == 0
+    assert result.semantic_results == []
+
+
+def test_find_references_not_ready_does_not_return_partial_references(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyReferencesEngine(loc("sentinel", lib), (ref(lib), ref(main)))
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.total_hits == 0
+    assert result.semantic_results == []
+    assert engine.find_references_calls == 0
+
+
+def test_find_references_background_index_off_is_unresolved_not_local_ok(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyReferencesEngine(loc("sentinel", lib), (ref(lib), ref(main)))
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.semantic_results == []
+    assert engine.find_references_calls == 0
 
 
 class SentinelEngine(NeverReadyEngine):
@@ -784,6 +983,12 @@ def test_module_level_registry_reports_unknown_config():
         ).status
         == QueryStatus.INVALID_REQUEST
     )
+    assert (
+        api_find_references(
+            "add", "/tmp/missing.c", Pos(0, 0), build_config_id="missing"
+        ).status
+        == QueryStatus.INVALID_REQUEST
+    )
 
 
 def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Path):
@@ -792,6 +997,7 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
     register_build_config(BuildConfig("test", str(tmp_path)))
     search_marker = object()
     definition_marker = object()
+    references_marker = object()
     calls: list[tuple[str, object]] = []
 
     class DummyCodeGraph:
@@ -820,6 +1026,24 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
             calls.append(("definition", (symbol, file, pos, allow_syntactic_fallback)))
             return definition_marker
 
+        def find_references(
+            self,
+            symbol: str,
+            file: str,
+            pos: Pos,
+            *,
+            limit: int = 100,
+            offset: int = 0,
+            allow_syntactic_fallback: bool = False,
+        ):
+            calls.append(
+                (
+                    "references",
+                    (symbol, file, pos, limit, offset, allow_syntactic_fallback),
+                )
+            )
+            return references_marker
+
     monkeypatch.setattr("codegraph.api.CodeGraph", DummyCodeGraph)
 
     assert api_search_symbol(
@@ -830,11 +1054,19 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
         api_get_definition("add", str(main), Pos(1, 0), build_config_id="test")
         is definition_marker
     )
+    assert (
+        api_find_references(
+            "add", str(main), Pos(1, 0), build_config_id="test", limit=7, offset=2
+        )
+        is references_marker
+    )
     assert calls == [
         ("init", "test"),
         ("search", ("add", None, 3, 0)),
         ("init", "test"),
         ("definition", ("add", str(main), Pos(1, 0), False)),
+        ("init", "test"),
+        ("references", ("add", str(main), Pos(1, 0), 7, 2, False)),
     ]
 
 

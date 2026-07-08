@@ -29,6 +29,7 @@ class EngineObservationResult:
     call_edges: tuple[CallEdgeResult, ...] = ()
     symbol_ambiguous: bool = False
     index_scope_known: bool = True
+    total_results: int | None = None
 
 
 class EngineObservation(Protocol):
