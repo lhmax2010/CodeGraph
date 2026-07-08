@@ -312,17 +312,17 @@ class CodeGraph:
         ready = False
         try:
             with self._engine_factory(self._clangd_config()) as engine:
-                ready = _warm_background_index(
-                    engine, self.config, self.config.warmup_file or real_file
+                warmup_file = _reference_warmup_file(self.config, real_file)
+                _warm_references_file(engine, self.config, warmup_file)
+                observation, ready = _find_references_with_stable_cross_tu(
+                    engine,
+                    self.config,
+                    symbol,
+                    real_file,
+                    pos,
+                    limit,
+                    offset,
                 )
-                if ready:
-                    observation = engine.find_references(
-                        symbol,
-                        real_file,
-                        pos,
-                        limit=limit,
-                        offset=offset,
-                    )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
             return _engine_failure(query, exc)
         health = _health_after_warm(health, self.config, ready)
@@ -331,7 +331,9 @@ class CodeGraph:
             if observation.total_results is not None
             else len(observation.references)
         )
-        ready_for_references = ready
+        ready_for_references = ready and _references_have_cross_tu_evidence(
+            observation, real_file
+        )
         if self.config.background_index and total_hits == 0:
             ready_for_references = False
         result = route_observation(
@@ -398,6 +400,62 @@ def _warm_background_index(
             time.sleep(sleep_for)
 
 
+def _warm_references_file(
+    engine: EngineObservation,
+    config: BuildConfig,
+    warmup_file: str | None,
+) -> None:
+    if not config.background_index:
+        return
+    if warmup_file is not None and hasattr(engine, "warm_file"):
+        getattr(engine, "warm_file")(warmup_file)
+
+
+def _find_references_with_stable_cross_tu(
+    engine: EngineObservation,
+    config: BuildConfig,
+    symbol: str,
+    file: str,
+    pos: Pos,
+    limit: int,
+    offset: int,
+) -> tuple[EngineObservationResult, bool]:
+    deadline = time.monotonic() + config.index_ready_timeout
+    observation = engine.find_references(
+        symbol,
+        file,
+        pos,
+        limit=limit,
+        offset=offset,
+    )
+    if not config.background_index:
+        return observation, False
+
+    signature = _references_stability_signature(observation)
+    cross_tu = _references_have_cross_tu_evidence(observation, file)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return observation, False
+        sleep_for = min(config.index_ready_poll_interval, remaining)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        next_observation = engine.find_references(
+            symbol,
+            file,
+            pos,
+            limit=limit,
+            offset=offset,
+        )
+        next_signature = _references_stability_signature(next_observation)
+        next_cross_tu = _references_have_cross_tu_evidence(next_observation, file)
+        if cross_tu and next_cross_tu and signature == next_signature:
+            return next_observation, True
+        observation = next_observation
+        signature = next_signature
+        cross_tu = next_cross_tu
+
+
 def _prewarm_index_ready_timeout(config: BuildConfig) -> float:
     if config.prewarm_index_ready_timeout is not None:
         return config.prewarm_index_ready_timeout
@@ -458,6 +516,48 @@ def _index_ready_probe_matches(
     return False
 
 
+def _reference_warmup_file(config: BuildConfig, query_file: str) -> str | None:
+    if config.warmup_file is not None:
+        return config.warmup_file
+    query_real = str(Path(query_file).resolve())
+    suffix = config.index_ready_probe_path_suffix
+    for file in _compile_command_files(config.compile_commands_dir):
+        file_real = str(Path(file).resolve())
+        if file_real == query_real:
+            continue
+        if suffix is not None and file_real.endswith(suffix):
+            continue
+        return file_real
+    return None
+
+
+def _references_have_cross_tu_evidence(
+    observation: EngineObservationResult, query_file: str
+) -> bool:
+    query_real = str(Path(query_file).resolve())
+    return any(
+        str(Path(reference.file).resolve()) != query_real
+        for reference in observation.references
+    )
+
+
+def _references_stability_signature(
+    observation: EngineObservationResult,
+) -> tuple[int | None, tuple[tuple[str, int, int, str], ...]]:
+    return (
+        observation.total_results,
+        tuple(
+            (
+                str(Path(reference.file).resolve()),
+                reference.range.start.line,
+                reference.range.start.character,
+                reference.kind,
+            )
+            for reference in observation.references
+        ),
+    )
+
+
 def _semantic_search_limit(limit: int, offset: int) -> int:
     return max(100, limit + offset)
 
@@ -475,8 +575,12 @@ def _search_window_may_be_truncated(
 def _ensure_background_index_references_are_non_exhaustive(
     result: QueryResult,
 ) -> QueryResult:
-    for item in result.semantic_results:
-        credibility = item.credibility
+    credibilities = (
+        [result.status_credibility]
+        + [item.credibility for item in result.semantic_results]
+        + [candidate.credibility for candidate in result.syntactic_candidates]
+    )
+    for credibility in credibilities:
         if (
             credibility.index_backend == IndexBackend.BACKGROUND_INDEX
             and credibility.coverage.is_exhaustive_within_scope

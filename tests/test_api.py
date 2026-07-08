@@ -10,8 +10,10 @@ import pytest
 from codegraph.api import (
     BuildConfig,
     CodeGraph,
+    _ensure_background_index_references_are_non_exhaustive,
     _index_ready_probe_matches,
     _prewarm_index_ready_timeout,
+    _reference_warmup_file,
     _warm_background_index,
     clear_build_configs,
     find_references as api_find_references,
@@ -20,10 +22,25 @@ from codegraph.api import (
     register_build_config,
     search_symbol as api_search_symbol,
 )
+from codegraph.credibility import (
+    Certainty,
+    Coverage,
+    Credibility,
+    DependencyScope,
+    IndexBackend,
+    IndexScope,
+    QueryKind,
+    Relation,
+    Resolved,
+    Source,
+)
 from codegraph.engines.protocol import EngineObservationResult
 from codegraph.types import (
+    Candidate,
     LocationResult,
     Pos,
+    QueryMeta,
+    QueryResult,
     QueryStatus,
     Range,
     ReferenceResult,
@@ -83,6 +100,23 @@ def loc(name: str, file: Path, line: int = 1) -> LocationResult:
 def ref(file: Path, line: int = 1) -> ReferenceResult:
     pos = Pos(line, 9)
     return ReferenceResult(Range(pos, Pos(line, 12)), str(file), "reference")
+
+
+def exhaustive_background_index_credibility() -> Credibility:
+    return Credibility(
+        source=Source.CLANGD,
+        certainty=Certainty.SEMANTIC,
+        relation=Relation.NA,
+        resolved=Resolved.RESOLVED,
+        query_kind=QueryKind.ENTITY,
+        dependency=DependencyScope.complete(),
+        coverage=Coverage(
+            index_scope=IndexScope.INDEXED_PROJECT,
+            is_exhaustive_within_scope=True,
+        ),
+        index_backend=IndexBackend.BACKGROUND_INDEX,
+        build_config_id="test",
+    )
 
 
 @pytest.mark.skipif(shutil.which("clangd") is None, reason="clangd unavailable")
@@ -284,6 +318,29 @@ class ReadyReferencesEngine(NeverReadyEngine):
         return EngineObservationResult(
             references=self.references[offset : offset + limit],
             total_results=len(self.references),
+        )
+
+
+class ProgressiveReferencesEngine(NeverReadyEngine):
+    def __init__(self, observations: tuple[tuple[ReferenceResult, ...], ...]):
+        self.observations = observations
+        self.find_references_calls = 0
+
+    def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        index = min(self.find_references_calls, len(self.observations) - 1)
+        self.find_references_calls += 1
+        references = self.observations[index]
+        return EngineObservationResult(
+            references=references[offset : offset + limit],
+            total_results=len(references),
         )
 
 
@@ -506,26 +563,112 @@ def test_find_references_returns_positive_non_exhaustive_background_index_result
             background_index=True,
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
-            warmup_file=str(lib),
+            index_ready_poll_interval=0,
+            warmup_file=str(main),
         ),
         engine_factory=lambda _cfg: engine,
     )
 
     result = client.find_references(
-        "add", str(main), Pos(1, line.index("add")), limit=1, offset=1
+        "add", str(main), Pos(1, line.index("add")), limit=3
     )
 
     assert result.status == QueryStatus.OK
     assert result.index_health == "complete"
     assert result.total_hits == 3
-    assert len(result.semantic_results) == 1
+    assert len(result.semantic_results) == 2
+    assert len(result.syntactic_candidates) == 1
     credibility = result.semantic_results[0].credibility
     assert credibility.coverage.index_scope.value == "indexed_project"
     assert credibility.coverage.is_exhaustive_within_scope is False
     assert credibility.coverage.negative_scope.value == "none"
     assert result.status_credibility.coverage.is_exhaustive_within_scope is False
-    assert result.semantic_results[0].data.file == str(main)
-    assert engine.warmed_file == str(lib)
+    assert all(
+        candidate.credibility.coverage.index_scope is IndexScope.INDEXED_PROJECT
+        for candidate in result.syntactic_candidates
+    )
+    assert all(
+        not candidate.credibility.coverage.is_exhaustive_within_scope
+        for candidate in result.syntactic_candidates
+    )
+    assert {item.data.file for item in result.semantic_results} == {str(lib), str(main)}
+    assert engine.warmed_file == str(main)
+
+
+def test_find_references_default_warmup_avoids_query_and_probe_target(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    references = (ref(lib), ref(main))
+    engine = ReadyReferencesEngine(loc("sentinel", lib), references)
+    line = lib.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+            index_ready_poll_interval=0,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references("add", str(lib), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 2
+    assert result.status_credibility.coverage.index_scope is IndexScope.INDEXED_PROJECT
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.INDEXED_PROJECT
+        for item in result.semantic_results
+    )
+    assert engine.warmed_file == str(main)
+
+
+def test_find_references_waits_for_query_references_to_stabilize(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    project_references = (ref(main), ref(lib), ref(lib, line=0))
+    engine = ProgressiveReferencesEngine(
+        (
+            (ref(main),),
+            project_references,
+            project_references,
+        )
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references(
+        "add", str(main), Pos(1, line.index("add")), limit=3
+    )
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 3
+    assert {
+        item.credibility.coverage.index_scope for item in result.semantic_results
+    } == {IndexScope.INDEXED_PROJECT}
+    assert engine.find_references_calls == 3
 
 
 def test_find_references_empty_background_index_result_is_unresolved(
@@ -540,6 +683,7 @@ def test_find_references_empty_background_index_result_is_unresolved(
             "test",
             str(tmp_path),
             background_index=True,
+            index_ready_timeout=0,
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
@@ -554,12 +698,14 @@ def test_find_references_empty_background_index_result_is_unresolved(
     assert result.semantic_results == []
 
 
-def test_find_references_not_ready_does_not_return_partial_references(
+def test_find_references_not_ready_marks_partial_references_current_tu(
     tmp_path: Path,
 ):
-    lib, main = write_project(tmp_path)
+    _lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
-    engine = ReadyReferencesEngine(loc("sentinel", lib), (ref(lib), ref(main)))
+    engine = ReadyReferencesEngine(
+        loc("sentinel", main), (ref(main), ref(main, line=0))
+    )
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig(
@@ -567,6 +713,7 @@ def test_find_references_not_ready_does_not_return_partial_references(
             str(tmp_path),
             background_index=True,
             index_ready_timeout=0,
+            index_ready_poll_interval=0,
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
@@ -575,19 +722,25 @@ def test_find_references_not_ready_does_not_return_partial_references(
 
     result = client.find_references("add", str(main), Pos(1, line.index("add")))
 
-    assert result.status == QueryStatus.UNRESOLVED
+    assert result.status == QueryStatus.OK
     assert result.index_health == "unknown"
-    assert result.total_hits == 0
-    assert result.semantic_results == []
-    assert engine.find_references_calls == 0
+    assert result.total_hits == 2
+    assert result.semantic_results
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
+        for item in result.semantic_results
+    )
+    assert engine.find_references_calls == 1
 
 
-def test_find_references_background_index_off_is_unresolved_not_local_ok(
+def test_find_references_background_index_off_marks_local_references_current_tu(
     tmp_path: Path,
 ):
-    lib, main = write_project(tmp_path)
+    _lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
-    engine = ReadyReferencesEngine(loc("sentinel", lib), (ref(lib), ref(main)))
+    engine = ReadyReferencesEngine(
+        loc("sentinel", main), (ref(main), ref(main, line=0))
+    )
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
@@ -596,10 +749,14 @@ def test_find_references_background_index_off_is_unresolved_not_local_ok(
 
     result = client.find_references("add", str(main), Pos(1, line.index("add")))
 
-    assert result.status == QueryStatus.UNRESOLVED
+    assert result.status == QueryStatus.OK
     assert result.index_health == "unknown"
-    assert result.semantic_results == []
-    assert engine.find_references_calls == 0
+    assert result.total_hits == 2
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
+        for item in result.semantic_results
+    )
+    assert engine.find_references_calls == 1
 
 
 class SentinelEngine(NeverReadyEngine):
@@ -732,6 +889,71 @@ def test_index_ready_probe_match_requires_path_suffix(tmp_path: Path):
     )
 
     assert _index_ready_probe_matches(observation, "sentinel", config) is False
+
+
+def test_reference_warmup_file_avoids_query_and_probe_suffix(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    config = BuildConfig(
+        "test",
+        str(tmp_path),
+        background_index=True,
+        index_ready_probe_symbol="sentinel",
+        index_ready_probe_path_suffix="lib.c",
+    )
+    explicit = BuildConfig(
+        "test",
+        str(tmp_path),
+        background_index=True,
+        warmup_file=str(lib),
+    )
+
+    assert _reference_warmup_file(config, str(lib)) == str(main)
+    assert _reference_warmup_file(config, str(main)) is None
+    assert _reference_warmup_file(explicit, str(main)) == str(lib)
+
+
+def test_background_index_reference_guard_rejects_exhaustive_status_and_candidates(
+    tmp_path: Path,
+):
+    lib, _main = write_project(tmp_path)
+    exhaustive = exhaustive_background_index_credibility()
+    non_exhaustive = Credibility(
+        source=Source.CLANGD,
+        certainty=Certainty.SEMANTIC,
+        relation=Relation.NA,
+        resolved=Resolved.RESOLVED,
+        query_kind=QueryKind.ENTITY,
+        dependency=DependencyScope.complete(),
+        coverage=Coverage(index_scope=IndexScope.INDEXED_PROJECT),
+        index_backend=IndexBackend.BACKGROUND_INDEX,
+        build_config_id="test",
+    )
+    query = QueryMeta("entity", "add", "test", str(lib), Pos(1, 4))
+
+    with pytest.raises(RuntimeError, match="must not assert exhaustive"):
+        _ensure_background_index_references_are_non_exhaustive(
+            QueryResult(
+                query=query,
+                status=QueryStatus.OK,
+                status_credibility=exhaustive,
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="must not assert exhaustive"):
+        _ensure_background_index_references_are_non_exhaustive(
+            QueryResult(
+                query=query,
+                status=QueryStatus.OK,
+                status_credibility=non_exhaustive,
+                syntactic_candidates=[
+                    Candidate(
+                        data=loc("add", lib),
+                        credibility=exhaustive,
+                        relevance_score=20,
+                    )
+                ],
+            )
+        )
 
 
 def test_prewarm_warms_cache_but_query_still_proves_readiness(tmp_path: Path):
