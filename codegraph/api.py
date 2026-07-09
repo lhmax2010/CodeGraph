@@ -45,7 +45,7 @@ _KIND_FILTERS = {
     "macro": SymbolKind.MACRO,
 }
 _DEFAULT_PREWARM_INDEX_READY_TIMEOUT = 30.0
-_CALL_EDGE_STABLE_MATCHES = 3
+_STABLE_MATCHES = 3
 
 
 @dataclass(frozen=True)
@@ -588,40 +588,21 @@ def _find_references_with_stable_cross_tu(
     limit: int,
     offset: int,
 ) -> tuple[EngineObservationResult, bool]:
-    deadline = time.monotonic() + config.index_ready_timeout
-    observation = engine.find_references(
-        symbol,
-        file,
-        pos,
-        limit=limit,
-        offset=offset,
-    )
-    if not config.background_index:
-        return observation, False
-
-    signature = _references_stability_signature(observation)
-    cross_tu = _references_have_cross_tu_evidence(observation, file)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return observation, False
-        sleep_for = min(config.index_ready_poll_interval, remaining)
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-        next_observation = engine.find_references(
+    def observe() -> EngineObservationResult:
+        return engine.find_references(
             symbol,
             file,
             pos,
             limit=limit,
             offset=offset,
         )
-        next_signature = _references_stability_signature(next_observation)
-        next_cross_tu = _references_have_cross_tu_evidence(next_observation, file)
-        if cross_tu and next_cross_tu and signature == next_signature:
-            return next_observation, True
-        observation = next_observation
-        signature = next_signature
-        cross_tu = next_cross_tu
+
+    return _wait_for_stable_cross_tu_observation(
+        config,
+        observe,
+        _references_stability_signature,
+        lambda observation: _references_have_cross_tu_evidence(observation, file),
+    )
 
 
 def _find_call_edges_with_stable_cross_tu(
@@ -635,42 +616,56 @@ def _find_call_edges_with_stable_cross_tu(
     offset: int,
 ) -> tuple[EngineObservationResult, bool]:
     engine_limit = _semantic_search_limit(limit, offset)
-    observation = _call_edges_observation(
-        engine, direction, symbol, file, pos, limit=engine_limit, offset=0
-    )
-    if not config.background_index:
-        return _slice_call_edges_observation(observation, limit, offset), False
 
-    signature = _call_edges_stability_signature(observation)
-    cross_tu = _call_edges_have_cross_tu_evidence(observation, file, direction)
+    def observe() -> EngineObservationResult:
+        return _call_edges_observation(
+            engine, direction, symbol, file, pos, limit=engine_limit, offset=0
+        )
+
+    observation, ready = _wait_for_stable_cross_tu_observation(
+        config,
+        observe,
+        _call_edges_stability_signature,
+        lambda observation: _call_edges_have_cross_tu_evidence(
+            observation, file, direction
+        ),
+    )
+    return _slice_call_edges_observation(observation, limit, offset), ready
+
+
+def _wait_for_stable_cross_tu_observation(
+    config: BuildConfig,
+    observe: Callable[[], EngineObservationResult],
+    signature: Callable[[EngineObservationResult], object],
+    has_cross_tu: Callable[[EngineObservationResult], bool],
+) -> tuple[EngineObservationResult, bool]:
+    observation = observe()
+    if not config.background_index:
+        return observation, False
+
+    current_signature = signature(observation)
+    current_cross_tu = has_cross_tu(observation)
     stable_matches = 0
     deadline = time.monotonic() + config.index_ready_timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return _slice_call_edges_observation(observation, limit, offset), False
+            return observation, False
         sleep_for = min(config.index_ready_poll_interval, remaining)
         if sleep_for > 0:
             time.sleep(sleep_for)
-        next_observation = _call_edges_observation(
-            engine, direction, symbol, file, pos, limit=engine_limit, offset=0
-        )
-        next_signature = _call_edges_stability_signature(next_observation)
-        next_cross_tu = _call_edges_have_cross_tu_evidence(
-            next_observation, file, direction
-        )
-        if cross_tu and next_cross_tu and signature == next_signature:
+        next_observation = observe()
+        next_signature = signature(next_observation)
+        next_cross_tu = has_cross_tu(next_observation)
+        if current_cross_tu and next_cross_tu and current_signature == next_signature:
             stable_matches += 1
-            if stable_matches >= _CALL_EDGE_STABLE_MATCHES:
-                return (
-                    _slice_call_edges_observation(next_observation, limit, offset),
-                    True,
-                )
+            if stable_matches >= _STABLE_MATCHES:
+                return next_observation, True
         else:
             stable_matches = 0
         observation = next_observation
-        signature = next_signature
-        cross_tu = next_cross_tu
+        current_signature = next_signature
+        current_cross_tu = next_cross_tu
 
 
 def _call_edges_observation(

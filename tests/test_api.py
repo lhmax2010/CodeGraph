@@ -790,7 +790,56 @@ def test_find_references_waits_for_query_references_to_stabilize(
     assert {
         item.credibility.coverage.index_scope for item in result.semantic_results
     } == {IndexScope.INDEXED_PROJECT}
-    assert engine.find_references_calls == 3
+    assert engine.find_references_calls == 5
+
+
+def test_find_references_does_not_treat_short_reference_plateau_as_ready(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    local = (ref(main),)
+    partial = (ref(main), ref(lib))
+    project_references = (ref(main), ref(lib), ref(lib, line=0))
+    engine = ProgressiveReferencesEngine(
+        (
+            local,
+            partial,
+            partial,
+            partial,
+            project_references,
+            project_references,
+            project_references,
+            project_references,
+        )
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            index_ready_probe_symbol="sentinel",
+            index_ready_probe_path_suffix="lib.c",
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_references(
+        "add", str(main), Pos(1, line.index("add")), limit=3
+    )
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 3
+    assert {
+        item.credibility.coverage.index_scope for item in result.semantic_results
+    } == {IndexScope.INDEXED_PROJECT}
+    assert engine.find_references_calls == 8
 
 
 def test_find_references_empty_background_index_result_is_unresolved(
