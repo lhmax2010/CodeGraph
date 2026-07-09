@@ -58,7 +58,7 @@ P7/P8 stability backport 复核（2026-07-09，P8 review 后追加）：
 
 ## PR 与代码
 - PR 链接：N/A（按用户要求只 push，不创建 PR）。
-- 对应 Git Commit：当前 WIP 待用户核对后提交。
+- 对应 Git Commit：`943f4fa`（stability backport）+ stage08 收口提交；最终收口点见 `checkpoint/phase_8_call_hierarchy`。
 
 ## 遗留问题 / 风险
 - P8 需异构多路 review，重点看 P7/P8 共用 `_STABLE_MATCHES=3` 是否保持 P7 389/62 与 P8 387/2951 的价值兑现。
@@ -68,4 +68,16 @@ P7/P8 stability backport 复核（2026-07-09，P8 review 后追加）：
 - 结转不改：空结果会 poll 满 timeout 才返回 unresolved；更长 plateau 仍有理论残差（但 `is_exhaustive=False` + scope 兜底保证不作完整性声明）；stability 可配置化留后；P6/P7 结转的 sentinel warning、diagnostics_wait broken TU、api.py 异常分支覆盖仍留后续 harden。
 
 ## 下一阶段计划
-- 通过 P8 review 后，按 review 修复问题并做最终真机验收。
+- P8 review 与最终真机验收已通过，按收尾流程 merge / checkpoint。
+
+## Final Gate 复核（2026-07-09，针对 `943f4fa`）
+- 执行者：Kimi Code CLI
+- UT：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q` -> `159 passed in 2.48s`
+- 静态 gate：ruff / black --check / mypy codegraph / compileall / git diff --check 全绿
+- 复跑真机：
+  - P7 `find_references(gst_element_set_state)` 连续 3 次稳定 `389 refs / 62 files`，耗时 `2.871s / 2.898s / 2.906s`。
+  - P8 `find_callers(gst_element_set_state)` 仍 `387 / 379 + 8 / 62 files`。
+  - P8 `find_callers(gst_object_unref)` 仍 `2951 / 900 + 100`（limit=1000）。
+  - P8 `find_callees(gst_element_set_state)` 仍 `FAILED + CALLHIERARCHY_UNSUPPORTED`。
+  - P7 `bg=False` 退化仍 `2 refs / current_tu / unknown`。
+- 结论：stability backport 正确，P7 没改坏，共用 helper 抽象对，P8 可 merge。
