@@ -201,6 +201,7 @@ class ClangdAdapter:
             diagnostics=self._diagnostics(uri),
             call_edges=tuple(edges[offset : offset + limit]),
             symbol_ambiguous=len(roots) > 1,
+            total_results=len(edges),
         )
 
     def find_callees(
@@ -228,6 +229,7 @@ class ClangdAdapter:
             diagnostics=self._diagnostics(uri),
             call_edges=tuple(edges[offset : offset + limit]),
             symbol_ambiguous=len(roots) > 1,
+            total_results=len(edges),
         )
 
     def _initialize(self) -> None:

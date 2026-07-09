@@ -320,10 +320,12 @@ def test_call_hierarchy_uses_lsp_and_preserves_direction(tmp_path: Path):
     assert caller_edge.from_symbol.name == "caller"
     assert caller_edge.to_symbol.name == "add"
     assert caller_edge.call_site.start == Pos(5, 9)
+    assert callers.total_results == 1
     callee_edge = callees.call_edges[0]
     assert callee_edge.from_symbol.name == "caller"
     assert callee_edge.to_symbol.name == "add"
     assert callee_edge.call_site.start == Pos(5, 9)
+    assert callees.total_results == 1
     assert "callHierarchy/incomingCalls" in request_methods(fake)
     assert "callHierarchy/outgoingCalls" in request_methods(fake)
 

@@ -10,12 +10,15 @@ import pytest
 from codegraph.api import (
     BuildConfig,
     CodeGraph,
+    _ensure_background_index_call_hierarchy_is_non_exhaustive,
     _ensure_background_index_references_are_non_exhaustive,
     _index_ready_probe_matches,
     _prewarm_index_ready_timeout,
     _reference_warmup_file,
     _warm_background_index,
     clear_build_configs,
+    find_callees as api_find_callees,
+    find_callers as api_find_callers,
     find_references as api_find_references,
     get_definition as api_get_definition,
     prewarm_build_config,
@@ -37,6 +40,8 @@ from codegraph.credibility import (
 from codegraph.engines.protocol import EngineObservationResult
 from codegraph.types import (
     Candidate,
+    CallEdgeResult,
+    IssueCode,
     LocationResult,
     Pos,
     QueryMeta,
@@ -100,6 +105,22 @@ def loc(name: str, file: Path, line: int = 1) -> LocationResult:
 def ref(file: Path, line: int = 1) -> ReferenceResult:
     pos = Pos(line, 9)
     return ReferenceResult(Range(pos, Pos(line, 12)), str(file), "reference")
+
+
+def call_edge(
+    caller_file: Path,
+    callee_file: Path,
+    *,
+    caller_name: str = "caller",
+    callee_name: str = "add",
+    line: int = 1,
+) -> CallEdgeResult:
+    call_pos = Pos(line, 9)
+    return CallEdgeResult(
+        SymbolId(None, caller_name, str(caller_file), Pos(line, 4)),
+        SymbolId(None, callee_name, str(callee_file), Pos(line, 0)),
+        Range(call_pos, Pos(line, 12)),
+    )
 
 
 def exhaustive_background_index_credibility() -> Credibility:
@@ -191,6 +212,28 @@ class NeverReadyEngine:
         return EngineObservationResult()
 
     def find_references(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        return EngineObservationResult()
+
+    def find_callers(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        return EngineObservationResult()
+
+    def find_callees(
         self,
         symbol: str,
         file: str,
@@ -342,6 +385,85 @@ class ProgressiveReferencesEngine(NeverReadyEngine):
             references=references[offset : offset + limit],
             total_results=len(references),
         )
+
+
+class ReadyCallEdgesEngine(NeverReadyEngine):
+    def __init__(
+        self,
+        *,
+        callers: tuple[CallEdgeResult, ...] = (),
+        callees: tuple[CallEdgeResult, ...] = (),
+    ):
+        self.callers = callers
+        self.callees = callees
+        self.find_callers_calls = 0
+        self.find_callees_calls = 0
+
+    def find_callers(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        self.find_callers_calls += 1
+        return EngineObservationResult(
+            call_edges=self.callers[offset : offset + limit],
+            total_results=len(self.callers),
+        )
+
+    def find_callees(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        self.find_callees_calls += 1
+        return EngineObservationResult(
+            call_edges=self.callees[offset : offset + limit],
+            total_results=len(self.callees),
+        )
+
+
+class ProgressiveCallEdgesEngine(NeverReadyEngine):
+    def __init__(self, observations: tuple[tuple[CallEdgeResult, ...], ...]):
+        self.observations = observations
+        self.find_callers_calls = 0
+
+    def find_callers(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        index = min(self.find_callers_calls, len(self.observations) - 1)
+        self.find_callers_calls += 1
+        call_edges = self.observations[index]
+        return EngineObservationResult(
+            call_edges=call_edges[offset : offset + limit],
+            total_results=len(call_edges),
+        )
+
+
+class UnsupportedCalleesEngine(NeverReadyEngine):
+    def find_callees(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> EngineObservationResult:
+        raise NotImplementedError("clangd callHierarchy outgoingCalls unsupported")
 
 
 class TruncatedSearchEngine(NeverReadyEngine):
@@ -757,6 +879,273 @@ def test_find_references_background_index_off_marks_local_references_current_tu(
         for item in result.semantic_results
     )
     assert engine.find_references_calls == 1
+
+
+def test_find_callers_returns_positive_non_exhaustive_background_index_edges(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    edges = (
+        call_edge(lib, main, caller_name="helper", callee_name="add"),
+        call_edge(main, main, caller_name="main", callee_name="add"),
+    )
+    engine = ReadyCallEdgesEngine(callers=edges)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_poll_interval=0,
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.query.kind == "relation"
+    assert result.index_health == "complete"
+    assert result.total_hits == 2
+    assert len(result.semantic_results) == 2
+    first = result.semantic_results[0]
+    assert isinstance(first.data, CallEdgeResult)
+    assert first.data.from_symbol.name == "helper"
+    assert first.data.to_symbol.name == "add"
+    assert first.credibility.relation is Relation.MUST
+    assert first.credibility.coverage.index_scope is IndexScope.INDEXED_PROJECT
+    assert first.credibility.coverage.is_exhaustive_within_scope is False
+    assert result.status_credibility.coverage.is_exhaustive_within_scope is False
+    assert engine.find_callers_calls == 4
+
+
+def test_find_callers_waits_for_call_edges_to_stabilize(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    local = (call_edge(main, main, caller_name="main", callee_name="add"),)
+    project = (
+        call_edge(lib, main, caller_name="helper", callee_name="add"),
+        call_edge(main, main, caller_name="main", callee_name="add"),
+    )
+    engine = ProgressiveCallEdgesEngine((local, project, project))
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 2
+    assert {
+        item.credibility.coverage.index_scope for item in result.semantic_results
+    } == {IndexScope.INDEXED_PROJECT}
+    assert engine.find_callers_calls == 5
+
+
+def test_find_callers_does_not_treat_short_call_edge_plateau_as_ready(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    local = (call_edge(main, main, caller_name="main", callee_name="add"),)
+    partial = (
+        call_edge(lib, main, caller_name="helper", callee_name="add"),
+        call_edge(main, main, caller_name="main", callee_name="add"),
+    )
+    project = (
+        call_edge(lib, main, caller_name="helper", callee_name="add"),
+        call_edge(lib, main, caller_name="other_helper", callee_name="add", line=0),
+        call_edge(main, main, caller_name="main", callee_name="add"),
+    )
+    engine = ProgressiveCallEdgesEngine(
+        (local, partial, partial, partial, project, project, project, project)
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_timeout=1,
+            index_ready_poll_interval=0,
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 3
+    assert len(result.semantic_results) == 2
+    assert len(result.syntactic_candidates) == 1
+    assert engine.find_callers_calls == 8
+
+
+def test_find_callers_not_ready_marks_local_edges_current_tu(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyCallEdgesEngine(
+        callers=(
+            call_edge(main, main, caller_name="main", callee_name="add"),
+            call_edge(main, main, caller_name="other", callee_name="add", line=0),
+        )
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "unknown"
+    assert result.total_hits == 2
+    assert result.semantic_results
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
+        for item in result.semantic_results
+    )
+    assert engine.find_callers_calls == 1
+
+
+def test_find_callers_empty_background_index_result_is_unresolved(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyCallEdgesEngine(callers=())
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_timeout=0,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.total_hits == 0
+    assert result.semantic_results == []
+    assert result.status_credibility.coverage.negative_scope.value == "none"
+
+
+def test_find_callees_unsupported_returns_failed_without_fallback(tmp_path: Path):
+    _lib, main = write_project(tmp_path)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_factory=lambda _cfg: UnsupportedCalleesEngine(),
+    )
+
+    result = client.find_callees("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.FAILED
+    assert result.semantic_results == []
+    assert result.syntactic_candidates == []
+    assert IssueCode.CALLHIERARCHY_UNSUPPORTED in [note.code for note in result.notes]
+
+
+def test_find_callees_routes_outgoing_edges_when_engine_supports_them(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    edges = (call_edge(main, lib, caller_name="main", callee_name="add"),)
+    engine = ReadyCallEdgesEngine(callees=edges)
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            source_roots=(str(tmp_path),),
+            background_index=True,
+            index_ready_poll_interval=0,
+            warmup_file=str(main),
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callees("main", str(main), Pos(1, line.index("main")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "complete"
+    assert result.total_hits == 1
+    edge = result.semantic_results[0].data
+    assert isinstance(edge, CallEdgeResult)
+    assert edge.from_symbol.name == "main"
+    assert edge.to_symbol.name == "add"
+    assert result.semantic_results[0].credibility.relation is Relation.MUST
+    assert (
+        result.semantic_results[0].credibility.coverage.is_exhaustive_within_scope
+        is False
+    )
+
+
+def test_background_index_call_hierarchy_guard_rejects_exhaustive_results(
+    tmp_path: Path,
+):
+    lib, main = write_project(tmp_path)
+    exhaustive = exhaustive_background_index_credibility()
+    query = QueryMeta("relation", "add", "test", str(main), Pos(1, 4))
+    data = call_edge(lib, main)
+
+    with pytest.raises(RuntimeError, match="call hierarchy must not assert exhaustive"):
+        _ensure_background_index_call_hierarchy_is_non_exhaustive(
+            QueryResult(
+                query=query,
+                status=QueryStatus.OK,
+                status_credibility=exhaustive,
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="call hierarchy must not assert exhaustive"):
+        _ensure_background_index_call_hierarchy_is_non_exhaustive(
+            QueryResult(
+                query=query,
+                status=QueryStatus.OK,
+                status_credibility=Credibility(
+                    source=Source.CLANGD,
+                    certainty=Certainty.SEMANTIC,
+                    relation=Relation.NA,
+                    resolved=Resolved.RESOLVED,
+                    query_kind=QueryKind.RELATION,
+                    dependency=DependencyScope.complete(),
+                    coverage=Coverage(index_scope=IndexScope.INDEXED_PROJECT),
+                    index_backend=IndexBackend.BACKGROUND_INDEX,
+                    build_config_id="test",
+                ),
+                semantic_results=[],
+                syntactic_candidates=[
+                    Candidate(data=data, credibility=exhaustive, relevance_score=None)
+                ],
+            )
+        )
 
 
 class SentinelEngine(NeverReadyEngine):
@@ -1211,6 +1600,18 @@ def test_module_level_registry_reports_unknown_config():
         ).status
         == QueryStatus.INVALID_REQUEST
     )
+    assert (
+        api_find_callers(
+            "add", "/tmp/missing.c", Pos(0, 0), build_config_id="missing"
+        ).status
+        == QueryStatus.INVALID_REQUEST
+    )
+    assert (
+        api_find_callees(
+            "add", "/tmp/missing.c", Pos(0, 0), build_config_id="missing"
+        ).status
+        == QueryStatus.INVALID_REQUEST
+    )
 
 
 def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Path):
@@ -1220,6 +1621,8 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
     search_marker = object()
     definition_marker = object()
     references_marker = object()
+    callers_marker = object()
+    callees_marker = object()
     calls: list[tuple[str, object]] = []
 
     class DummyCodeGraph:
@@ -1266,6 +1669,42 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
             )
             return references_marker
 
+        def find_callers(
+            self,
+            symbol: str,
+            file: str,
+            pos: Pos,
+            *,
+            limit: int = 100,
+            offset: int = 0,
+            allow_syntactic_fallback: bool = False,
+        ):
+            calls.append(
+                (
+                    "callers",
+                    (symbol, file, pos, limit, offset, allow_syntactic_fallback),
+                )
+            )
+            return callers_marker
+
+        def find_callees(
+            self,
+            symbol: str,
+            file: str,
+            pos: Pos,
+            *,
+            limit: int = 100,
+            offset: int = 0,
+            allow_syntactic_fallback: bool = False,
+        ):
+            calls.append(
+                (
+                    "callees",
+                    (symbol, file, pos, limit, offset, allow_syntactic_fallback),
+                )
+            )
+            return callees_marker
+
     monkeypatch.setattr("codegraph.api.CodeGraph", DummyCodeGraph)
 
     assert api_search_symbol(
@@ -1282,6 +1721,18 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
         )
         is references_marker
     )
+    assert (
+        api_find_callers(
+            "add", str(main), Pos(1, 0), build_config_id="test", limit=5, offset=1
+        )
+        is callers_marker
+    )
+    assert (
+        api_find_callees(
+            "add", str(main), Pos(1, 0), build_config_id="test", limit=4, offset=3
+        )
+        is callees_marker
+    )
     assert calls == [
         ("init", "test"),
         ("search", ("add", None, 3, 0)),
@@ -1289,6 +1740,10 @@ def test_module_level_registry_validates_and_delegates(monkeypatch, tmp_path: Pa
         ("definition", ("add", str(main), Pos(1, 0), False)),
         ("init", "test"),
         ("references", ("add", str(main), Pos(1, 0), 7, 2, False)),
+        ("init", "test"),
+        ("callers", ("add", str(main), Pos(1, 0), 5, 1, False)),
+        ("init", "test"),
+        ("callees", ("add", str(main), Pos(1, 0), 4, 3, False)),
     ]
 
 

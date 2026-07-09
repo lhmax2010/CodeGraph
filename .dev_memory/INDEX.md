@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：无
+- 当前活跃 stage：stage08_call_hierarchy（待 Review）
 - 最后已确认 stage（已 Merge）：stage07_find_references
 - 设计基线：docs/design.md v1.4.5 Frozen（2026-07-07；R1 change_2/change_3/change_4/change_5 已应用；change_5 已冻结，MVP background-index 下 search_symbol/get_definition 不产 not_found）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -18,6 +18,7 @@
 | stage05 | index_build | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_5_index_build`（逻辑收口 `cea43d9`） |
 | stage06 | e2e | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_6_e2e` |
 | stage07 | find_references | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_7_find_references` |
+| stage08 | call_hierarchy | 待 Review | - | baseline `3bad237` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。

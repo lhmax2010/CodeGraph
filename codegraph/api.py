@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Literal, Protocol
 
 from .credibility import (
     ActiveConfig,
@@ -28,7 +28,15 @@ from .indexing import (
     summarize_compile_commands,
 )
 from .routing import route_engine_call, route_observation, validate_query_result
-from .types import IssueCode, Note, Pos, QueryMeta, QueryResult, QueryStatus
+from .types import (
+    CallEdgeResult,
+    IssueCode,
+    Note,
+    Pos,
+    QueryMeta,
+    QueryResult,
+    QueryStatus,
+)
 
 _KIND_FILTERS = {
     "function": SymbolKind.ORDINARY_FUNCTION,
@@ -37,6 +45,7 @@ _KIND_FILTERS = {
     "macro": SymbolKind.MACRO,
 }
 _DEFAULT_PREWARM_INDEX_READY_TIMEOUT = 30.0
+_CALL_EDGE_STABLE_MATCHES = 3
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,60 @@ def find_references(
         return _invalid_result(query, f"unknown build_config_id: {build_config_id}")
     client = CodeGraph(config)
     return client.find_references(
+        symbol,
+        file,
+        pos,
+        limit=limit,
+        offset=offset,
+        allow_syntactic_fallback=allow_syntactic_fallback,
+    )
+
+
+def find_callers(
+    symbol: str,
+    file: str,
+    pos: Pos,
+    *,
+    build_config_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    allow_syntactic_fallback: bool = False,
+) -> QueryResult:
+    """Return callers for a symbol in a registered build config."""
+
+    query = QueryMeta("relation", symbol, build_config_id, str(file), pos)
+    config = _BUILD_CONFIGS.get(build_config_id)
+    if config is None:
+        return _invalid_result(query, f"unknown build_config_id: {build_config_id}")
+    client = CodeGraph(config)
+    return client.find_callers(
+        symbol,
+        file,
+        pos,
+        limit=limit,
+        offset=offset,
+        allow_syntactic_fallback=allow_syntactic_fallback,
+    )
+
+
+def find_callees(
+    symbol: str,
+    file: str,
+    pos: Pos,
+    *,
+    build_config_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    allow_syntactic_fallback: bool = False,
+) -> QueryResult:
+    """Return callees for a symbol in a registered build config."""
+
+    query = QueryMeta("relation", symbol, build_config_id, str(file), pos)
+    config = _BUILD_CONFIGS.get(build_config_id)
+    if config is None:
+        return _invalid_result(query, f"unknown build_config_id: {build_config_id}")
+    client = CodeGraph(config)
+    return client.find_callees(
         symbol,
         file,
         pos,
@@ -352,6 +415,111 @@ class CodeGraph:
         )
         return _ensure_background_index_references_are_non_exhaustive(result)
 
+    def find_callers(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        allow_syntactic_fallback: bool = False,
+    ) -> QueryResult:
+        return self._find_call_edges(
+            "callers",
+            symbol,
+            file,
+            pos,
+            limit=limit,
+            offset=offset,
+            allow_syntactic_fallback=allow_syntactic_fallback,
+        )
+
+    def find_callees(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        allow_syntactic_fallback: bool = False,
+    ) -> QueryResult:
+        return self._find_call_edges(
+            "callees",
+            symbol,
+            file,
+            pos,
+            limit=limit,
+            offset=offset,
+            allow_syntactic_fallback=allow_syntactic_fallback,
+        )
+
+    def _find_call_edges(
+        self,
+        direction: Literal["callers", "callees"],
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int,
+        offset: int,
+        allow_syntactic_fallback: bool,
+    ) -> QueryResult:
+        real_file = str(Path(file).resolve())
+        query = QueryMeta(
+            "relation", symbol, self.config.build_config_id, real_file, pos
+        )
+        invalid = _validate_file_pos(real_file, pos)
+        if invalid is not None:
+            return _invalid_result(query, invalid)
+        provider = create_treesitter_provider(self.config.source_roots)
+        health = _index_health(self.config)
+        observation = EngineObservationResult()
+        ready = False
+        try:
+            with self._engine_factory(self._clangd_config()) as engine:
+                warmup_file = _reference_warmup_file(self.config, real_file)
+                _warm_references_file(engine, self.config, warmup_file)
+                observation, ready = _find_call_edges_with_stable_cross_tu(
+                    engine,
+                    self.config,
+                    direction,
+                    symbol,
+                    real_file,
+                    pos,
+                    limit,
+                    offset,
+                )
+        except Exception as exc:  # noqa: BLE001 - API reports engine failures.
+            return _engine_failure(query, exc)
+        health = _health_after_warm(health, self.config, ready)
+        total_hits = (
+            observation.total_results
+            if observation.total_results is not None
+            else len(observation.call_edges)
+        )
+        ready_for_call_edges = ready and _call_edges_have_cross_tu_evidence(
+            observation, real_file, direction
+        )
+        if self.config.background_index and total_hits == 0:
+            ready_for_call_edges = False
+        result = route_observation(
+            query,
+            observation,
+            syntactic_provider=provider,
+            allow_syntactic_fallback=allow_syntactic_fallback,
+            limit=limit,
+            offset=offset,
+            index_scope=_effective_index_scope(self.config, ready_for_call_edges),
+            index_health=_effective_health(health, self.config, ready_for_call_edges),
+            index_backend=IndexBackend.BACKGROUND_INDEX,
+            active_config=self.config.active_config,
+            symbol_kind=SymbolKind.ORDINARY_FUNCTION,
+            total_hits=total_hits,
+        )
+        return _ensure_background_index_call_hierarchy_is_non_exhaustive(result)
+
     def _clangd_config(self) -> ClangdAdapterConfig:
         return ClangdAdapterConfig(
             self.config.compile_commands_dir,
@@ -456,6 +624,70 @@ def _find_references_with_stable_cross_tu(
         cross_tu = next_cross_tu
 
 
+def _find_call_edges_with_stable_cross_tu(
+    engine: EngineObservation,
+    config: BuildConfig,
+    direction: Literal["callers", "callees"],
+    symbol: str,
+    file: str,
+    pos: Pos,
+    limit: int,
+    offset: int,
+) -> tuple[EngineObservationResult, bool]:
+    engine_limit = _semantic_search_limit(limit, offset)
+    observation = _call_edges_observation(
+        engine, direction, symbol, file, pos, limit=engine_limit, offset=0
+    )
+    if not config.background_index:
+        return _slice_call_edges_observation(observation, limit, offset), False
+
+    signature = _call_edges_stability_signature(observation)
+    cross_tu = _call_edges_have_cross_tu_evidence(observation, file, direction)
+    stable_matches = 0
+    deadline = time.monotonic() + config.index_ready_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _slice_call_edges_observation(observation, limit, offset), False
+        sleep_for = min(config.index_ready_poll_interval, remaining)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        next_observation = _call_edges_observation(
+            engine, direction, symbol, file, pos, limit=engine_limit, offset=0
+        )
+        next_signature = _call_edges_stability_signature(next_observation)
+        next_cross_tu = _call_edges_have_cross_tu_evidence(
+            next_observation, file, direction
+        )
+        if cross_tu and next_cross_tu and signature == next_signature:
+            stable_matches += 1
+            if stable_matches >= _CALL_EDGE_STABLE_MATCHES:
+                return (
+                    _slice_call_edges_observation(next_observation, limit, offset),
+                    True,
+                )
+        else:
+            stable_matches = 0
+        observation = next_observation
+        signature = next_signature
+        cross_tu = next_cross_tu
+
+
+def _call_edges_observation(
+    engine: EngineObservation,
+    direction: Literal["callers", "callees"],
+    symbol: str,
+    file: str,
+    pos: Pos,
+    *,
+    limit: int,
+    offset: int,
+) -> EngineObservationResult:
+    if direction == "callers":
+        return engine.find_callers(symbol, file, pos, limit=limit, offset=offset)
+    return engine.find_callees(symbol, file, pos, limit=limit, offset=offset)
+
+
 def _prewarm_index_ready_timeout(config: BuildConfig) -> float:
     if config.prewarm_index_ready_timeout is not None:
         return config.prewarm_index_ready_timeout
@@ -558,6 +790,55 @@ def _references_stability_signature(
     )
 
 
+def _call_edges_have_cross_tu_evidence(
+    observation: EngineObservationResult,
+    query_file: str,
+    direction: Literal["callers", "callees"],
+) -> bool:
+    query_real = str(Path(query_file).resolve())
+    if direction == "callers":
+        return any(
+            str(Path(edge.from_symbol.file).resolve()) != query_real
+            for edge in observation.call_edges
+        )
+    return any(
+        str(Path(edge.to_symbol.file).resolve()) != query_real
+        for edge in observation.call_edges
+    )
+
+
+def _call_edges_stability_signature(
+    observation: EngineObservationResult,
+) -> tuple[int | None, tuple[tuple[str, int, int, str, str, int, int], ...]]:
+    return (
+        observation.total_results,
+        tuple(_call_edge_signature(edge) for edge in observation.call_edges),
+    )
+
+
+def _call_edge_signature(
+    edge: CallEdgeResult,
+) -> tuple[str, int, int, str, str, int, int]:
+    return (
+        str(Path(edge.from_symbol.file).resolve()),
+        edge.from_symbol.pos.line,
+        edge.from_symbol.pos.character,
+        edge.from_symbol.name,
+        str(Path(edge.to_symbol.file).resolve()),
+        edge.call_site.start.line,
+        edge.call_site.start.character,
+    )
+
+
+def _slice_call_edges_observation(
+    observation: EngineObservationResult, limit: int, offset: int
+) -> EngineObservationResult:
+    return replace(
+        observation,
+        call_edges=observation.call_edges[offset : offset + limit],
+    )
+
+
 def _semantic_search_limit(limit: int, offset: int) -> int:
     return max(100, limit + offset)
 
@@ -575,6 +856,18 @@ def _search_window_may_be_truncated(
 def _ensure_background_index_references_are_non_exhaustive(
     result: QueryResult,
 ) -> QueryResult:
+    return _ensure_background_index_results_are_non_exhaustive(result, "references")
+
+
+def _ensure_background_index_call_hierarchy_is_non_exhaustive(
+    result: QueryResult,
+) -> QueryResult:
+    return _ensure_background_index_results_are_non_exhaustive(result, "call hierarchy")
+
+
+def _ensure_background_index_results_are_non_exhaustive(
+    result: QueryResult, label: str
+) -> QueryResult:
     credibilities = (
         [result.status_credibility]
         + [item.credibility for item in result.semantic_results]
@@ -585,7 +878,7 @@ def _ensure_background_index_references_are_non_exhaustive(
             credibility.index_backend == IndexBackend.BACKGROUND_INDEX
             and credibility.coverage.is_exhaustive_within_scope
         ):
-            raise RuntimeError("background-index references must not assert exhaustive")
+            raise RuntimeError(f"background-index {label} must not assert exhaustive")
     return result
 
 
