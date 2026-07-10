@@ -1,15 +1,26 @@
 # CodeGraph 设计文档
 
 ## 0. 元信息
-- 版本：v1.4.5（规范版；前身规范外迭代版至 DESIGN v1.3）
+- 版本：v1.5.0（规范版；前身规范外迭代版至 DESIGN v1.3）
 - 创建时间：2026-06-11
 - 状态：**Frozen**（v1.3 冻结于 2026-06-11；v1.4 为 P1 实现期经 R1 变更后的修订，2026-06-13；
-  v1.4.5 为 P6 集成期经 change_5 变更后的修订）
+  v1.4.5 为 P6 集成期经 change_5 变更后的修订；v1.5.0 为 P8 后多版本 support 经 change_6 变更后的修订）
 - 成熟度说明：本设计经三轮多 AI 架构 review + 一轮主系统对接 + 三轮规范化评审冻结为 v1.3；
   进入 Phase 1 开发后，两轮多路代码 review（ChatGPT/Kimi/Gemini）发现冻结设计的一处契约矛盾
   （QR7×INV9）+ 一处虚假否定漏洞，经 R1 变更（change_2.md）修订为 v1.4。
 - 前身：本文由 CodeGraph DESIGN v1.3（规范外迭代版）按公司设计规范模板重构而来。
-- **v1.4.5 相对 v1.4.4 的变更**（R1 变更 change_5.md，P6 集成期多路 review 发现）：
+- **v1.5.0 相对 v1.4.5 的变更**（R1 变更 change_6.md，P8 后多版本工具链验证发现）：
+  - **[能力扩展] 多版本 clangd support**：CodeGraph 从假设单一 clangd 18.1.3 扩展为 support
+    多版本（18.1.3/21.1.1/22.1.8，运行时探测）。触发：clangd 18 不支持 callHierarchy
+    outgoingCalls（find_callees 只能 FAILED），而 GBS 生产用 clangd 21.1.1（支持 outgoing）；
+    且发布后开发者环境版本不一。经三版本真机 spot-check 验证后落进 design。
+  - 关键结论（三版本对比）：(1) CodeGraph 诚实性属性【版本无关、一致】（not_found→UNRESOLVED、
+    is_exhaustive 恒 False、find_references 均 389/62、降 health 不降 kind）；(2) call graph
+    结果【版本相关】（find_callers 18=387/21/22=386，18 多报 1 false positive；outgoingCalls
+    需 clangd 20+）；(3) 索引【必须按版本隔离】（clangd 跨版本改写 cache，共享会污染）。
+  - 涉及：§1.4 clangd 假设（单版本→多版本 + 三条关键事实）、§4.1.1 find_callers/callees 契约
+    （callHierarchy 逐方向 runtime probe）、§6 R-技6（泛化为跨版本能力/结果差异）。
+    call graph 结果携带 clangd 版本作为可追溯元数据；诚实性属性版本无关故不入版本判断。
   - **[DESIGN_ISSUE 修正] 新增 INV14d**：index_backend=background-index ⟹ 不产出 not_found
     （结果为 unresolved）。P6 的 search_symbol 项目级 not_found 经四轮多路 review 挖出四层
     虚假否定（bg=False 借 complete health / ready 判据被 header 命中误触发 / fuzzy 结果挤占
@@ -125,7 +136,9 @@
   （见 §4.4/§7 P6/§6 R-依1）。注：syntax helper 跑在 x86 开发机，不涉及 ARM 板。
 - [ASSUMPTION] 消费方（含 MCP agent）会读取并尊重 `consumer_warning=not_evidence` 标记；
   该假设需消费方侧集成测试验证（主系统侧已认领，见 §4.1.8 约束 C-3）。
-- [OPEN] clangd-indexer 路线（二期）需安装 clang-tools-18（~9MB），内网可得性未确认；
+- [OPEN] clangd-indexer 路线（二期）需安装【与选定 clangd 版本匹配的】clang-tools/clangd-indexer
+  （~9MB；change_6 后 clangd 多版本，clangd-indexer 须与所用 clangd 同版本以保索引兼容），
+  内网可得性未确认；
   MVP 不依赖它，用 background-index（已实测，零额外依赖）。
 - [OPEN] 真实 unipicture 代码库（比已测的 gstreamer 大）的索引规模/耗时为外推估算，
   首建峰值内存（~2GB/gstreamer）可能需 `-j` 压并行度，待真机确认。
@@ -146,7 +159,19 @@
   (2) MCP server 层若需 MCP SDK/协议库，仅限 mcp_server.py 使用，核心库不依赖；
   内网不可得时可手写 stdio JSON-RPC 或只提供库 API 形态（见 §6 R-依3）。核心模块
   （credibility/routing/engines/indexing/api）始终纯 stdlib。
-- **clangd**：宿主机 `Ubuntu clangd 18.1.3`（已实测）。
+- **clangd（多版本 support·change_6）**：CodeGraph support 多个 clangd 版本，运行时探测版本
+  与能力，不绑死单一版本。已实测三版本：`clangd 18.1.3`（宿主机基线/最低支持）、
+  `clangd 21.1.1`（对齐 GBS 生产工具链）、`clangd 22.1.8`（最新 release）。
+  关键事实（三版本真机 spot-check 验证，见 change_6.md）：
+  · **CodeGraph 诚实性属性跨版本一致**（not_found 一律 UNRESOLVED、is_exhaustive 恒 False、
+    find_references 三版本均 389/62、降 health 不降 kind、bg=False 不虚假否定）——这些立身之本
+    的属性【版本无关】。
+  · **call graph 结果与 clangd 版本绑定**：find_callers 数量随版本变（18=387、21/22=386——
+    18 多报 1 条 false positive，21/22 更准）；callHierarchy outgoingCalls 需 clangd 20+
+    （18 不支持→FAILED、21/22 点亮）。故 call graph 类结果需携带 clangd 版本作为【可追溯元数据】。
+  · **索引按 clangd 版本隔离**：clangd 会改写索引 cache（跨版本非只读，实测 18 建 3593、
+    21 独立建 3595、22 独立建 3596；共享 cache 会被后接触的版本污染，实测原 rw_arm cache 被
+    21 写到 3614）。每个 clangd 版本【必须】用独立 CDB 目录 + 独立 .cache/clangd/index，不共享。
 - 测试框架：pytest。
 
 ### 2.2 部署环境
@@ -324,8 +349,13 @@ get_impact(symbol: str, *, build_config_id: str, limit: int = 100) -> QueryResul
 - `allow_syntactic_fallback`：精确查询默认 False（不补 tree-sitter 候选）；search_symbol
   无此参数（本就自动补，见 §4.4 护栏触发规则）。
 - **find_callers/find_callees [契约]**：用 LSP `callHierarchy/incoming|outgoingCalls`
-  （prepareCallHierarchy 后），**不**用 references+AST 自行推导。clangd 不支持 callHierarchy
-  时 → status=FAILED + notes=CALLHIERARCHY_UNSUPPORTED（不触发兜底）。
+  （prepareCallHierarchy 后），**不**用 references+AST 自行推导。
+  **[change_6·细粒度能力探测]** callHierarchy 分 incoming / outgoing 两个方向，运行时【逐方向
+  探测】而非假设整体支持：incomingCalls 各支持版本可用；outgoingCalls 需 clangd 20+
+  （clangd 18.1.3 缺此方法，返回 method not found）。某方向不被当前 clangd 支持时 →
+  该方向查询 status=FAILED + notes=CALLHIERARCHY_UNSUPPORTED（不触发兜底、不用 references+AST
+  伪造调用图）。实现接标准 LSP，支持的 clangd 版本自动点亮（如 find_callees 在 18 FAILED、
+  21/22 可用，同一份代码）。call graph 结果携带产生它的 clangd 版本作为可追溯元数据（见 §1.4）。
 
 #### 4.1.2 返回结构
 ```python
@@ -377,6 +407,12 @@ class QueryResult:
     syntactic_candidates: list[Candidate]  # 非证据通道：tree-sitter 候选 + clangd 降级候选
     index_health: Literal["complete", "incomplete", "unknown"]
     total_hits: int | None           # 全局命中总数（分页）；clangd 尽力统计，不可行为 None
+    engine_version: str | None = None  # [change_6] 产生此结果的 clangd 版本（可追溯元数据）；
+                                     #   call graph 类结果（find_callers/callees）由 adapter 填
+                                     #   （如 "clangd 21.1.1"），其他查询留 None。纯附加：默认 None、
+                                     #   不进 Credibility、不参与 check_invariants/QR/INV。
+                                     #   语义：解释"此结果依赖哪个 clangd 版本"，不改变可信度评分
+                                     #   （诚实性属性版本无关，见 §1.4；差异分析见 change_6.md）。
     notes: list[Note]                # 结构化提示（IssueCode + detail），消费方按 code 分支
 
 @dataclass
@@ -499,7 +535,11 @@ locate_log_statement(log_text: str, *, tag: str | None = None,
   异步等待影响，无法在可观测输出层区分"真不存在"与"存在但未索引到"。项目级与 TU 级诚实
   负证明等二期 clangd-indexer（逐 TU 台账）。消费方在 MVP 阶段收不到 not_found，只有
   unresolved（无需再"降级为 BEST_EFFORT"——系统根本不产出不可信的 not_found）。见 INV14d。
-- **C-2**：build_config_id 标配置不标代码版本；索引版本一致性由消费方自管（或等二期 staleness）。
+- **C-2**（change_6 修订）：build_config_id 标配置不标代码版本；代码 staleness 一致性仍由
+  消费方自管（或等二期 staleness）。**但索引的 clangd 版本隔离是 CodeGraph 配置层【强约束】，
+  不由消费方自管**：每个 clangd 版本必须用独立 CDB 目录 + 独立 .cache/clangd/index
+  （clangd 跨版本改写索引，共享会污染，见 §1.4/change_6.md）。BuildConfig.compile_commands_dir
+  按 clangd 版本隔离承载此约束。
 - **C-3**：消费方须集成测试验证 syntactic_candidates 真被当非证据处理（防 LLM 固化为事实）。
 - **consumer_hint**：消费方贴业务标注的开放 dict（runtime_confirmed / claim_id /
   ticket_id / verdict_relevance）；**CodeGraph 永不读、永不填**。
@@ -795,7 +835,7 @@ blind_spot_nearby=False, blind_spot_affects_result=False, consumer_hint=None
 | **R-技3：宿主机 x86 解析 ARM 的 inactive #ifdef 分支** | 条件编译分支归属错误 | 中 | active_config 维度（host/target/mixed/unknown）；MVP 粗粒度，精确逐分支归属二期 |
 | **R-技4：tree-sitter 对 C/C++ 宏/模板/条件编译误识别** | 候选噪音/误导 | 中 | 评分自闭（护栏3）+ 低 certainty(syntactic)+ relation∈{may,n/a} + 不参与负证明；只作启发不作证据 |
 | **R-技5：clangd 子进程崩溃/僵尸/句柄泄漏** | 查询失败、资源泄漏 | 中 | 超时（30s）+ 健康检查 + 异常退出自动重启；FAILED 状态如实暴露 |
-| **R-技6：callHierarchy 在 clangd 18 的支持差异** | callers/callees 部分失效 | 中 | 不支持→FAILED+CALLHIERARCHY_UNSUPPORTED（不静默）；P8 须真机验证 callHierarchy 可用性 |
+| **R-技6：clangd 跨版本能力/结果差异（change_6 泛化）** | callers/callees 支持性与调用图数量随 clangd 版本变 | 中 | 【能力探测】callHierarchy 逐方向 runtime probe（outgoing 需 20+），不支持→FAILED+CALLHIERARCHY_UNSUPPORTED（不静默、不伪造）；【版本隔离】索引按 clangd 版本独立 cache（跨版本会改写）；【可追溯】call graph 结果携带 clangd 版本元数据；【已验证】三版本(18/21/22) spot-check 确认 CodeGraph 诚实性属性（not_found/is_exhaustive/refs 389）版本无关、一致，仅 call graph 数量版本相关（18 多报 1 false positive、21/22 更准） |
 | **R-依3：MCP server 需 MCP SDK/协议库（非纯 stdlib）** | MCP 形态引入第三方依赖 | 中 | §2.1 列为允许例外（仅 MCP 层）；或手写 stdio JSON-RPC 保纯 stdlib；内网可得性待确认，不可得则只提供库 API 形态 |
 | **R-依1：tree-sitter Python binding 内网不可得** | 失语法候选能力 + 失要素2判定致语义结果降级 | 低（已验证内网可得，见 §1.4 VERIFIED 已坐实） | tree-sitter 在目标 x86 开发环境已验证可装可用（0.25.2 + tree-sitter-c/cpp，能识别 preproc 节点）。万一未来环境不可得：**安全降级但非"功能不受损"**——既失 tree-sitter 候选，且要素2（宏伪位置判定）无 helper 时保守标"不满足"，所有需要素2 的语义结果降级为候选（见 §4.4/§7 P6）。即 clangd 仍工作，但无法产出 OK 语义结果，只给候选。change_4 已修正原"功能不受损只是少候选"的过度乐观措辞。 |
 | **R-依2：clangd-indexer（二期）需装 clang-tools-18，内网或不可得** | 项目级负证明/逐 TU 台账延后 | 低 | MVP 不依赖它（background-index 已够）；仅当项目级 not_found 成刚需才触发 |
@@ -805,7 +845,8 @@ blind_spot_nearby=False, blind_spot_affects_result=False, consumer_hint=None
 **Top 3（按"最可能阻塞开发/最大危害"重选）**：
 1. **R-技1**（虚假否定 —— 整个系统防的核心，已用 INV14 四重钳死；change_5 新增 14d：
    MVP background-index 一律不产 not_found、只 unresolved）。
-2. **R-技6**（callHierarchy 支持差异 —— 直接决定 P8 callers/callees 能否交付，须 P8 真机验证）。
+2. **R-技6**（clangd 跨版本能力/结果差异 —— P8 已交付 callers、callees 逐方向 probe；
+   change_6 后三版本 18/21/22 已 spot-check 验证：诚实性版本无关、call graph 版本相关）。
 3. **R-依3 / R-范2**（MCP runtime 依赖与真实库规模 —— 二者都可能在落地期卡住，需早确认）。
 （注：R-依1 tree-sitter binding 已验证内网可得（§1.4 VERIFIED），概率低，移出 Top 3——危害本身不低：不可得时失候选且要素2语义降级，见 R-依1 行。）
 
@@ -975,7 +1016,8 @@ P6, P7, P8 → P9（MCP 薄封装）
 - **DoD**（引用 §10·接口层）：
   - [ ] find_callers/callees 用 callHierarchy（不自行 references+AST）
   - [ ] callHierarchy 不支持时→FAILED+CALLHIERARCHY_UNSUPPORTED，有测试
-  - [ ] **真机验证 callHierarchy 在目标 clangd 18 可用**（呼应 §6 R-技6）
+  - [ ] **真机验证 callHierarchy 多版本能力**（呼应 §6 R-技6/change_6）：incoming 各版本可用；
+        outgoing 需 clangd 20+（18 FAILED、21/22 点亮）；逐方向 runtime probe
   - [ ] CallEdgeResult schema；relation 正确（must 仅 semantic+resolved）；from/to 方向正确
   - [ ] 覆盖率 + R13/dev_memory/checkpoint/Review/PR/R14
 - **预估规模**：~500 行（含测试）。
