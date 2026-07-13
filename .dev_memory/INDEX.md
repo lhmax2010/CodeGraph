@@ -5,7 +5,7 @@
 ## 当前状态
 - 当前活跃 stage：无
 - 最后已确认 stage（已 Merge）：stage08_call_hierarchy
-- 设计基线：docs/design.md v1.4.5 Frozen（2026-07-07；R1 change_2/change_3/change_4/change_5 已应用；change_5 已冻结，MVP background-index 下 search_symbol/get_definition 不产 not_found）
+- 设计基线：docs/design.md v1.5.0 Frozen（2026-07-13；R1 change_2/change_3/change_4/change_5/change_6 已应用；change_6 已冻结，多版本 clangd support）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
 
 ## stage 列表
