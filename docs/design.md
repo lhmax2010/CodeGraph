@@ -840,7 +840,7 @@ blind_spot_nearby=False, blind_spot_affects_result=False, consumer_hint=None
 | **R-技6：clangd 跨版本能力/结果差异（change_6 泛化）** | callers/callees 支持性与调用图数量随 clangd 版本变 | 中 | 【能力探测】callHierarchy 逐方向 runtime probe（outgoing 需 20+），不支持→FAILED+CALLHIERARCHY_UNSUPPORTED（不静默、不伪造）；【版本隔离】索引按 clangd 版本独立 cache（跨版本会改写）；【可追溯】call graph 结果携带 clangd 版本元数据；【已验证】三版本(18/21/22) spot-check 确认 CodeGraph 诚实性属性（not_found/is_exhaustive/refs 389）版本无关、一致，仅 call graph 数量版本相关（18 多报 1 false positive、21/22 更准） |
 | **R-依3：MCP server 需 MCP SDK/协议库（非纯 stdlib）** | MCP 形态引入第三方依赖 | 中 | §2.1 列为允许例外（仅 MCP 层）；或手写 stdio JSON-RPC 保纯 stdlib；内网可得性待确认，不可得则只提供库 API 形态 |
 | **R-依1：tree-sitter Python binding 内网不可得** | 失语法候选能力 + 失要素2判定致语义结果降级 | 低（已验证内网可得，见 §1.4 VERIFIED 已坐实） | tree-sitter 在目标 x86 开发环境已验证可装可用（0.25.2 + tree-sitter-c/cpp，能识别 preproc 节点）。万一未来环境不可得：**安全降级但非"功能不受损"**——既失 tree-sitter 候选，且要素2（宏伪位置判定）无 helper 时保守标"不满足"，所有需要素2 的语义结果降级为候选（见 §4.4/§7 P6）。即 clangd 仍工作，但无法产出 OK 语义结果，只给候选。change_4 已修正原"功能不受损只是少候选"的过度乐观措辞。 |
-| **R-依2：clangd-indexer（二期）需装 clang-tools-18，内网或不可得** | 项目级负证明/逐 TU 台账延后 | 低 | MVP 不依赖它（background-index 已够）；仅当项目级 not_found 成刚需才触发 |
+| **R-依2：clangd-indexer（二期）需装【与选定 clangd 版本匹配的】clang-tools/clangd-indexer，内网或不可得** | 项目级负证明/逐 TU 台账延后 | 低 | MVP 不依赖它（background-index 已够）；仅当项目级 not_found 成刚需才触发；[change_6] 多版本后 clangd-indexer 须与所用 clangd 同版本，以保索引兼容（索引跨版本会改写，见 §1.4） |
 | **R-范1：实现者把第二批复杂度（owning_tu/edge_mechanism 等）做进 MVP** | 交付被拖垮 | 中 | §1.3 + §3.5 严格圈定 MVP；§7 Phase 只切第一批；R11 禁大范围重构 |
 | **R-范2：真实库（unipicture）规模大于实测的 gstreamer** | 建库耗时/内存超预算 | 中 | 体积/耗时随 TU 线性外推；`-j` 压内存；CI 离线建可接受分钟级；真机基准验证 |
 
