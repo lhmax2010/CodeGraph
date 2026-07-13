@@ -144,4 +144,4 @@ found → FAILED）已是第一个实例；需补：clangd 版本探测 + 结果
 - 三版本编译：clangd 21.1.1（build 52min）、22.1.8（build 58min）到 /home，18 用系统版本。
 - 三版本独立 cache：rw_arm-clangd18(3593)/21(3595)/22(3596)，各自 health=complete。
 - 完整 spot-check 日志：`.dev_memory/change_6_multiversion/spotcheck-20260710.txt`
-  （归档进 repo 以便复核；含三版本逐属性对比 + 386/387 raw edge 字段）。
+  （归档进 repo 以便复核；含三版本逐属性对比汇总。386/387 的 raw edge 字段见本文 §2.1）。

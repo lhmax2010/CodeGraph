@@ -407,13 +407,15 @@ class QueryResult:
     syntactic_candidates: list[Candidate]  # 非证据通道：tree-sitter 候选 + clangd 降级候选
     index_health: Literal["complete", "incomplete", "unknown"]
     total_hits: int | None           # 全局命中总数（分页）；clangd 尽力统计，不可行为 None
+    notes: list[Note]                # 结构化提示（IssueCode + detail），消费方按 code 分支
     engine_version: str | None = None  # [change_6] 产生此结果的 clangd 版本（可追溯元数据）；
                                      #   call graph 类结果（find_callers/callees）由 adapter 填
                                      #   （如 "clangd 21.1.1"），其他查询留 None。纯附加：默认 None、
                                      #   不进 Credibility、不参与 check_invariants/QR/INV。
                                      #   语义：解释"此结果依赖哪个 clangd 版本"，不改变可信度评分
                                      #   （诚实性属性版本无关，见 §1.4；差异分析见 change_6.md）。
-    notes: list[Note]                # 结构化提示（IssueCode + detail），消费方按 code 分支
+                                     #   [字段顺序] 必须置于所有无默认值字段之后（dataclass 规则：
+                                     #   有默认值字段不得先于无默认值字段，否则 TypeError）。
 
 @dataclass
 class Result:
