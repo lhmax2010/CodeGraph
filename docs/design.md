@@ -21,6 +21,7 @@
   - 涉及：§1.4 clangd 假设（单版本→多版本 + 三条关键事实）、§4.1.1 find_callers/callees 契约
     （callHierarchy 逐方向 runtime probe）、§6 R-技6（泛化为跨版本能力/结果差异）。
     call graph 结果携带 clangd 版本作为可追溯元数据；诚实性属性版本无关故不入版本判断。
+- **v1.4.5 相对 v1.4.4 的变更**（R1 变更 change_5.md，P6 集成期多路 review 发现）：
   - **[DESIGN_ISSUE 修正] 新增 INV14d**：index_backend=background-index ⟹ 不产出 not_found
     （结果为 unresolved）。P6 的 search_symbol 项目级 not_found 经四轮多路 review 挖出四层
     虚假否定（bg=False 借 complete health / ready 判据被 header 命中误触发 / fuzzy 结果挤占
@@ -350,12 +351,14 @@ get_impact(symbol: str, *, build_config_id: str, limit: int = 100) -> QueryResul
   无此参数（本就自动补，见 §4.4 护栏触发规则）。
 - **find_callers/find_callees [契约]**：用 LSP `callHierarchy/incoming|outgoingCalls`
   （prepareCallHierarchy 后），**不**用 references+AST 自行推导。
-  **[change_6·细粒度能力探测]** callHierarchy 分 incoming / outgoing 两个方向，运行时【逐方向
-  探测】而非假设整体支持：incomingCalls 各支持版本可用；outgoingCalls 需 clangd 20+
-  （clangd 18.1.3 缺此方法，返回 method not found）。某方向不被当前 clangd 支持时 →
-  该方向查询 status=FAILED + notes=CALLHIERARCHY_UNSUPPORTED（不触发兜底、不用 references+AST
-  伪造调用图）。实现接标准 LSP，支持的 clangd 版本自动点亮（如 find_callees 在 18 FAILED、
-  21/22 可用，同一份代码）。call graph 结果携带产生它的 clangd 版本作为可追溯元数据（见 §1.4）。
+  **[change_6·细粒度能力判定·实现期落地]** callHierarchy 分 incoming / outgoing 两个方向，
+  运行时【逐方向判定】而非假设整体支持：实现为**反应式判定**（发起该方向请求，若 clangd 返回
+  method-not-found / unsupported，则判该方向不可用），非启动期主动 probe。incomingCalls 各支持
+  版本可用；outgoingCalls 需 clangd 20+（clangd 18.1.3 缺此方法，返回 method not found）。
+  某方向不被当前 clangd 支持时 → 该方向查询 status=FAILED + notes=CALLHIERARCHY_UNSUPPORTED
+  （不触发兜底、不用 references+AST 伪造调用图）。实现接标准 LSP，支持的 clangd 版本自动点亮
+  （如 find_callees 在 18 FAILED、21/22 可用，同一份代码）。call graph 结果携带产生它的 clangd
+  版本作为可追溯元数据（engine_version，见 §4.1.2/§1.4；实现期落地）。
 
 #### 4.1.2 返回结构
 ```python
