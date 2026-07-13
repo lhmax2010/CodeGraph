@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from importlib import import_module
@@ -10,6 +11,7 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
 from ..credibility import SymbolKind
+from ..engine_version import clangd_version_from_initialize, detect_clangd_version
 from ..types import (
     CallEdgeResult,
     LocationResult,
@@ -21,6 +23,7 @@ from ..types import (
 from .protocol import EngineDiagnostics, EngineObservationResult
 
 JsonObject = dict[str, Any]
+_METHOD_NOT_FOUND_CODE = re.compile(r"[\"']?code[\"']?\s*:\s*-32601\b")
 _verify_clangd: Any = import_module("tools.verify_clangd")
 LSPClient: Any = _verify_clangd.LSPClient
 path_to_uri: Callable[[str], str] = _verify_clangd.path_to_uri
@@ -70,6 +73,8 @@ class ClangdAdapter:
         client_factory: ClientFactory = LSPClient,
     ):
         self.config = config
+        self.engine_version: str | None = None
+        self._probe_executable_version = client_factory is LSPClient
         self.compile_dir = _compile_dir(config.compile_commands_dir)
         extra_args = [
             f"--compile-commands-dir={self.compile_dir}",
@@ -233,7 +238,7 @@ class ClangdAdapter:
         )
 
     def _initialize(self) -> None:
-        self._request(
+        result = self._request(
             "initialize",
             {
                 "processId": os.getpid(),
@@ -248,6 +253,9 @@ class ClangdAdapter:
                 },
             },
         )
+        self.engine_version = clangd_version_from_initialize(result)
+        if self.engine_version is None and self._probe_executable_version:
+            self.engine_version = detect_clangd_version(self.config.clangd_path)
         self._client.notify("initialized", {})
 
     def _open_document(self, file: str) -> str:
@@ -451,5 +459,7 @@ def _is_include_not_found(message: str) -> bool:
 def _looks_unsupported(exc: RuntimeError) -> bool:
     text = str(exc).lower()
     return (
-        "methodnotfound" in text or "method not found" in text or "unsupported" in text
+        "methodnotfound" in text
+        or "method not found" in text
+        or _METHOD_NOT_FOUND_CODE.search(text) is not None
     )

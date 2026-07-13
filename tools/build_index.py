@@ -20,7 +20,11 @@ from codegraph.indexing import (  # noqa: E402 - script bootstraps repo root fir
     rewrite_cdb_for_index,
     run_background_index,
     scan_index_shards,
+    stamp_existing_index,
     summarize_compile_commands,
+)
+from codegraph.engine_version import (  # noqa: E402 - same bootstrap.
+    detect_clangd_version,
 )
 
 
@@ -58,6 +62,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Only inspect existing shards; do not launch clangd.",
     )
+    parser.add_argument(
+        "--stamp-existing-index",
+        action="store_true",
+        help=(
+            "Explicitly attest a healthy legacy cache with --clangd; requires "
+            "--inspect-only and never launches clangd for indexing."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -75,14 +87,32 @@ def main(argv: list[str] | None = None) -> int:
             compile_dir = str(Path(args.compile_commands_dir).resolve())
             rewrite = None
 
+        if args.stamp_existing_index and not args.inspect_only:
+            raise ValueError("--stamp-existing-index requires --inspect-only")
+
         if args.inspect_only:
             cdb = summarize_compile_commands(compile_dir)
             shards = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
+            engine_version = detect_clangd_version(args.clangd)
+            if engine_version is None:
+                raise ValueError(f"cannot detect clangd version: {args.clangd}")
+            health = (
+                stamp_existing_index(compile_dir, args.clangd)
+                if args.stamp_existing_index
+                else evaluate_index_health(
+                    cdb, shards, expected_engine_version=engine_version
+                )
+            )
+            if args.stamp_existing_index:
+                shards = scan_index_shards(
+                    index_dir_for_compile_commands_dir(compile_dir)
+                )
             payload = {
                 "rewrite": asdict(rewrite) if rewrite is not None else None,
                 "compile_commands": asdict(cdb),
                 "shards": asdict(shards),
-                "health": asdict(evaluate_index_health(cdb, shards)),
+                "health": asdict(health),
+                "engine_version": engine_version,
             }
         else:
             result = run_background_index(

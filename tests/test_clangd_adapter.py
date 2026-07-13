@@ -14,6 +14,7 @@ from codegraph.engines.clangd_adapter import (
     _diagnostics_from_lsp,
     _location_result_from_location,
     _location_result_from_workspace_symbol,
+    _looks_unsupported,
     _reference_result_from_location,
     _symbol_kind,
     _uri_to_path,
@@ -131,6 +132,25 @@ def test_background_index_flag_is_opt_in(tmp_path: Path):
 
     assert calls[0][4] is False
     assert calls[1][4] is True
+
+
+def test_initialize_captures_and_normalizes_server_version(tmp_path: Path):
+    fake = FakeClient(
+        {
+            "initialize": [
+                {
+                    "serverInfo": {
+                        "name": "clangd",
+                        "version": "clangd version 21.1.1 (release)",
+                    }
+                }
+            ]
+        }
+    )
+
+    adapter = make_adapter(fake, tmp_path)
+
+    assert adapter.engine_version == "clangd 21.1.1"
 
 
 def test_config_positional_extra_args_keep_background_default(tmp_path: Path):
@@ -367,6 +387,32 @@ def test_call_hierarchy_runtime_error_is_not_mislabeled_unsupported(tmp_path: Pa
 
     with pytest.raises(RuntimeError, match="clangd crashed"):
         adapter.find_callers("add", str(src), Pos(0, 4))
+
+    generic_unsupported = FakeClient(
+        {
+            "initialize": [{}],
+            "textDocument/prepareCallHierarchy": [
+                RuntimeError("call item unsupported because index is corrupt")
+            ],
+        }
+    )
+    adapter = make_adapter(generic_unsupported, tmp_path)
+    with pytest.raises(RuntimeError, match="unsupported because index is corrupt"):
+        adapter.find_callers("add", str(src), Pos(0, 4))
+
+
+def test_unsupported_detection_only_accepts_method_not_found():
+    assert _looks_unsupported(RuntimeError("MethodNotFound: callHierarchy"))
+    assert _looks_unsupported(
+        RuntimeError(
+            "callHierarchy/outgoingCalls error: "
+            "{'code': -32601, 'message': 'unknown method'}"
+        )
+    )
+    assert not _looks_unsupported(
+        RuntimeError("operation unsupported for malformed call item")
+    )
+    assert not _looks_unsupported(RuntimeError("invalid offset -32601 unsupported"))
 
 
 def test_lsp_conversion_helpers_ignore_malformed_shapes():

@@ -20,8 +20,10 @@ from .credibility import (
 from .engines.clangd_adapter import ClangdAdapter, ClangdAdapterConfig
 from .engines.protocol import EngineObservation, EngineObservationResult
 from .engines.treesitter_adapter import create_treesitter_provider
+from .engine_version import detect_clangd_version
 from .factories import make_error_credibility
 from .indexing import (
+    IndexHealthReport,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
     scan_index_shards,
@@ -50,7 +52,7 @@ _STABLE_MATCHES = 3
 
 @dataclass(frozen=True)
 class BuildConfig:
-    """One CodeGraph build/index configuration."""
+    """One build config whose CDB/cache is owned by one exact clangd version."""
 
     build_config_id: str
     compile_commands_dir: str
@@ -243,19 +245,32 @@ class CodeGraph:
         engine_factory: Callable[[ClangdAdapterConfig], ManagedEngine] | None = None,
     ):
         self.config = config
+        self._probe_configured_engine = engine_factory is None
         self._engine_factory = engine_factory or (lambda cfg: ClangdAdapter(cfg))
 
     def prewarm(self, file: str | None = None) -> bool:
         """Warm clangd/index caches; each user query still proves readiness itself."""
 
+        health = _initial_index_health(self.config, self._probe_configured_engine)
+        if health.reason == "index_engine_mismatch":
+            return False
         try:
             with self._engine_factory(self._clangd_config()) as engine:
-                return _warm_background_index(
+                engine_version = _managed_engine_version(engine)
+                health = _index_health(self.config, engine_version)
+                ready = _warm_background_index(
                     engine,
                     self.config,
                     file,
                     timeout=_prewarm_index_ready_timeout(self.config),
                 )
+                if ready:
+                    health = _index_health(self.config, engine_version)
+                return ready and health.reason not in {
+                    "index_engine_unverified",
+                    "index_engine_mismatch",
+                    "index_engine_unavailable",
+                }
         except Exception:
             return False
 
@@ -272,9 +287,19 @@ class CodeGraph:
         if kind is None and kind_filter is not None:
             return _invalid_result(query, f"invalid kind_filter: {kind_filter}")
         provider = create_treesitter_provider(self.config.source_roots)
-        health = _index_health(self.config)
+        health = _initial_index_health(self.config, self._probe_configured_engine)
+        if health.reason == "index_engine_mismatch":
+            return _index_guard_unresolved(
+                query,
+                health,
+                active_config=self.config.active_config,
+                symbol_kind=_search_symbol_kind(kind),
+            )
+        engine_version: str | None = None
         try:
             with self._engine_factory(self._clangd_config()) as engine:
+                engine_version = _managed_engine_version(engine)
+                health = _index_health(self.config, engine_version)
                 ready = _warm_background_index(engine, self.config)
                 engine_limit = _semantic_search_limit(limit, offset)
                 observation = engine.search_symbol(
@@ -287,17 +312,21 @@ class CodeGraph:
                     observation, engine_limit
                 )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
-            return _engine_failure(query, exc)
-        health = _health_after_warm(health, self.config, ready)
+            return _with_index_engine_health_note(_engine_failure(query, exc), health)
+        health = _health_after_warm(
+            health, self.config, ready, engine_version=engine_version
+        )
         observation, total_hits = _exact_symbol_observation(
             observation, symbol, limit=limit, offset=offset
         )
-        ready_for_negative_proof = ready and not (
-            search_window_may_be_truncated and total_hits == 0
+        ready_for_negative_proof = (
+            ready
+            and health.health == IndexHealth.COMPLETE
+            and not (search_window_may_be_truncated and total_hits == 0)
         )
         if self.config.background_index and not observation.locations:
             ready_for_negative_proof = False
-        return route_observation(
+        result = route_observation(
             query,
             observation,
             syntactic_provider=provider,
@@ -306,13 +335,14 @@ class CodeGraph:
             offset=offset,
             index_scope=_effective_index_scope(self.config, ready_for_negative_proof),
             index_health=_effective_health(
-                health, self.config, ready_for_negative_proof
+                health.health, self.config, ready_for_negative_proof
             ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=_search_symbol_kind(kind),
             total_hits=total_hits,
         )
+        return _with_index_engine_health_note(result, health)
 
     def get_definition(
         self,
@@ -328,31 +358,44 @@ class CodeGraph:
         if invalid is not None:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
-        health = _index_health(self.config)
+        health = _initial_index_health(self.config, self._probe_configured_engine)
+        if health.reason == "index_engine_mismatch":
+            return _index_guard_unresolved(
+                query,
+                health,
+                active_config=self.config.active_config,
+                symbol_kind=SymbolKind.UNKNOWN,
+            )
+        engine_version: str | None = None
         try:
             with self._engine_factory(self._clangd_config()) as engine:
+                engine_version = _managed_engine_version(engine)
+                health = _index_health(self.config, engine_version)
                 ready = _warm_background_index(engine, self.config, real_file)
                 observation = engine.get_definition(symbol, real_file, pos)
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
-            return _engine_failure(query, exc)
-        health = _health_after_warm(health, self.config, ready)
-        ready_for_negative_proof = ready
+            return _with_index_engine_health_note(_engine_failure(query, exc), health)
+        health = _health_after_warm(
+            health, self.config, ready, engine_version=engine_version
+        )
+        ready_for_negative_proof = ready and health.health == IndexHealth.COMPLETE
         if self.config.background_index and not observation.locations:
             ready_for_negative_proof = False
-        return route_observation(
+        result = route_observation(
             query,
             observation,
             syntactic_provider=provider,
             allow_syntactic_fallback=allow_syntactic_fallback,
             index_scope=_effective_index_scope(self.config, ready_for_negative_proof),
             index_health=_effective_health(
-                health, self.config, ready_for_negative_proof
+                health.health, self.config, ready_for_negative_proof
             ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=SymbolKind.UNKNOWN,
             total_hits=len(observation.locations),
         )
+        return _with_index_engine_health_note(result, health)
 
     def find_references(
         self,
@@ -370,11 +413,21 @@ class CodeGraph:
         if invalid is not None:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
-        health = _index_health(self.config)
+        health = _initial_index_health(self.config, self._probe_configured_engine)
+        if health.reason == "index_engine_mismatch":
+            return _index_guard_unresolved(
+                query,
+                health,
+                active_config=self.config.active_config,
+                symbol_kind=SymbolKind.UNKNOWN,
+            )
         observation = EngineObservationResult()
         ready = False
+        engine_version: str | None = None
         try:
             with self._engine_factory(self._clangd_config()) as engine:
+                engine_version = _managed_engine_version(engine)
+                health = _index_health(self.config, engine_version)
                 warmup_file = _reference_warmup_file(self.config, real_file)
                 _warm_references_file(engine, self.config, warmup_file)
                 observation, ready = _find_references_with_stable_cross_tu(
@@ -387,15 +440,19 @@ class CodeGraph:
                     offset,
                 )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
-            return _engine_failure(query, exc)
-        health = _health_after_warm(health, self.config, ready)
+            return _with_index_engine_health_note(_engine_failure(query, exc), health)
+        health = _health_after_warm(
+            health, self.config, ready, engine_version=engine_version
+        )
         total_hits = (
             observation.total_results
             if observation.total_results is not None
             else len(observation.references)
         )
-        ready_for_references = ready and _references_have_cross_tu_evidence(
-            observation, real_file
+        ready_for_references = (
+            ready
+            and health.health == IndexHealth.COMPLETE
+            and _references_have_cross_tu_evidence(observation, real_file)
         )
         if self.config.background_index and total_hits == 0:
             ready_for_references = False
@@ -407,12 +464,15 @@ class CodeGraph:
             limit=limit,
             offset=offset,
             index_scope=_effective_index_scope(self.config, ready_for_references),
-            index_health=_effective_health(health, self.config, ready_for_references),
+            index_health=_effective_health(
+                health.health, self.config, ready_for_references
+            ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=SymbolKind.UNKNOWN,
             total_hits=total_hits,
         )
+        result = _with_index_engine_health_note(result, health)
         return _ensure_background_index_references_are_non_exhaustive(result)
 
     def find_callers(
@@ -474,11 +534,21 @@ class CodeGraph:
         if invalid is not None:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
-        health = _index_health(self.config)
+        health = _initial_index_health(self.config, self._probe_configured_engine)
+        if health.reason == "index_engine_mismatch":
+            return _index_guard_unresolved(
+                query,
+                health,
+                active_config=self.config.active_config,
+                symbol_kind=SymbolKind.ORDINARY_FUNCTION,
+            )
         observation = EngineObservationResult()
         ready = False
+        engine_version: str | None = None
         try:
             with self._engine_factory(self._clangd_config()) as engine:
+                engine_version = _managed_engine_version(engine)
+                health = _index_health(self.config, engine_version)
                 warmup_file = _reference_warmup_file(self.config, real_file)
                 _warm_references_file(engine, self.config, warmup_file)
                 observation, ready = _find_call_edges_with_stable_cross_tu(
@@ -492,15 +562,20 @@ class CodeGraph:
                     offset,
                 )
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
-            return _engine_failure(query, exc)
-        health = _health_after_warm(health, self.config, ready)
+            result = _engine_failure(query, exc, engine_version=engine_version)
+            return _with_index_engine_health_note(result, health)
+        health = _health_after_warm(
+            health, self.config, ready, engine_version=engine_version
+        )
         total_hits = (
             observation.total_results
             if observation.total_results is not None
             else len(observation.call_edges)
         )
-        ready_for_call_edges = ready and _call_edges_have_cross_tu_evidence(
-            observation, real_file, direction
+        ready_for_call_edges = (
+            ready
+            and health.health == IndexHealth.COMPLETE
+            and _call_edges_have_cross_tu_evidence(observation, real_file, direction)
         )
         if self.config.background_index and total_hits == 0:
             ready_for_call_edges = False
@@ -512,12 +587,16 @@ class CodeGraph:
             limit=limit,
             offset=offset,
             index_scope=_effective_index_scope(self.config, ready_for_call_edges),
-            index_health=_effective_health(health, self.config, ready_for_call_edges),
+            index_health=_effective_health(
+                health.health, self.config, ready_for_call_edges
+            ),
             index_backend=IndexBackend.BACKGROUND_INDEX,
             active_config=self.config.active_config,
             symbol_kind=SymbolKind.ORDINARY_FUNCTION,
             total_hits=total_hits,
         )
+        result = validate_query_result(replace(result, engine_version=engine_version))
+        result = _with_index_engine_health_note(result, health)
         return _ensure_background_index_call_hierarchy_is_non_exhaustive(result)
 
     def _clangd_config(self) -> ClangdAdapterConfig:
@@ -704,10 +783,14 @@ def _effective_index_scope(config: BuildConfig, index_ready: bool) -> IndexScope
 
 
 def _health_after_warm(
-    health: IndexHealth, config: BuildConfig, index_ready: bool
-) -> IndexHealth:
+    health: IndexHealthReport,
+    config: BuildConfig,
+    index_ready: bool,
+    *,
+    engine_version: str | None,
+) -> IndexHealthReport:
     if config.background_index and index_ready:
-        return _index_health(config)
+        return _index_health(config, engine_version)
     return health
 
 
@@ -877,15 +960,105 @@ def _ensure_background_index_results_are_non_exhaustive(
     return result
 
 
-def _index_health(config: BuildConfig) -> IndexHealth:
+def _index_health(
+    config: BuildConfig, engine_version: str | None = None
+) -> IndexHealthReport:
+    index_dir = index_dir_for_compile_commands_dir(config.compile_commands_dir)
     try:
         cdb = summarize_compile_commands(config.compile_commands_dir)
-        shards = scan_index_shards(
-            index_dir_for_compile_commands_dir(config.compile_commands_dir)
+        shards = scan_index_shards(index_dir)
+        expected_engine_version = engine_version if config.background_index else None
+        if config.background_index and engine_version is None:
+            structural = evaluate_index_health(cdb, shards)
+            if structural.health != IndexHealth.COMPLETE:
+                return structural
+            return replace(
+                structural,
+                health=IndexHealth.UNKNOWN,
+                reason="index_engine_unavailable",
+            )
+        return evaluate_index_health(
+            cdb,
+            shards,
+            expected_engine_version=expected_engine_version,
         )
-        return evaluate_index_health(cdb, shards).health
     except Exception:
-        return IndexHealth.UNKNOWN
+        return IndexHealthReport(
+            health=IndexHealth.UNKNOWN,
+            reason="index_health_error",
+            unique_tu_count=0,
+            idx_shards=0,
+            index_dir=str(index_dir.resolve()),
+        )
+
+
+def _initial_index_health(
+    config: BuildConfig, probe_configured_engine: bool
+) -> IndexHealthReport:
+    engine_version = (
+        detect_clangd_version(config.clangd_path)
+        if config.background_index and probe_configured_engine
+        else None
+    )
+    return _index_health(config, engine_version)
+
+
+def _index_guard_unresolved(
+    query: QueryMeta,
+    health: IndexHealthReport,
+    *,
+    active_config: ActiveConfig,
+    symbol_kind: SymbolKind,
+) -> QueryResult:
+    result = route_observation(
+        query,
+        EngineObservationResult(),
+        index_scope=IndexScope.CURRENT_TU,
+        index_health=IndexHealth.UNKNOWN,
+        index_backend=IndexBackend.BACKGROUND_INDEX,
+        active_config=active_config,
+        symbol_kind=symbol_kind,
+        total_hits=0,
+    )
+    return _with_index_engine_health_note(result, health)
+
+
+def _managed_engine_version(engine: EngineObservation) -> str | None:
+    value = getattr(engine, "engine_version", None)
+    return value if isinstance(value, str) else None
+
+
+def _with_index_engine_health_note(
+    result: QueryResult, health: IndexHealthReport
+) -> QueryResult:
+    notes = [Note(note.code, note.detail) for note in result.notes]
+    if health.reason == "index_engine_mismatch":
+        notes.append(
+            Note(
+                IssueCode.INDEX_ENGINE_MISMATCH,
+                "index built by "
+                f"{health.index_engine_version or 'unknown'}; current engine "
+                f"{health.expected_engine_version or 'unknown'}",
+            )
+        )
+    elif health.reason in {
+        "index_engine_unverified",
+        "index_engine_unavailable",
+    }:
+        detail = (
+            "index engine stamp missing or invalid; engine compatibility unverified"
+            if health.reason == "index_engine_unverified"
+            else "current clangd version unavailable; index compatibility unverified"
+        )
+        replaced = False
+        for note in notes:
+            if note.code == IssueCode.INDEX_UNKNOWN:
+                note.detail = detail
+                replaced = True
+                break
+        if not replaced:
+            notes.append(Note(IssueCode.INDEX_UNKNOWN, detail))
+    return validate_query_result(replace(result, notes=notes))
 
 
 def _first_existing_tu(config: BuildConfig) -> str | None:
@@ -949,8 +1122,14 @@ def _invalid_result(query: QueryMeta, detail: str) -> QueryResult:
     )
 
 
-def _engine_failure(query: QueryMeta, exc: Exception) -> QueryResult:
+def _engine_failure(
+    query: QueryMeta,
+    exc: Exception,
+    *,
+    engine_version: str | None = None,
+) -> QueryResult:
     def raise_observation() -> EngineObservationResult:
         raise exc
 
-    return route_engine_call(query, raise_observation)
+    result = route_engine_call(query, raise_observation)
+    return validate_query_result(replace(result, engine_version=engine_version))

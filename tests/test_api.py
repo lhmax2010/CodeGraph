@@ -38,6 +38,11 @@ from codegraph.credibility import (
     Source,
 )
 from codegraph.engines.protocol import EngineObservationResult
+from codegraph.indexing import (
+    BackgroundIndexConfig,
+    run_background_index,
+    write_index_engine_version,
+)
 from codegraph.types import (
     Candidate,
     CallEdgeResult,
@@ -87,6 +92,14 @@ def write_project(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def touch_complete_index(tmp_path: Path) -> None:
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "lib.idx").write_text("idx", encoding="utf-8")
+    (index_dir / "main.idx").write_text("idx", encoding="utf-8")
+    write_index_engine_version(index_dir, "clangd 18.1.3")
+
+
+def touch_unstamped_complete_index(tmp_path: Path) -> None:
     index_dir = tmp_path / ".cache" / "clangd" / "index"
     index_dir.mkdir(parents=True)
     (index_dir / "lib.idx").write_text("idx", encoding="utf-8")
@@ -143,6 +156,16 @@ def exhaustive_background_index_credibility() -> Credibility:
 @pytest.mark.skipif(shutil.which("clangd") is None, reason="clangd unavailable")
 def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Path):
     lib, main = write_project(tmp_path)
+    build = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            jobs=2,
+            max_wait_seconds=10,
+            poll_interval_seconds=0.1,
+            stable_rounds=2,
+        )
+    )
+    assert build.health_report.health.value == "complete"
     client = CodeGraph(
         BuildConfig(
             "test",
@@ -167,13 +190,16 @@ def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Pa
 
     assert definition.status == QueryStatus.OK
     assert definition.index_health == "complete"
+    assert definition.engine_version is None
     assert [r.data.symbol_id.file for r in definition.semantic_results] == [str(lib)]
     assert search.status == QueryStatus.OK
     assert search.index_health == "complete"
+    assert search.engine_version is None
     assert [r.data.symbol_id.name for r in search.semantic_results] == ["add"]
     assert [r.data.symbol_id.file for r in search.semantic_results] == [str(lib)]
     assert references.status == QueryStatus.OK
     assert references.index_health == "complete"
+    assert references.engine_version is None
     assert references.total_hits is not None
     assert references.total_hits >= 2
     assert all(
@@ -183,6 +209,8 @@ def test_search_symbol_and_get_definition_e2e_with_background_index(tmp_path: Pa
 
 
 class NeverReadyEngine:
+    engine_version = "clangd 18.1.3"
+
     def __enter__(self) -> "NeverReadyEngine":
         return self
 
@@ -957,6 +985,7 @@ def test_find_callers_returns_positive_non_exhaustive_background_index_edges(
 
     assert result.status == QueryStatus.OK
     assert result.query.kind == "relation"
+    assert result.engine_version == "clangd 18.1.3"
     assert result.index_health == "complete"
     assert result.total_hits == 2
     assert len(result.semantic_results) == 2
@@ -1115,6 +1144,7 @@ def test_find_callees_unsupported_returns_failed_without_fallback(tmp_path: Path
     result = client.find_callees("add", str(main), Pos(1, line.index("add")))
 
     assert result.status == QueryStatus.FAILED
+    assert result.engine_version == "clangd 18.1.3"
     assert result.semantic_results == []
     assert result.syntactic_candidates == []
     assert IssueCode.CALLHIERARCHY_UNSUPPORTED in [note.code for note in result.notes]
@@ -1143,6 +1173,7 @@ def test_find_callees_routes_outgoing_edges_when_engine_supports_them(
     result = client.find_callees("main", str(main), Pos(1, line.index("main")))
 
     assert result.status == QueryStatus.OK
+    assert result.engine_version == "clangd 18.1.3"
     assert result.index_health == "complete"
     assert result.total_hits == 1
     edge = result.semantic_results[0].data
@@ -1154,6 +1185,106 @@ def test_find_callees_routes_outgoing_edges_when_engine_supports_them(
         result.semantic_results[0].credibility.coverage.is_exhaustive_within_scope
         is False
     )
+
+
+def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_unstamped_complete_index(tmp_path)
+    engine = ReadyCallEdgesEngine(
+        callers=(call_edge(lib, main, caller_name="helper", callee_name="add"),)
+    )
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_poll_interval=0,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "unknown"
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
+        for item in result.semantic_results
+    )
+    unknown = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "stamp missing" in unknown.detail
+    assert IssueCode.INDEX_ENGINE_MISMATCH not in {note.code for note in result.notes}
+
+
+def test_mismatched_index_engine_emits_note_and_downgrades_health(tmp_path: Path):
+    lib, main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    engine = ReadyCallEdgesEngine(
+        callers=(call_edge(lib, main, caller_name="helper", callee_name="add"),)
+    )
+    engine.engine_version = "clangd 21.1.1"
+    line = main.read_text(encoding="utf-8").splitlines()[1]
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            background_index=True,
+            index_ready_poll_interval=0,
+        ),
+        engine_factory=lambda _cfg: engine,
+    )
+
+    result = client.find_callers("add", str(main), Pos(1, line.index("add")))
+
+    assert result.status == QueryStatus.OK
+    assert result.engine_version == "clangd 21.1.1"
+    assert result.index_health == "unknown"
+    mismatch = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_ENGINE_MISMATCH
+    )
+    assert "clangd 18.1.3" in mismatch.detail
+    assert "clangd 21.1.1" in mismatch.detail
+    assert all(
+        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
+        for item in result.semantic_results
+    )
+
+
+def test_known_engine_mismatch_is_rejected_before_clangd_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    started = False
+
+    def fail_if_started(_config: object) -> NeverReadyEngine:
+        nonlocal started
+        started = True
+        raise AssertionError("clangd must not start for a known mismatched cache")
+
+    monkeypatch.setattr("codegraph.api.ClangdAdapter", fail_if_started)
+    monkeypatch.setattr(
+        "codegraph.api.detect_clangd_version", lambda _path: "clangd 21.1.1"
+    )
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            clangd_path="clangd-21",
+            background_index=True,
+        )
+    )
+
+    result = client.search_symbol("add", kind_filter="function")
+
+    assert started is False
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.status_credibility.symbol_kind.value == "ordinary_function"
+    assert IssueCode.INDEX_ENGINE_MISMATCH in {note.code for note in result.notes}
 
 
 def test_background_index_call_hierarchy_guard_rejects_exhaustive_results(

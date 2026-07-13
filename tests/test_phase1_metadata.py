@@ -431,6 +431,9 @@ def test_query_result_and_candidate_defaults():
     assert candidate.consumer_warning == "not_evidence"
     assert result.semantic_results == []
     assert result.index_health == "unknown"
+    assert result.engine_version is None
+    field_names = list(result.__dataclass_fields__)
+    assert field_names[-3:] == ["total_hits", "notes", "engine_version"]
 
 
 def test_engine_protocol_module_exports_phase1_shapes():

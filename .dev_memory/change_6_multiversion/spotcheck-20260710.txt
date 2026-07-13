@@ -51,3 +51,13 @@ cache_after: (3596, 40127218, 1783656683410402995) mutated= True
 18.1.3: refs=389/62 callers=387/62 callees=failed:None:[] cache_mutated=False
 21.1.1: refs=389/62 callers=386/61 callees=ok:3:['g_return_if_fail_warning', 'g_type_check_instance_is_a', 'gst_element_get_type'] cache_mutated=False
 22.1.8: refs=389/62 callers=386/61 callees=ok:3:['g_return_if_fail_warning', 'g_type_check_instance_is_a', 'gst_element_get_type'] cache_mutated=True
+
+## shared-cache pollution evidence (earlier 21-on-18 experiment)
+Count command:
+`find "$RW_ARM_ROOT/.cache/clangd/index" -type f -name '*.idx' | wc -l`
+
+Experiment command shape:
+`$CLANGD_21 --background-index=true --compile-commands-dir="$RW_ARM_ROOT"`
+followed by LSP initialize/open/query against the clangd-18-built cache.
+
+Observed count: `3593` before -> `3614` after. This established that a newer clangd may rewrite a cache built by another version; it was not a read-only compatibility check. The change_6 implementation therefore compares `.codegraph_engine` before starting the default background-index adapter and refuses a known mismatch.

@@ -14,10 +14,13 @@ from codegraph.indexing import (
     compile_commands_path,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
+    read_index_engine_version,
     rewrite_cdb_for_index,
     run_background_index,
     scan_index_shards,
+    stamp_existing_index,
     summarize_compile_commands,
+    write_index_engine_version,
 )
 
 
@@ -39,6 +42,15 @@ def touch_idx(index_dir: Path, count: int) -> None:
     index_dir.mkdir(parents=True, exist_ok=True)
     for idx in range(count):
         (index_dir / f"tu{idx}.idx").write_text("idx", encoding="utf-8")
+
+
+def fake_clangd(tmp_path: Path, version: str = "18.1.3") -> Path:
+    executable = tmp_path / f"clangd-{version}"
+    executable.write_text(
+        f"#!/bin/sh\necho 'clangd version {version}'\n", encoding="utf-8"
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 def test_compile_commands_summary_deduplicates_unique_tu(tmp_path: Path):
@@ -191,6 +203,44 @@ def test_index_health_no_translation_units_is_unknown(tmp_path: Path):
     assert report.reason == "no_translation_units"
 
 
+def test_index_engine_stamp_has_verified_unverified_and_mismatch_states(
+    tmp_path: Path,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    cdb = summarize_compile_commands(tmp_path)
+
+    unverified = evaluate_index_health(
+        cdb,
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+    assert unverified.health == IndexHealth.UNKNOWN
+    assert unverified.reason == "index_engine_unverified"
+
+    write_index_engine_version(index_dir, "clangd version 21.1.1")
+    verified = evaluate_index_health(
+        cdb,
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+    assert verified.health == IndexHealth.COMPLETE
+    assert verified.index_engine_version == "clangd 21.1.1"
+
+    mismatch = evaluate_index_health(
+        cdb,
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.2",
+    )
+    assert mismatch.health == IndexHealth.UNKNOWN
+    assert mismatch.reason == "index_engine_mismatch"
+    assert mismatch.expected_engine_version == "clangd 21.1.2"
+    assert mismatch.index_engine_version == "clangd 21.1.1"
+
+
 def test_rewrite_cdb_for_index_reuses_existing_rewriter(tmp_path: Path):
     buildroot = tmp_path / "buildroot"
     source_dir = buildroot / "home" / "abuild" / "project"
@@ -296,6 +346,47 @@ def test_background_index_smoke_builds_idx_shard(tmp_path: Path):
     assert result.stable is True
     assert result.shard_report.idx_shards >= 1
     assert result.health_report.health == IndexHealth.COMPLETE
+    assert result.engine_version is not None
+    assert read_index_engine_version(result.index_dir) == result.engine_version
+
+
+def test_background_index_does_not_auto_claim_unstamped_existing_cache(
+    tmp_path: Path,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    touch_idx(index_dir_for_compile_commands_dir(tmp_path), 1)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path)),
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.stable is False
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_unverified"
+    assert read_index_engine_version(result.index_dir) is None
+
+
+def test_stamp_existing_index_requires_health_and_rejects_conflicts(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    clangd_21 = fake_clangd(tmp_path, "21.1.1")
+
+    report = stamp_existing_index(tmp_path, str(clangd_21))
+
+    assert report.health == IndexHealth.COMPLETE
+    assert read_index_engine_version(index_dir) == "clangd 21.1.1"
+    clangd_22 = fake_clangd(tmp_path, "22.1.8")
+    with pytest.raises(ValueError, match="conflicting index engine stamp"):
+        stamp_existing_index(tmp_path, str(clangd_22))
 
 
 def test_background_index_missing_clangd_degrades_to_unknown(tmp_path: Path):
@@ -344,7 +435,10 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     write_cdb(tmp_path, [source])
-    touch_idx(index_dir_for_compile_commands_dir(tmp_path), 1)
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    clangd = fake_clangd(tmp_path)
+    write_index_engine_version(index_dir, "clangd 18.1.3")
 
     completed = subprocess.run(
         [
@@ -353,6 +447,8 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
             "--compile-commands-dir",
             str(tmp_path),
             "--inspect-only",
+            "--clangd",
+            str(clangd),
         ],
         cwd=Path(__file__).resolve().parents[1],
         check=True,
@@ -363,6 +459,47 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
 
     assert payload["health"]["health"] == IndexHealth.COMPLETE
     assert payload["health"]["idx_shards"] == 1
+
+
+def test_build_index_cli_reports_unverified_then_explicitly_stamps_legacy_cache(
+    tmp_path: Path,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    touch_idx(index_dir_for_compile_commands_dir(tmp_path), 1)
+    clangd = fake_clangd(tmp_path, "21.1.1")
+    command = [
+        sys.executable,
+        "tools/build_index.py",
+        "--compile-commands-dir",
+        str(tmp_path),
+        "--inspect-only",
+        "--clangd",
+        str(clangd),
+    ]
+
+    before = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    before_payload = json.loads(before.stdout)
+    assert before_payload["health"]["health"] == IndexHealth.UNKNOWN
+    assert before_payload["health"]["reason"] == "index_engine_unverified"
+
+    stamped = subprocess.run(
+        [*command, "--stamp-existing-index"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    stamped_payload = json.loads(stamped.stdout)
+    assert stamped_payload["health"]["health"] == IndexHealth.COMPLETE
+    assert stamped_payload["engine_version"] == "clangd 21.1.1"
 
 
 def test_build_index_cli_invalid_input_reports_json(tmp_path: Path):

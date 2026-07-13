@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from .credibility import IndexHealth
+from .engine_version import (
+    clangd_version_from_initialize,
+    detect_clangd_version,
+    normalize_clangd_version,
+)
+
+_ENGINE_STAMP_NAME = ".codegraph_engine"
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,8 @@ class IndexHealthReport:
     idx_shards: int
     index_dir: str
     extension_counts: tuple[tuple[str, int], ...] = ()
+    expected_engine_version: str | None = None
+    index_engine_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,7 @@ class BackgroundIndexResult:
     shard_report: IndexShardSummary
     health_report: IndexHealthReport
     stderr_tail: str = ""
+    engine_version: str | None = None
 
 
 def compile_commands_path(path_or_dir: str | Path) -> Path:
@@ -138,19 +148,150 @@ def index_dir_for_compile_commands_dir(path_or_dir: str | Path) -> Path:
     return cdb_path.parent / ".cache" / "clangd" / "index"
 
 
+def index_engine_stamp_path(index_dir: str | Path) -> Path:
+    return Path(index_dir) / _ENGINE_STAMP_NAME
+
+
+def read_index_engine_version(index_dir: str | Path) -> str | None:
+    """Read a canonical engine version; missing stamps are intentionally distinct."""
+
+    path = index_engine_stamp_path(index_dir)
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    normalized = normalize_clangd_version(raw)
+    if normalized is None:
+        raise ValueError(f"invalid index engine stamp: {path}")
+    return normalized
+
+
+def write_index_engine_version(index_dir: str | Path, engine_version: str) -> Path:
+    """Atomically write the exact clangd version that completed this index."""
+
+    normalized = normalize_clangd_version(engine_version)
+    if normalized is None:
+        raise ValueError(f"invalid clangd version: {engine_version!r}")
+    path = index_engine_stamp_path(index_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(normalized + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
 def evaluate_index_health(
     cdb: CompileCommandsSummary,
     shards: IndexShardSummary,
+    *,
+    expected_engine_version: str | None = None,
 ) -> IndexHealthReport:
     if cdb.unique_tu_count <= 0:
-        return _health(IndexHealth.UNKNOWN, "no_translation_units", cdb, shards)
+        return _health(
+            IndexHealth.UNKNOWN,
+            "no_translation_units",
+            cdb,
+            shards,
+            expected_engine_version=expected_engine_version,
+        )
     if not shards.exists:
-        return _health(IndexHealth.UNKNOWN, "index_dir_missing", cdb, shards)
+        return _health(
+            IndexHealth.UNKNOWN,
+            "index_dir_missing",
+            cdb,
+            shards,
+            expected_engine_version=expected_engine_version,
+        )
     if shards.idx_shards == 0 and shards.total_files > 0:
-        return _health(IndexHealth.UNKNOWN, "no_idx_files", cdb, shards)
+        return _health(
+            IndexHealth.UNKNOWN,
+            "no_idx_files",
+            cdb,
+            shards,
+            expected_engine_version=expected_engine_version,
+        )
+    if expected_engine_version is not None:
+        expected = normalize_clangd_version(expected_engine_version)
+        if expected is None:
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_unavailable",
+                cdb,
+                shards,
+                expected_engine_version=expected_engine_version,
+            )
+        try:
+            actual = read_index_engine_version(shards.index_dir)
+        except (OSError, ValueError):
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_unverified",
+                cdb,
+                shards,
+                expected_engine_version=expected,
+            )
+        if actual is None:
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_unverified",
+                cdb,
+                shards,
+                expected_engine_version=expected,
+            )
+        if actual != expected:
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_mismatch",
+                cdb,
+                shards,
+                expected_engine_version=expected,
+                index_engine_version=actual,
+            )
     if shards.idx_shards < cdb.unique_tu_count:
-        return _health(IndexHealth.INCOMPLETE, "shards_lt_unique_tu", cdb, shards)
-    return _health(IndexHealth.COMPLETE, "shards_ge_unique_tu", cdb, shards)
+        return _health(
+            IndexHealth.INCOMPLETE,
+            "shards_lt_unique_tu",
+            cdb,
+            shards,
+            expected_engine_version=expected_engine_version,
+            index_engine_version=expected_engine_version,
+        )
+    return _health(
+        IndexHealth.COMPLETE,
+        "shards_ge_unique_tu",
+        cdb,
+        shards,
+        expected_engine_version=expected_engine_version,
+        index_engine_version=expected_engine_version,
+    )
+
+
+def stamp_existing_index(
+    compile_commands_dir: str | Path, clangd_path: str
+) -> IndexHealthReport:
+    """Explicitly attest a healthy legacy cache with the selected clangd version."""
+
+    cdb = summarize_compile_commands(compile_commands_dir)
+    index_dir = index_dir_for_compile_commands_dir(compile_commands_dir)
+    shards = scan_index_shards(index_dir)
+    structural = evaluate_index_health(cdb, shards)
+    if structural.health != IndexHealth.COMPLETE:
+        raise ValueError(
+            f"cannot stamp index with health={structural.health.value}: "
+            f"{structural.reason}"
+        )
+    engine_version = detect_clangd_version(clangd_path)
+    if engine_version is None:
+        raise ValueError(f"cannot detect clangd version: {clangd_path}")
+    existing = read_index_engine_version(index_dir)
+    if existing is not None and existing != engine_version:
+        raise ValueError(
+            f"conflicting index engine stamp: {existing} != {engine_version}"
+        )
+    write_index_engine_version(index_dir, engine_version)
+    return evaluate_index_health(
+        cdb, scan_index_shards(index_dir), expected_engine_version=engine_version
+    )
 
 
 def rewrite_cdb_for_index(
@@ -197,6 +338,22 @@ def rewrite_cdb_for_index(
 def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult:
     compile_dir = Path(config.compile_commands_dir).resolve()
     cdb = summarize_compile_commands(compile_dir)
+    index_dir = index_dir_for_compile_commands_dir(compile_dir)
+    initial_shards = scan_index_shards(index_dir)
+    engine_version = detect_clangd_version(config.clangd_path)
+    preflight = _build_preflight_health(cdb, initial_shards, engine_version)
+    if preflight is not None:
+        return BackgroundIndexResult(
+            compile_commands_dir=str(compile_dir),
+            index_dir=initial_shards.index_dir,
+            elapsed_seconds=0.0,
+            exit_code=None,
+            stable=False,
+            shard_report=initial_shards,
+            health_report=preflight,
+            stderr_tail=preflight.reason,
+            engine_version=engine_version,
+        )
     start = time.monotonic()
     client: _IndexLspClient | None = None
     stable = False
@@ -208,11 +365,12 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
         trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
         client = _IndexLspClient(config)
         client.initialize()
+        engine_version = client.engine_version or engine_version
         for file in trigger_files:
             client.open_file(file)
         client.request_document_symbols(trigger_files[0])
         stable = _wait_for_stable_shards(
-            index_dir_for_compile_commands_dir(compile_dir),
+            index_dir,
             stable_rounds=config.stable_rounds,
             max_wait_seconds=config.max_wait_seconds,
             poll_interval_seconds=config.poll_interval_seconds,
@@ -228,7 +386,7 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
             stderr_tail = "\n".join(part for part in (stderr_tail, error_tail) if part)
 
     elapsed = time.monotonic() - start
-    shard_report = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
+    shard_report = scan_index_shards(index_dir)
     health = (
         _health(IndexHealth.UNKNOWN, error_reason, cdb, shard_report)
         if error_reason is not None
@@ -240,6 +398,39 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
             )
         )
     )
+    if health.health == IndexHealth.COMPLETE:
+        if engine_version is None:
+            health = _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_unavailable",
+                cdb,
+                shard_report,
+            )
+        else:
+            try:
+                write_index_engine_version(index_dir, engine_version)
+                shard_report = scan_index_shards(index_dir)
+                health = evaluate_index_health(
+                    cdb,
+                    shard_report,
+                    expected_engine_version=engine_version,
+                )
+            except (OSError, ValueError) as exc:
+                health = _health(
+                    IndexHealth.UNKNOWN,
+                    "index_engine_stamp_write_failed",
+                    cdb,
+                    shard_report,
+                    expected_engine_version=engine_version,
+                )
+                stderr_tail = "\n".join(
+                    part
+                    for part in (
+                        stderr_tail,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    if part
+                )
     return BackgroundIndexResult(
         compile_commands_dir=str(compile_dir),
         index_dir=shard_report.index_dir,
@@ -249,6 +440,7 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
         shard_report=shard_report,
         health_report=health,
         stderr_tail=stderr_tail,
+        engine_version=engine_version,
     )
 
 
@@ -257,6 +449,9 @@ def _health(
     reason: str,
     cdb: CompileCommandsSummary,
     shards: IndexShardSummary,
+    *,
+    expected_engine_version: str | None = None,
+    index_engine_version: str | None = None,
 ) -> IndexHealthReport:
     return IndexHealthReport(
         health=health,
@@ -265,7 +460,24 @@ def _health(
         idx_shards=shards.idx_shards,
         index_dir=shards.index_dir,
         extension_counts=shards.extension_counts,
+        expected_engine_version=expected_engine_version,
+        index_engine_version=index_engine_version,
     )
+
+
+def _build_preflight_health(
+    cdb: CompileCommandsSummary,
+    shards: IndexShardSummary,
+    engine_version: str | None,
+) -> IndexHealthReport | None:
+    if shards.idx_shards == 0:
+        return None
+    if engine_version is None:
+        return _health(IndexHealth.UNKNOWN, "index_engine_unavailable", cdb, shards)
+    report = evaluate_index_health(cdb, shards, expected_engine_version=engine_version)
+    if report.reason in {"index_engine_unverified", "index_engine_mismatch"}:
+        return report
+    return None
 
 
 def _entry_args(entry: dict[str, Any]) -> tuple[str, ...]:
@@ -341,6 +553,7 @@ class _IndexLspClient:
         self._responses: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._stderr_lines: list[str] = []
+        self.engine_version: str | None = None
         args = [
             config.clangd_path,
             "--background-index=true",
@@ -364,11 +577,12 @@ class _IndexLspClient:
 
     def initialize(self) -> None:
         root = str(Path(self._config.compile_commands_dir).resolve())
-        self.request(
+        result = self.request(
             "initialize",
             {"processId": os.getpid(), "rootUri": "file://" + root, "capabilities": {}},
             timeout=20,
         )
+        self.engine_version = clangd_version_from_initialize(result)
         self.notify("initialized", {})
 
     def open_file(self, file: str) -> None:

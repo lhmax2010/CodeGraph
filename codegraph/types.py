@@ -48,6 +48,7 @@ class IssueCode(str, Enum):
     PATH_TRAVERSAL_BLOCKED = "path_traversal_blocked"
     INDEX_INCOMPLETE = "index_incomplete"
     INDEX_UNKNOWN = "index_unknown"
+    INDEX_ENGINE_MISMATCH = "index_engine_mismatch"
     INDEX_SHARD_EXT_FALLBACK = "index_shard_ext_fallback"
     DEPENDENCY_INCOMPLETE = "dependency_incomplete"
     SYMBOL_AMBIGUOUS = "symbol_ambiguous"
@@ -127,3 +128,4 @@ class QueryResult:
     index_health: Literal["complete", "incomplete", "unknown"] = "unknown"
     total_hits: int | None = None
     notes: list[Note] = field(default_factory=list)
+    engine_version: str | None = None
