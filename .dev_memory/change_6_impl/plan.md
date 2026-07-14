@@ -9,7 +9,7 @@
 
 ## Baseline
 - 分支基线：`main` @ `7cd0bd1`
-- baseline 命令：`PYTHONPATH=.:tools /home/linhao/Toolchain/development/CodeGraph/.venv/bin/python -m pytest tests/ -q`
+- baseline 命令：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q`
 - baseline 结果：`159 passed in 3.74s`
 
 ## 风险档
@@ -61,4 +61,4 @@
 ## 依赖前置阶段
 - 已 Merge：P1-P8。
 - 已冻结设计：`docs/design.md v1.5.0`，`docs/design_changes/change_6.md`。
-- 真机工具链：`/home/linhao/clang-toolchains/` 下 clangd 18/21/22 与版本专用 rw_arm cache。
+- 真机工具链：`$CLANG_TOOLCHAINS_ROOT` 下 clangd 18/21/22 与版本专用 rw_arm cache。

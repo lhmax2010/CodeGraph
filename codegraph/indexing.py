@@ -185,15 +185,8 @@ def evaluate_index_health(
     shards: IndexShardSummary,
     *,
     expected_engine_version: str | None = None,
+    check_engine_ownership: bool = False,
 ) -> IndexHealthReport:
-    if cdb.unique_tu_count <= 0:
-        return _health(
-            IndexHealth.UNKNOWN,
-            "no_translation_units",
-            cdb,
-            shards,
-            expected_engine_version=expected_engine_version,
-        )
     if not shards.exists:
         return _health(
             IndexHealth.UNKNOWN,
@@ -202,26 +195,17 @@ def evaluate_index_health(
             shards,
             expected_engine_version=expected_engine_version,
         )
-    if shards.idx_shards == 0 and shards.total_files > 0:
-        return _health(
-            IndexHealth.UNKNOWN,
-            "no_idx_files",
-            cdb,
-            shards,
-            expected_engine_version=expected_engine_version,
-        )
-    if expected_engine_version is not None:
-        expected = normalize_clangd_version(expected_engine_version)
-        if expected is None:
-            return _health(
-                IndexHealth.UNKNOWN,
-                "index_engine_unavailable",
-                cdb,
-                shards,
-                expected_engine_version=expected_engine_version,
-            )
+
+    verify_ownership = check_engine_ownership or expected_engine_version is not None
+    expected = normalize_clangd_version(expected_engine_version)
+    actual: str | None = None
+    if verify_ownership:
+        stamp_path = index_engine_stamp_path(shards.index_dir)
+        stamp_exists = stamp_path.exists()
         try:
-            actual = read_index_engine_version(shards.index_dir)
+            actual = (
+                read_index_engine_version(shards.index_dir) if stamp_exists else None
+            )
         except (OSError, ValueError):
             return _health(
                 IndexHealth.UNKNOWN,
@@ -230,7 +214,15 @@ def evaluate_index_health(
                 shards,
                 expected_engine_version=expected,
             )
-        if actual is None:
+        if actual is not None and expected is None:
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_unavailable",
+                cdb,
+                shards,
+                index_engine_version=actual,
+            )
+        if actual is None and shards.total_files > 0:
             return _health(
                 IndexHealth.UNKNOWN,
                 "index_engine_unverified",
@@ -238,7 +230,7 @@ def evaluate_index_health(
                 shards,
                 expected_engine_version=expected,
             )
-        if actual != expected:
+        if actual is not None and actual != expected:
             return _health(
                 IndexHealth.UNKNOWN,
                 "index_engine_mismatch",
@@ -247,22 +239,41 @@ def evaluate_index_health(
                 expected_engine_version=expected,
                 index_engine_version=actual,
             )
+
+    if cdb.unique_tu_count <= 0:
+        return _health(
+            IndexHealth.UNKNOWN,
+            "no_translation_units",
+            cdb,
+            shards,
+            expected_engine_version=expected,
+            index_engine_version=actual,
+        )
+    if shards.idx_shards == 0 and shards.total_files > 0:
+        return _health(
+            IndexHealth.UNKNOWN,
+            "no_idx_files",
+            cdb,
+            shards,
+            expected_engine_version=expected,
+            index_engine_version=actual,
+        )
     if shards.idx_shards < cdb.unique_tu_count:
         return _health(
             IndexHealth.INCOMPLETE,
             "shards_lt_unique_tu",
             cdb,
             shards,
-            expected_engine_version=expected_engine_version,
-            index_engine_version=expected_engine_version,
+            expected_engine_version=expected,
+            index_engine_version=actual,
         )
     return _health(
         IndexHealth.COMPLETE,
         "shards_ge_unique_tu",
         cdb,
         shards,
-        expected_engine_version=expected_engine_version,
-        index_engine_version=expected_engine_version,
+        expected_engine_version=expected,
+        index_engine_version=actual,
     )
 
 
@@ -470,12 +481,19 @@ def _build_preflight_health(
     shards: IndexShardSummary,
     engine_version: str | None,
 ) -> IndexHealthReport | None:
-    if shards.idx_shards == 0:
+    if not shards.exists or shards.total_files == 0:
         return None
-    if engine_version is None:
-        return _health(IndexHealth.UNKNOWN, "index_engine_unavailable", cdb, shards)
-    report = evaluate_index_health(cdb, shards, expected_engine_version=engine_version)
-    if report.reason in {"index_engine_unverified", "index_engine_mismatch"}:
+    report = evaluate_index_health(
+        cdb,
+        shards,
+        expected_engine_version=engine_version,
+        check_engine_ownership=True,
+    )
+    if report.reason in {
+        "index_engine_unavailable",
+        "index_engine_unverified",
+        "index_engine_mismatch",
+    }:
         return report
     return None
 

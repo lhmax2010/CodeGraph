@@ -372,6 +372,52 @@ def test_background_index_does_not_auto_claim_unstamped_existing_cache(
     assert read_index_engine_version(result.index_dir) is None
 
 
+def test_mismatched_stamp_blocks_with_zero_idx(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    write_index_engine_version(index_dir, "clangd 18.1.3")
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.stable is False
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_mismatch"
+    assert result.shard_report.idx_shards == 0
+    assert read_index_engine_version(index_dir) == "clangd 18.1.3"
+
+
+def test_unstamped_non_idx_cache_is_not_auto_claimed(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    index_dir.mkdir(parents=True)
+    marker = index_dir / "partial.tmp"
+    marker.write_text("partial", encoding="utf-8")
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.stable is False
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_unverified"
+    assert marker.read_text(encoding="utf-8") == "partial"
+    assert read_index_engine_version(index_dir) is None
+
+
 def test_stamp_existing_index_requires_health_and_rejects_conflicts(tmp_path: Path):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
@@ -459,6 +505,42 @@ def test_build_index_cli_inspect_only(tmp_path: Path):
 
     assert payload["health"]["health"] == IndexHealth.COMPLETE
     assert payload["health"]["idx_shards"] == 1
+
+
+def test_build_index_cli_inspect_missing_clangd_reports_engine_unavailable(
+    tmp_path: Path,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    write_index_engine_version(index_dir, "clangd 18.1.3")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "tools/build_index.py",
+            "--compile-commands-dir",
+            str(tmp_path),
+            "--inspect-only",
+            "--clangd",
+            str(tmp_path / "missing-clangd"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 1
+    assert payload["health"]["health"] == IndexHealth.UNKNOWN
+    assert payload["health"]["reason"] == "index_engine_unavailable"
+    assert payload["health"]["index_engine_version"] == "clangd 18.1.3"
+    assert "error" not in payload
+    assert "Traceback" not in completed.stderr
 
 
 def test_build_index_cli_reports_unverified_then_explicitly_stamps_legacy_cache(

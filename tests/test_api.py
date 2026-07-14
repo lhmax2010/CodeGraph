@@ -106,6 +106,10 @@ def touch_unstamped_complete_index(tmp_path: Path) -> None:
     (index_dir / "main.idx").write_text("idx", encoding="utf-8")
 
 
+def fake_engine_version_probe(_clangd_path: str) -> str:
+    return "clangd 18.1.3"
+
+
 def loc(name: str, file: Path, line: int = 1) -> LocationResult:
     pos = Pos(line, 4)
     return LocationResult(
@@ -529,6 +533,7 @@ def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     touch_complete_index(tmp_path)
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyEngine(
             (loc("add", lib), loc("address_like_noise", lib))
         ),
@@ -545,6 +550,7 @@ def test_search_symbol_offset_keeps_exact_total_hits(tmp_path: Path):
     lib, main = write_project(tmp_path)
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyEngine(
             (
                 loc("needle", lib),
@@ -573,6 +579,7 @@ def test_search_symbol_empty_page_with_matches_is_not_not_found(tmp_path: Path):
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyEngine(
             (
                 loc("sentinel", lib),
@@ -604,6 +611,7 @@ def test_search_symbol_truncated_fuzzy_window_cannot_assert_not_found(
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -626,6 +634,7 @@ def test_search_symbol_without_kind_filter_cannot_assert_not_found(tmp_path: Pat
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
     )
 
@@ -649,6 +658,7 @@ def test_search_symbol_function_filter_keeps_kind_but_cannot_assert_not_found(
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
     )
 
@@ -665,6 +675,7 @@ def test_background_index_off_cannot_use_complete_health_for_not_found(tmp_path:
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: NeverReadyEngine(),
     )
 
@@ -686,6 +697,7 @@ def test_get_definition_without_kind_filter_cannot_assert_not_found(tmp_path: Pa
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: ReadyNoDefinitionEngine(loc("sentinel", lib)),
     )
 
@@ -716,6 +728,7 @@ def test_find_references_returns_positive_non_exhaustive_background_index_result
             index_ready_poll_interval=0,
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -763,6 +776,7 @@ def test_find_references_default_warmup_avoids_query_and_probe_target(
             index_ready_probe_path_suffix="lib.c",
             index_ready_poll_interval=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -805,6 +819,7 @@ def test_find_references_waits_for_query_references_to_stabilize(
             index_ready_probe_path_suffix="lib.c",
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -854,6 +869,7 @@ def test_find_references_does_not_treat_short_reference_plateau_as_ready(
             index_ready_probe_path_suffix="lib.c",
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -886,6 +902,7 @@ def test_find_references_empty_background_index_result_is_unresolved(
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -916,6 +933,7 @@ def test_find_references_not_ready_marks_partial_references_current_tu(
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -943,6 +961,7 @@ def test_find_references_background_index_off_marks_local_references_current_tu(
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -978,6 +997,7 @@ def test_find_callers_returns_positive_non_exhaustive_background_index_edges(
             index_ready_poll_interval=0,
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1020,6 +1040,7 @@ def test_find_callers_waits_for_call_edges_to_stabilize(tmp_path: Path):
             index_ready_poll_interval=0,
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1063,6 +1084,7 @@ def test_find_callers_does_not_treat_short_call_edge_plateau_as_ready(
             index_ready_poll_interval=0,
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1093,6 +1115,7 @@ def test_find_callers_not_ready_marks_local_edges_current_tu(tmp_path: Path):
             background_index=True,
             index_ready_timeout=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1121,6 +1144,7 @@ def test_find_callers_empty_background_index_result_is_unresolved(tmp_path: Path
             background_index=True,
             index_ready_timeout=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1138,6 +1162,7 @@ def test_find_callees_unsupported_returns_failed_without_fallback(tmp_path: Path
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: UnsupportedCalleesEngine(),
     )
 
@@ -1167,6 +1192,7 @@ def test_find_callees_routes_outgoing_edges_when_engine_supports_them(
             index_ready_poll_interval=0,
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1201,6 +1227,7 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
             background_index=True,
             index_ready_poll_interval=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1219,7 +1246,7 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
     assert IssueCode.INDEX_ENGINE_MISMATCH not in {note.code for note in result.notes}
 
 
-def test_mismatched_index_engine_emits_note_and_downgrades_health(tmp_path: Path):
+def test_probe_claim_is_rechecked_against_started_engine(tmp_path: Path):
     lib, main = write_project(tmp_path)
     touch_complete_index(tmp_path)
     engine = ReadyCallEdgesEngine(
@@ -1234,22 +1261,24 @@ def test_mismatched_index_engine_emits_note_and_downgrades_health(tmp_path: Path
             background_index=True,
             index_ready_poll_interval=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
     result = client.find_callers("add", str(main), Pos(1, line.index("add")))
 
-    assert result.status == QueryStatus.OK
+    assert result.status == QueryStatus.UNRESOLVED
     assert result.engine_version == "clangd 21.1.1"
     assert result.index_health == "unknown"
+    assert result.semantic_results == []
+    assert engine.find_callers_calls == 0
     mismatch = next(
         note for note in result.notes if note.code == IssueCode.INDEX_ENGINE_MISMATCH
     )
     assert "clangd 18.1.3" in mismatch.detail
     assert "clangd 21.1.1" in mismatch.detail
-    assert all(
-        item.credibility.coverage.index_scope is IndexScope.CURRENT_TU
-        for item in result.semantic_results
+    assert (
+        result.status_credibility.coverage.index_scope is not IndexScope.INDEXED_PROJECT
     )
 
 
@@ -1285,6 +1314,39 @@ def test_known_engine_mismatch_is_rejected_before_clangd_starts(
     assert result.index_health == "unknown"
     assert result.status_credibility.symbol_kind.value == "ordinary_function"
     assert IssueCode.INDEX_ENGINE_MISMATCH in {note.code for note in result.notes}
+
+
+def test_stamped_cache_with_unknown_current_version_fails_closed(tmp_path: Path):
+    write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    client = CodeGraph(
+        BuildConfig(
+            "test",
+            str(tmp_path),
+            clangd_path="missing-clangd",
+            background_index=True,
+        ),
+        engine_version_probe=lambda _path: None,
+        engine_factory=count_factory_calls,
+    )
+
+    result = client.search_symbol("add", kind_filter="function")
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert result.status_credibility.symbol_kind.value == "ordinary_function"
+    unavailable = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "version unavailable" in unavailable.detail
 
 
 def test_background_index_call_hierarchy_guard_rejects_exhaustive_results(
@@ -1387,6 +1449,7 @@ def test_ready_probe_is_not_satisfied_by_target_header_hit(tmp_path: Path):
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1414,6 +1477,7 @@ def test_ready_probe_requires_configured_path_suffix(tmp_path: Path):
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="other.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1437,6 +1501,7 @@ def test_ready_probe_without_path_suffix_is_not_ready(tmp_path: Path):
             background_index=True,
             index_ready_probe_symbol="sentinel",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1543,6 +1608,7 @@ def test_prewarm_warms_cache_but_query_still_proves_readiness(tmp_path: Path):
             index_ready_probe_path_suffix="lib.c",
             warmup_file=str(main),
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1575,6 +1641,7 @@ def test_prewarm_failure_does_not_disable_later_query_warm(tmp_path: Path):
             index_ready_probe_symbol="sentinel",
             index_ready_probe_path_suffix="lib.c",
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: next(engines),
     )
 
@@ -1645,7 +1712,11 @@ def test_prewarm_uses_independent_longer_timeout(tmp_path: Path):
         request_timeout=5,
         warmup_file=str(main),
     )
-    client = CodeGraph(config, engine_factory=lambda _cfg: engine)
+    client = CodeGraph(
+        config,
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=lambda _cfg: engine,
+    )
 
     assert client.prewarm() is False
 
@@ -1686,6 +1757,7 @@ def test_query_warm_still_uses_query_timeout_not_prewarm_timeout(tmp_path: Path)
             index_ready_probe_path_suffix="lib.c",
             request_timeout=5,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: engine,
     )
 
@@ -1702,6 +1774,7 @@ def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: 
     _lib, main = write_project(tmp_path)
     client = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: FailingEngine(),
     )
 
@@ -1716,6 +1789,7 @@ def test_invalid_inputs_and_engine_failures_return_structured_results(tmp_path: 
 
     definition_failed = CodeGraph(
         BuildConfig("test", str(tmp_path), background_index=False),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: DefinitionFailingEngine(),
     ).get_definition("add", str(main), Pos(1, 0))
     assert definition_failed.status == QueryStatus.FAILED
@@ -1752,6 +1826,7 @@ def test_background_index_not_ready_downgrades_health_to_avoid_false_not_found(
             background_index=True,
             index_ready_timeout=0,
         ),
+        engine_version_probe=fake_engine_version_probe,
         engine_factory=lambda _cfg: NeverReadyEngine(),
     )
 

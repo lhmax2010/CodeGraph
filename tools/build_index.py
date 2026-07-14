@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,7 @@ from codegraph.indexing import (  # noqa: E402 - script bootstraps repo root fir
 from codegraph.engine_version import (  # noqa: E402 - same bootstrap.
     detect_clangd_version,
 )
+from codegraph.credibility import IndexHealth  # noqa: E402 - same bootstrap.
 
 
 def _dump_json(payload: object) -> None:
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    return_code = 0
 
     try:
         if args.input_cdb:
@@ -95,18 +97,31 @@ def main(argv: list[str] | None = None) -> int:
             shards = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
             engine_version = detect_clangd_version(args.clangd)
             if engine_version is None:
-                raise ValueError(f"cannot detect clangd version: {args.clangd}")
-            health = (
-                stamp_existing_index(compile_dir, args.clangd)
-                if args.stamp_existing_index
-                else evaluate_index_health(
-                    cdb, shards, expected_engine_version=engine_version
+                health = replace(
+                    evaluate_index_health(
+                        cdb,
+                        shards,
+                        check_engine_ownership=True,
+                    ),
+                    health=IndexHealth.UNKNOWN,
+                    reason="index_engine_unavailable",
                 )
-            )
-            if args.stamp_existing_index:
-                shards = scan_index_shards(
-                    index_dir_for_compile_commands_dir(compile_dir)
+                return_code = 1
+            else:
+                health = (
+                    stamp_existing_index(compile_dir, args.clangd)
+                    if args.stamp_existing_index
+                    else evaluate_index_health(
+                        cdb,
+                        shards,
+                        expected_engine_version=engine_version,
+                        check_engine_ownership=True,
+                    )
                 )
+                if args.stamp_existing_index:
+                    shards = scan_index_shards(
+                        index_dir_for_compile_commands_dir(compile_dir)
+                    )
             payload = {
                 "rewrite": asdict(rewrite) if rewrite is not None else None,
                 "compile_commands": asdict(cdb),
@@ -145,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _dump_json(payload)
-    return 0
+    return return_code
 
 
 if __name__ == "__main__":

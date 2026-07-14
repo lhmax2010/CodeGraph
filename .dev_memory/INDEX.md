@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：change_6_impl（待用户核对）
+- 当前活跃 stage：change_6_impl（review 修复完成，待异构复核）
 - 最后已确认 stage（已 Merge）：stage08_call_hierarchy
 - 设计基线：docs/design.md v1.5.0 Frozen（2026-07-13；R1 change_2/change_3/change_4/change_5/change_6 已应用；change_6 已冻结，多版本 clangd support）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
