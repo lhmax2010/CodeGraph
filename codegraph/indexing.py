@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -23,6 +24,26 @@ from .engine_version import (
 )
 
 _ENGINE_STAMP_NAME = ".codegraph_engine"
+_BUILD_INDEX_BLOCKING_REASONS = {
+    "index_engine_mismatch",
+    "index_engine_stamp_invalid",
+    "index_engine_unavailable",
+    "index_engine_unverified",
+    "index_engine_version_inconsistent",
+}
+
+
+class _IndexEngineStampError(ValueError):
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        existing_version: str | None = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.existing_version = existing_version
 
 
 @dataclass(frozen=True)
@@ -159,6 +180,8 @@ def read_index_engine_version(index_dir: str | Path) -> str | None:
     try:
         raw = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        if path.is_symlink():
+            raise ValueError(f"invalid index engine stamp: {path}")
         return None
     normalized = normalize_clangd_version(raw)
     if normalized is None:
@@ -167,17 +190,59 @@ def read_index_engine_version(index_dir: str | Path) -> str | None:
 
 
 def write_index_engine_version(index_dir: str | Path, engine_version: str) -> Path:
-    """Atomically write the exact clangd version that completed this index."""
+    """Create an engine stamp without ever replacing existing ownership."""
 
     normalized = normalize_clangd_version(engine_version)
     if normalized is None:
         raise ValueError(f"invalid clangd version: {engine_version!r}")
     path = index_engine_stamp_path(index_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(normalized + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
+
+    try:
+        existing = read_index_engine_version(index_dir)
+    except (OSError, ValueError) as exc:
+        raise _IndexEngineStampError(
+            "index_engine_stamp_invalid",
+            f"index engine stamp is invalid or unreadable: {path}",
+        ) from exc
+    if existing is not None:
+        if existing != normalized:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"conflicting index engine stamp: {existing} != {normalized}",
+                existing_version=existing,
+            )
+        return path
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o644)
+            fh.write(normalized + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = read_index_engine_version(index_dir)
+            except (OSError, ValueError) as exc:
+                raise _IndexEngineStampError(
+                    "index_engine_stamp_invalid",
+                    f"index engine stamp is invalid or unreadable: {path}",
+                ) from exc
+            if existing != normalized:
+                raise _IndexEngineStampError(
+                    "index_engine_mismatch",
+                    f"conflicting index engine stamp: {existing} != {normalized}",
+                    existing_version=existing,
+                )
+        return path
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def evaluate_index_health(
@@ -201,7 +266,7 @@ def evaluate_index_health(
     actual: str | None = None
     if verify_ownership:
         stamp_path = index_engine_stamp_path(shards.index_dir)
-        stamp_exists = stamp_path.exists()
+        stamp_exists = stamp_path.exists() or stamp_path.is_symlink()
         try:
             actual = (
                 read_index_engine_version(shards.index_dir) if stamp_exists else None
@@ -209,7 +274,7 @@ def evaluate_index_health(
         except (OSError, ValueError):
             return _health(
                 IndexHealth.UNKNOWN,
-                "index_engine_unverified",
+                "index_engine_stamp_invalid",
                 cdb,
                 shards,
                 expected_engine_version=expected,
@@ -294,7 +359,14 @@ def stamp_existing_index(
     engine_version = detect_clangd_version(clangd_path)
     if engine_version is None:
         raise ValueError(f"cannot detect clangd version: {clangd_path}")
-    existing = read_index_engine_version(index_dir)
+    try:
+        existing = read_index_engine_version(index_dir)
+    except (OSError, ValueError) as exc:
+        raise _IndexEngineStampError(
+            "index_engine_stamp_invalid",
+            f"index engine stamp is invalid or unreadable: "
+            f"{index_engine_stamp_path(index_dir)}",
+        ) from exc
     if existing is not None and existing != engine_version:
         raise ValueError(
             f"conflicting index engine stamp: {existing} != {engine_version}"
@@ -352,6 +424,7 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
     index_dir = index_dir_for_compile_commands_dir(compile_dir)
     initial_shards = scan_index_shards(index_dir)
     engine_version = detect_clangd_version(config.clangd_path)
+    probed_engine_version = engine_version
     preflight = _build_preflight_health(cdb, initial_shards, engine_version)
     if preflight is not None:
         return BackgroundIndexResult(
@@ -372,21 +445,31 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
     exit_code: int | None = None
     error_reason: str | None = None
     error_tail = ""
+    ownership_health: IndexHealthReport | None = None
     try:
         trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
         client = _IndexLspClient(config)
         client.initialize()
-        engine_version = client.engine_version or engine_version
-        for file in trigger_files:
-            client.open_file(file)
-        client.request_document_symbols(trigger_files[0])
-        stable = _wait_for_stable_shards(
-            index_dir,
-            stable_rounds=config.stable_rounds,
-            max_wait_seconds=config.max_wait_seconds,
-            poll_interval_seconds=config.poll_interval_seconds,
+        engine_version = client.engine_version
+        ownership_health = _post_initialize_preflight_health(
+            cdb,
+            scan_index_shards(index_dir),
+            engine_version,
+            probed_engine_version,
         )
-        client.shutdown()
+        if ownership_health is not None:
+            client.shutdown()
+        else:
+            for file in trigger_files:
+                client.open_file(file)
+            client.request_document_symbols(trigger_files[0])
+            stable = _wait_for_stable_shards(
+                index_dir,
+                stable_rounds=config.stable_rounds,
+                max_wait_seconds=config.max_wait_seconds,
+                poll_interval_seconds=config.poll_interval_seconds,
+            )
+            client.shutdown()
     except Exception as exc:
         error_reason = "index_build_failed"
         error_tail = f"{type(exc).__name__}: {exc}"
@@ -398,17 +481,16 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
 
     elapsed = time.monotonic() - start
     shard_report = scan_index_shards(index_dir)
-    health = (
-        _health(IndexHealth.UNKNOWN, error_reason, cdb, shard_report)
-        if error_reason is not None
-        else (
-            evaluate_index_health(cdb, shard_report)
-            if stable and exit_code == 0
-            else _health(
-                IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report
-            )
+    if ownership_health is not None:
+        health = ownership_health
+    elif error_reason is not None:
+        health = _health(IndexHealth.UNKNOWN, error_reason, cdb, shard_report)
+    elif stable and exit_code == 0:
+        health = evaluate_index_health(cdb, shard_report)
+    else:
+        health = _health(
+            IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report
         )
-    )
     if health.health == IndexHealth.COMPLETE:
         if engine_version is None:
             health = _health(
@@ -425,6 +507,23 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
                     cdb,
                     shard_report,
                     expected_engine_version=engine_version,
+                )
+            except _IndexEngineStampError as exc:
+                health = _health(
+                    IndexHealth.UNKNOWN,
+                    exc.reason,
+                    cdb,
+                    shard_report,
+                    expected_engine_version=engine_version,
+                    index_engine_version=exc.existing_version,
+                )
+                stderr_tail = "\n".join(
+                    part
+                    for part in (
+                        stderr_tail,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    if part
                 )
             except (OSError, ValueError) as exc:
                 health = _health(
@@ -481,20 +580,50 @@ def _build_preflight_health(
     shards: IndexShardSummary,
     engine_version: str | None,
 ) -> IndexHealthReport | None:
-    if not shards.exists or shards.total_files == 0:
-        return None
     report = evaluate_index_health(
         cdb,
         shards,
         expected_engine_version=engine_version,
         check_engine_ownership=True,
     )
-    if report.reason in {
-        "index_engine_unavailable",
-        "index_engine_unverified",
-        "index_engine_mismatch",
-    }:
+    if report.reason in _BUILD_INDEX_BLOCKING_REASONS:
         return report
+    return None
+
+
+def _post_initialize_preflight_health(
+    cdb: CompileCommandsSummary,
+    shards: IndexShardSummary,
+    engine_version: str | None,
+    probed_engine_version: str | None,
+) -> IndexHealthReport | None:
+    report = evaluate_index_health(
+        cdb,
+        shards,
+        expected_engine_version=engine_version,
+        check_engine_ownership=True,
+    )
+    if report.reason == "index_engine_stamp_invalid":
+        return report
+    if engine_version is None:
+        return _health(
+            IndexHealth.UNKNOWN,
+            "index_engine_unavailable",
+            cdb,
+            shards,
+            index_engine_version=report.index_engine_version,
+        )
+    if report.reason in _BUILD_INDEX_BLOCKING_REASONS:
+        return report
+    if probed_engine_version is not None and engine_version != probed_engine_version:
+        return _health(
+            IndexHealth.UNKNOWN,
+            "index_engine_version_inconsistent",
+            cdb,
+            shards,
+            expected_engine_version=probed_engine_version,
+            index_engine_version=engine_version,
+        )
     return None
 
 

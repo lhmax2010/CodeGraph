@@ -28,6 +28,17 @@ from codegraph.engine_version import (  # noqa: E402 - same bootstrap.
 )
 from codegraph.credibility import IndexHealth  # noqa: E402 - same bootstrap.
 
+_INDEX_ENGINE_BLOCKING_REASONS = {
+    "index_engine_mismatch",
+    "index_engine_stamp_invalid",
+    "index_engine_unavailable",
+    "index_engine_version_inconsistent",
+}
+_BUILD_INDEX_BLOCKING_REASONS = {
+    *_INDEX_ENGINE_BLOCKING_REASONS,
+    "index_engine_unverified",
+}
+
 
 def _dump_json(payload: object) -> None:
     json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
@@ -97,31 +108,42 @@ def main(argv: list[str] | None = None) -> int:
             shards = scan_index_shards(index_dir_for_compile_commands_dir(compile_dir))
             engine_version = detect_clangd_version(args.clangd)
             if engine_version is None:
-                health = replace(
-                    evaluate_index_health(
-                        cdb,
-                        shards,
-                        check_engine_ownership=True,
-                    ),
-                    health=IndexHealth.UNKNOWN,
-                    reason="index_engine_unavailable",
+                health = evaluate_index_health(
+                    cdb,
+                    shards,
+                    check_engine_ownership=True,
                 )
+                if health.reason != "index_engine_stamp_invalid":
+                    health = replace(
+                        health,
+                        health=IndexHealth.UNKNOWN,
+                        reason="index_engine_unavailable",
+                    )
                 return_code = 1
             else:
-                health = (
-                    stamp_existing_index(compile_dir, args.clangd)
-                    if args.stamp_existing_index
-                    else evaluate_index_health(
+                if args.stamp_existing_index:
+                    ownership = evaluate_index_health(
                         cdb,
                         shards,
                         expected_engine_version=engine_version,
                         check_engine_ownership=True,
                     )
-                )
-                if args.stamp_existing_index:
-                    shards = scan_index_shards(
-                        index_dir_for_compile_commands_dir(compile_dir)
+                    if ownership.reason in _INDEX_ENGINE_BLOCKING_REASONS:
+                        health = ownership
+                    else:
+                        health = stamp_existing_index(compile_dir, args.clangd)
+                        shards = scan_index_shards(
+                            index_dir_for_compile_commands_dir(compile_dir)
+                        )
+                else:
+                    health = evaluate_index_health(
+                        cdb,
+                        shards,
+                        expected_engine_version=engine_version,
+                        check_engine_ownership=True,
                     )
+            if health.reason in _INDEX_ENGINE_BLOCKING_REASONS:
+                return_code = 1
             payload = {
                 "rewrite": asdict(rewrite) if rewrite is not None else None,
                 "compile_commands": asdict(cdb),
@@ -144,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
                 "rewrite": asdict(rewrite) if rewrite is not None else None,
                 "build": asdict(result),
             }
+            if result.health_report.reason in _BUILD_INDEX_BLOCKING_REASONS:
+                return_code = 1
     except (
         FileNotFoundError,
         NotADirectoryError,

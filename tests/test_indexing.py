@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from codegraph.indexing import (
     compile_commands_path,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
+    index_engine_stamp_path,
     read_index_engine_version,
     rewrite_cdb_for_index,
     run_background_index,
@@ -241,6 +244,65 @@ def test_index_engine_stamp_has_verified_unverified_and_mismatch_states(
     assert mismatch.index_engine_version == "clangd 21.1.1"
 
 
+def test_index_engine_stamp_write_is_create_only_idempotent_and_conflict_safe(
+    tmp_path: Path,
+):
+    index_dir = tmp_path / "index"
+
+    stamp = write_index_engine_version(index_dir, "clangd 21.1.1")
+    initial_stat = stamp.stat()
+
+    assert read_index_engine_version(index_dir) == "clangd 21.1.1"
+    assert write_index_engine_version(index_dir, "clangd 21.1.1") == stamp
+    assert stamp.stat().st_ino == initial_stat.st_ino
+    assert stamp.stat().st_mtime_ns == initial_stat.st_mtime_ns
+
+    with pytest.raises(ValueError, match="conflicting index engine stamp"):
+        write_index_engine_version(index_dir, "clangd 22.1.8")
+    assert read_index_engine_version(index_dir) == "clangd 21.1.1"
+
+
+@pytest.mark.parametrize("stamp_state", ["invalid", "directory"])
+def test_index_engine_stamp_write_rejects_invalid_existing_ownership(
+    tmp_path: Path, stamp_state: str
+):
+    index_dir = tmp_path / "index"
+    stamp = index_engine_stamp_path(index_dir)
+    stamp.parent.mkdir(parents=True)
+    if stamp_state == "invalid":
+        stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
+    else:
+        stamp.mkdir()
+
+    with pytest.raises(ValueError, match="invalid or unreadable"):
+        write_index_engine_version(index_dir, "clangd 21.1.1")
+
+    if stamp_state == "invalid":
+        assert stamp.read_text(encoding="utf-8") == "not-a-clangd-version\n"
+    else:
+        assert stamp.is_dir()
+
+
+def test_index_engine_stamp_concurrent_creation_is_exclusive(tmp_path: Path):
+    index_dir = tmp_path / "index"
+    versions = ("clangd 21.1.1", "clangd 22.1.8")
+
+    def attempt(version: str) -> tuple[str, str]:
+        try:
+            write_index_engine_version(index_dir, version)
+        except ValueError as exc:
+            return "rejected", str(exc)
+        return "created", version
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(attempt, versions))
+
+    assert [state for state, _ in outcomes].count("created") == 1
+    assert [state for state, _ in outcomes].count("rejected") == 1
+    assert read_index_engine_version(index_dir) in versions
+    assert not tuple(index_dir.glob("*.tmp"))
+
+
 def test_rewrite_cdb_for_index_reuses_existing_rewriter(tmp_path: Path):
     buildroot = tmp_path / "buildroot"
     source_dir = buildroot / "home" / "abuild" / "project"
@@ -350,6 +412,70 @@ def test_background_index_smoke_builds_idx_shard(tmp_path: Path):
     assert read_index_engine_version(result.index_dir) == result.engine_version
 
 
+@pytest.mark.parametrize(
+    ("existing_stamp", "expected_reason"),
+    [
+        (True, "index_engine_mismatch"),
+        (False, "index_engine_version_inconsistent"),
+    ],
+)
+def test_background_index_rechecks_lsp_version_before_opening_tu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_stamp: bool,
+    expected_reason: str,
+):
+    real_clangd = shutil.which("clangd")
+    if real_clangd is None:
+        pytest.skip("clangd is not installed")
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    stamp = index_engine_stamp_path(index_dir)
+    if existing_stamp:
+        write_index_engine_version(index_dir, "clangd 99.99.99")
+    stamp_before = stamp.read_bytes() if stamp.is_file() else None
+    wrapper = tmp_path / "clangd-version-liar"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+        "  echo 'clangd version 99.99.99'\n"
+        "  exit 0\n"
+        "fi\n"
+        f'exec {shlex.quote(real_clangd)} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    opened_files: list[str] = []
+
+    def reject_open(_client: object, file: str) -> None:
+        opened_files.append(file)
+        raise AssertionError("ownership must be checked before opening a TU")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient.open_file", reject_open)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(wrapper),
+            max_wait_seconds=0.1,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+    stamp_after = stamp.read_bytes() if stamp.is_file() else None
+    ownership_overwritten = stamp_before != stamp_after
+
+    assert result.stable is False
+    assert result.health_report.reason == expected_reason
+    if existing_stamp:
+        assert result.health_report.index_engine_version == "clangd 99.99.99"
+    assert result.engine_version != "clangd 99.99.99"
+    assert opened_files == []
+    assert ownership_overwritten is False
+
+
 def test_background_index_does_not_auto_claim_unstamped_existing_cache(
     tmp_path: Path,
 ):
@@ -416,6 +542,54 @@ def test_unstamped_non_idx_cache_is_not_auto_claimed(tmp_path: Path):
     assert result.health_report.reason == "index_engine_unverified"
     assert marker.read_text(encoding="utf-8") == "partial"
     assert read_index_engine_version(index_dir) is None
+
+
+@pytest.mark.parametrize("stamp_state", ["invalid", "directory", "unreadable"])
+def test_invalid_engine_stamp_blocks_background_index_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stamp_state: str,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    index_dir.mkdir(parents=True)
+    stamp = index_engine_stamp_path(index_dir)
+    if stamp_state == "directory":
+        stamp.mkdir()
+    else:
+        stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
+    if stamp_state == "unreadable":
+        original_read_text = Path.read_text
+
+        def deny_stamp_read(path: Path, *args: object, **kwargs: object) -> str:
+            if path == stamp:
+                raise PermissionError(f"permission denied: {path}")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_stamp_read)
+    client_started = False
+
+    def fail_if_started(_config: object) -> object:
+        nonlocal client_started
+        client_started = True
+        raise AssertionError("invalid stamp must block before clangd starts")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", fail_if_started)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert client_started is False
+    assert result.exit_code is None
+    assert result.stable is False
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_stamp_invalid"
 
 
 def test_stamp_existing_index_requires_health_and_rejects_conflicts(tmp_path: Path):
@@ -543,6 +717,46 @@ def test_build_index_cli_inspect_missing_clangd_reports_engine_unavailable(
     assert "Traceback" not in completed.stderr
 
 
+@pytest.mark.parametrize("stamp_existing", [False, True])
+def test_build_index_cli_invalid_stamp_reports_structured_block(
+    tmp_path: Path, stamp_existing: bool
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    index_engine_stamp_path(index_dir).write_text(
+        "not-a-clangd-version\n", encoding="utf-8"
+    )
+
+    command = [
+        sys.executable,
+        "tools/build_index.py",
+        "--compile-commands-dir",
+        str(tmp_path),
+        "--inspect-only",
+        "--clangd",
+        str(fake_clangd(tmp_path, "21.1.1")),
+    ]
+    if stamp_existing:
+        command.append("--stamp-existing-index")
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 1
+    assert payload["health"]["health"] == IndexHealth.UNKNOWN
+    assert payload["health"]["reason"] == "index_engine_stamp_invalid"
+    assert "Traceback" not in completed.stderr
+
+
 def test_build_index_cli_reports_unverified_then_explicitly_stamps_legacy_cache(
     tmp_path: Path,
 ):
@@ -582,6 +796,36 @@ def test_build_index_cli_reports_unverified_then_explicitly_stamps_legacy_cache(
     stamped_payload = json.loads(stamped.stdout)
     assert stamped_payload["health"]["health"] == IndexHealth.COMPLETE
     assert stamped_payload["engine_version"] == "clangd 21.1.1"
+
+
+def test_build_index_cli_build_rejects_unverified_existing_cache(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    touch_idx(index_dir_for_compile_commands_dir(tmp_path), 1)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "tools/build_index.py",
+            "--compile-commands-dir",
+            str(tmp_path),
+            "--clangd",
+            str(fake_clangd(tmp_path, "21.1.1")),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 1
+    assert payload["build"]["health_report"]["reason"] == "index_engine_unverified"
+    assert (
+        read_index_engine_version(index_dir_for_compile_commands_dir(tmp_path)) is None
+    )
 
 
 def test_build_index_cli_invalid_input_reports_json(tmp_path: Path):

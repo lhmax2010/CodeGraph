@@ -40,6 +40,7 @@ from codegraph.credibility import (
 from codegraph.engines.protocol import EngineObservationResult
 from codegraph.indexing import (
     BackgroundIndexConfig,
+    index_engine_stamp_path,
     run_background_index,
     write_index_engine_version,
 )
@@ -1337,6 +1338,7 @@ def test_stamped_cache_with_unknown_current_version_fails_closed(tmp_path: Path)
         engine_factory=count_factory_calls,
     )
 
+    assert client.prewarm() is False
     result = client.search_symbol("add", kind_filter="function")
 
     assert factory_calls == 0
@@ -1347,6 +1349,55 @@ def test_stamped_cache_with_unknown_current_version_fails_closed(tmp_path: Path)
         note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
     )
     assert "version unavailable" in unavailable.detail
+
+
+@pytest.mark.parametrize("stamp_state", ["invalid", "directory", "unreadable"])
+def test_invalid_engine_stamp_blocks_before_engine_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stamp_state: str,
+):
+    write_project(tmp_path)
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    stamp = index_engine_stamp_path(index_dir)
+    if stamp_state == "directory":
+        stamp.mkdir()
+    else:
+        stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
+    if stamp_state == "unreadable":
+        original_read_text = Path.read_text
+
+        def deny_stamp_read(path: Path, *args: object, **kwargs: object) -> str:
+            if path == stamp:
+                raise PermissionError(f"permission denied: {path}")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_stamp_read)
+
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=count_factory_calls,
+    )
+
+    assert client.prewarm() is False
+    result = client.search_symbol("add", kind_filter="function")
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    invalid = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "stamp invalid or unreadable" in invalid.detail
 
 
 def test_background_index_call_hierarchy_guard_rejects_exhaustive_results(

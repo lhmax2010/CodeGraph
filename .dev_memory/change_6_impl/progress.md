@@ -43,3 +43,8 @@
 - 2026-07-14：当前机器一度 load average >11 且 swap 满，18 首次 prewarm 超时后只返回 2 refs/unknown（诚实降级）；热态复跑 prewarm 成功并恢复 389/62，未把降级结果冒充项目级完整结果。
 - 2026-07-14：修复后 deterministic gate：172 passed；coverage 总计 92%（api 行 94%、indexing 行 91%）；ruff、black --check、mypy、compileall、git diff --check 全绿。等待修复后的异构多路 review。
 - 2026-07-14：崩溃恢复后重新核验工作区与全部 deterministic gate，仍为 172 passed 且静态 gate 全绿。gstack Claude 前两次完整复核分别无输出卡住/180s 超时，第三次按两个 MAJOR 聚焦最终函数、调用点、核心测试与真机证据，明确给出 `VERDICT: APPROVE`，无遗留 BLOCKER/MAJOR；失败尝试未计作通过。
+- 2026-07-14：第三轮守卫加固采用两层物理约束：`index_engine_stamp_invalid` 复用 `INDEX_UNKNOWN` 但列为 blocking；`write_index_engine_version()` 只允许缺失 stamp 的排他首建或同版本幂等，冲突/损坏均拒绝。builder 在 LSP initialize 得到 serverInfo 实际版本后、任何 TU 打开前再次检查所有权；API 缺 stamp 仍保守可用，非空未验证 cache 的 builder 仍不自动认领。
+- 2026-07-14：stamp 首建采用“完整临时文件 + `link()` 排他发布”，既不暴露半写内容，也不以 replace 覆盖并发 owner；若目标已出现，只接受同版本幂等，冲突/损坏均 fail-closed。自审补掉 stamp 为目录且零 `.idx` 时的 preflight 早退，并让 LSP serverInfo 与 `--version` 不一致在无 stamp 新库上也于首个 TU 前停止。
+- 2026-07-14：第三轮 deterministic gate：187 passed；coverage 总计 92%（api 92%、indexing 89% 综合，二者行覆盖均超过 90%）；ruff、black --check、mypy、compileall、git diff --check 全绿。新增 wrapper、create-only/幂等/冲突/并发、非法内容/目录/PermissionError、CLI structured block 与 unverified 回归。
+- 2026-07-14：真机 wrapper（`--version` 伪装 99.99.99、实际 exec 系统 clangd）在有 stamp/无 stamp 两种路径均于 `open_file` 前拦截，stamp 未变/未创建。版本专用 cache：21/22 references 389/62、callees 3；18 高负载首轮诚实降级 2/unknown，热态复跑恢复 389/62、callees unsupported；三套分片快照均不变。21 对 18 cache 在 0.085s 内 mismatch 拦截且快照不变。
+- 2026-07-14：第三轮异构复核：Codex 按“路径 × stamp 状态 × 版本状态”自审无遗留 BLOCKER/MAJOR；gstack Claude 完整 diff 首次 180s 超时未计票，拆成生产守卫聚焦审查后明确 `VERDICT: APPROVE`。Kimi CLI 复探 180s 无输出超时，未计票；不以能力失败补票。

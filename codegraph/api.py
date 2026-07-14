@@ -50,6 +50,7 @@ _DEFAULT_PREWARM_INDEX_READY_TIMEOUT = 30.0
 _STABLE_MATCHES = 3
 _INDEX_ENGINE_BLOCKING_REASONS = {
     "index_engine_mismatch",
+    "index_engine_stamp_invalid",
     "index_engine_unavailable",
 }
 EngineVersionProbe = Callable[[str], str | None]
@@ -281,6 +282,7 @@ class CodeGraph:
                 return ready and health.reason not in {
                     "index_engine_unverified",
                     "index_engine_mismatch",
+                    "index_engine_stamp_invalid",
                     "index_engine_unavailable",
                 }
         except Exception:
@@ -1084,14 +1086,22 @@ def _with_index_engine_health_note(
             )
         )
     elif health.reason in {
+        "index_engine_stamp_invalid",
         "index_engine_unverified",
         "index_engine_unavailable",
     }:
-        detail = (
-            "index engine stamp missing or invalid; engine compatibility unverified"
-            if health.reason == "index_engine_unverified"
-            else "current clangd version unavailable; index compatibility unverified"
-        )
+        details = {
+            "index_engine_stamp_invalid": (
+                "index engine stamp invalid or unreadable; index ownership unverified"
+            ),
+            "index_engine_unverified": (
+                "index engine stamp missing; engine compatibility unverified"
+            ),
+            "index_engine_unavailable": (
+                "current clangd version unavailable; index compatibility unverified"
+            ),
+        }
+        detail = details[health.reason]
         replaced = False
         for note in notes:
             if note.code == IssueCode.INDEX_UNKNOWN:
