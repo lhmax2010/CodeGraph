@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
 
 import pytest
 
+import codegraph.indexing as indexing_module
 from codegraph.api import (
     BuildConfig,
     CodeGraph,
@@ -31,6 +33,7 @@ from codegraph.credibility import (
     Credibility,
     DependencyScope,
     IndexBackend,
+    IndexHealth,
     IndexScope,
     QueryKind,
     Relation,
@@ -40,6 +43,7 @@ from codegraph.credibility import (
 from codegraph.engines.protocol import EngineObservationResult
 from codegraph.indexing import (
     BackgroundIndexConfig,
+    IndexHealthReport,
     index_engine_stamp_path,
     run_background_index,
     write_index_engine_version,
@@ -545,6 +549,24 @@ def test_search_symbol_filters_exact_name_and_supports_background_index_off(
     assert result.status == QueryStatus.OK
     assert result.index_health == "unknown"
     assert [r.data.symbol_id.name for r in result.semantic_results] == ["add"]
+
+
+def test_index_health_error_does_not_block_single_tu_mode(tmp_path: Path):
+    lib, _main = write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.chmod(0)
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=False),
+        engine_factory=lambda _cfg: ReadyEngine((loc("add", lib),)),
+    )
+    try:
+        result = client.search_symbol("add")
+    finally:
+        index_dir.chmod(0o700)
+
+    assert result.status == QueryStatus.OK
+    assert result.index_health == "unknown"
 
 
 def test_search_symbol_offset_keeps_exact_total_hits(tmp_path: Path):
@@ -1351,7 +1373,10 @@ def test_stamped_cache_with_unknown_current_version_fails_closed(tmp_path: Path)
     assert "version unavailable" in unavailable.detail
 
 
-@pytest.mark.parametrize("stamp_state", ["invalid", "directory", "unreadable"])
+@pytest.mark.parametrize(
+    "stamp_state",
+    ["invalid", "directory", "unreadable", "valid_symlink", "dangling_symlink"],
+)
 def test_invalid_engine_stamp_blocks_before_engine_factory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1363,17 +1388,24 @@ def test_invalid_engine_stamp_blocks_before_engine_factory(
     stamp = index_engine_stamp_path(index_dir)
     if stamp_state == "directory":
         stamp.mkdir()
+    elif stamp_state in {"valid_symlink", "dangling_symlink"}:
+        target = tmp_path / "outside-stamp"
+        if stamp_state == "valid_symlink":
+            target.write_text("clangd 18.1.3\n", encoding="utf-8")
+        stamp.symlink_to(target)
     else:
         stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
     if stamp_state == "unreadable":
-        original_read_text = Path.read_text
+        original_open_stamp = indexing_module._open_index_engine_stamp
 
-        def deny_stamp_read(path: Path, *args: object, **kwargs: object) -> str:
+        def deny_stamp_read(path: Path) -> tuple[int, os.stat_result] | None:
             if path == stamp:
                 raise PermissionError(f"permission denied: {path}")
-            return original_read_text(path, *args, **kwargs)
+            return original_open_stamp(path)
 
-        monkeypatch.setattr(Path, "read_text", deny_stamp_read)
+        monkeypatch.setattr(
+            indexing_module, "_open_index_engine_stamp", deny_stamp_read
+        )
 
     factory_calls = 0
 
@@ -1398,6 +1430,107 @@ def test_invalid_engine_stamp_blocks_before_engine_factory(
         note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
     )
     assert "stamp invalid or unreadable" in invalid.detail
+
+
+def test_index_health_error_blocks_before_engine_factory(tmp_path: Path):
+    write_project(tmp_path)
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "partial.idx").write_text("partial", encoding="utf-8")
+    index_dir.chmod(0)
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=count_factory_calls,
+    )
+
+    try:
+        assert client.prewarm() is False
+        result = client.search_symbol("add", kind_filter="function")
+    finally:
+        index_dir.chmod(0o700)
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    unknown = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "health evaluation failed" in unknown.detail
+
+
+def test_build_in_progress_blocks_before_engine_factory(tmp_path: Path):
+    write_project(tmp_path)
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "lib.idx").write_text("idx", encoding="utf-8")
+    (index_dir / "main.idx").write_text("idx", encoding="utf-8")
+    claim = indexing_module._claim_index_engine_version(index_dir, "clangd 18.1.3")
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=count_factory_calls,
+    )
+    try:
+        result = client.search_symbol("add", kind_filter="function")
+    finally:
+        claim.release(rollback=True)
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    unknown = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "build in progress" in unknown.detail
+
+
+def test_stamp_write_failure_maps_to_index_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    write_project(tmp_path)
+    factory_calls = 0
+
+    def failed_health(*_args: object, **_kwargs: object) -> IndexHealthReport:
+        return IndexHealthReport(
+            health=IndexHealth.UNKNOWN,
+            reason="index_engine_stamp_write_failed",
+            unique_tu_count=0,
+            idx_shards=0,
+            index_dir=str(tmp_path / ".cache" / "clangd" / "index"),
+        )
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    monkeypatch.setattr("codegraph.api._index_health", failed_health)
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_factory=count_factory_calls,
+    )
+
+    result = client.search_symbol("add", kind_filter="function")
+
+    assert factory_calls == 0
+    unknown = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "stamp write failed" in unknown.detail
 
 
 def test_background_index_call_hierarchy_guard_rejects_exhaustive_results(

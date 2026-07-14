@@ -2,8 +2,8 @@
 > 开发过程持续追加，记录思考与决策，而非仅结果。
 
 ## 关键决策
-- 版本戳只在完整建库成功、分片稳定、health 判定完成后写入；查询路径只读。
-  - 原因：中途失败或未稳定的索引不能获得版本认证。
+- 版本戳在 LSP 实际版本复核后、首个 TU 打开前原子认领并持锁；仅完整建库成功、分片稳定且 health COMPLETE 时保留，正常失败只回滚本 builder 创建且 inode 未变的 stamp。
+  - 原因：所有权必须先于 clangd 分片副作用；同时中途失败或未稳定的索引不能长期获得版本认证。
 - 版本戳采用规范化完整版本（含 patch，如 `clangd 21.1.1`）精确匹配。
   - 原因：change_6 以保守隔离优先，暂不假设同 major/minor 的索引兼容。
 - 存量 cache 无 stamp 视为 `index_engine_unverified`：health 降为 unknown，复用 `INDEX_UNKNOWN` 并写明 detail；不新增冻结设计之外的 IssueCode。
@@ -21,7 +21,7 @@
 - `codegraph/engine_version.py`：stdlib-only clangd 版本规范化、LSP initialize 提取与二进制探测。
 - `codegraph/types.py`：纯附加 `IssueCode.INDEX_ENGINE_MISMATCH` 与 `QueryResult.engine_version`。
 - `codegraph/engines/clangd_adapter.py`：记录当前 clangd 版本；callHierarchy unsupported 收紧为明确 method-not-found / JSON-RPC `-32601`。
-- `codegraph/indexing.py` / `tools/build_index.py`：`.codegraph_engine` 三态、建库成功后写 stamp、建库前污染守卫、显式 `--stamp-existing-index`。
+- `codegraph/indexing.py` / `tools/build_index.py`：`.codegraph_engine` 三态、建库前原子认领与同版本互斥、失败 inode 回滚、建库前污染守卫、显式 `--stamp-existing-index`。
 - `codegraph/api.py`：BuildConfig 版本隔离守卫、预启动 mismatch 拦截、health/scope 诚实降级、仅 call graph 传播 `engine_version`。
 - 测试：stamp 三态、patch 精确匹配、显式迁移、拒绝自动认领、预启动拦截、版本元数据、unsupported 收紧及 P1-P8 回归。
 
@@ -48,3 +48,13 @@
 - 2026-07-14：第三轮 deterministic gate：187 passed；coverage 总计 92%（api 92%、indexing 89% 综合，二者行覆盖均超过 90%）；ruff、black --check、mypy、compileall、git diff --check 全绿。新增 wrapper、create-only/幂等/冲突/并发、非法内容/目录/PermissionError、CLI structured block 与 unverified 回归。
 - 2026-07-14：真机 wrapper（`--version` 伪装 99.99.99、实际 exec 系统 clangd）在有 stamp/无 stamp 两种路径均于 `open_file` 前拦截，stamp 未变/未创建。版本专用 cache：21/22 references 389/62、callees 3；18 高负载首轮诚实降级 2/unknown，热态复跑恢复 389/62、callees unsupported；三套分片快照均不变。21 对 18 cache 在 0.085s 内 mismatch 拦截且快照不变。
 - 2026-07-14：第三轮异构复核：Codex 按“路径 × stamp 状态 × 版本状态”自审无遗留 BLOCKER/MAJOR；gstack Claude 完整 diff 首次 180s 超时未计票，拆成生产守卫聚焦审查后明确 `VERDICT: APPROVE`。Kimi CLI 复探 180s 无输出超时，未计票；不以能力失败补票。
+- 2026-07-14：第四轮并发加固改为“认领先于副作用”：LSP serverInfo 与 `--version` 通过后，builder 在任何 `open_file` 前用完整临时文件 + `link()` 原子发布 stamp；临时 inode 先持 `flock`，发布后删除临时文件名但锁随 fd/inode 保持。跨版本竞争由 stamp 版本拒绝，同版本竞争由 stamp 自身的非阻塞排他锁返回 `index_engine_build_in_progress`，不增加锁文件。
+- 2026-07-14：正常建库失败仅在“本 builder 创建 + 路径仍指向同 dev/inode”时回滚 stamp；硬崩自动释放 flock 但留下保守认领，同版本可后续重建、异版本继续被挡。`index_engine_build_in_progress` 与 `index_engine_stamp_write_failed` 均为 reason，API 复用 `INDEX_UNKNOWN` 并提供结构化 detail，未新增冻结 IssueCode。
+- 2026-07-14：stamp 读写统一采用 `lstat` + `O_NOFOLLOW` + `fstat` inode 复核，任何有效/悬空 symlink 均为 `index_engine_stamp_invalid`；索引目录扫描失败为 blocking `index_health_error`，API/builder/CLI 均不启动 engine。`--stamp-existing-index` 的 OSError 改为结构化 `index_engine_stamp_write_failed`，并在 CLI help/change_6 §6.1 明示其为操作者 provenance 断言，已污染的原始 3614 分片 cache 禁止追认。
+- 2026-07-14：第四轮聚焦测试 `102 passed`；barrier 异版本/同版本/失败回滚与 fd 锁测试连续 10 轮全过（每轮 4 passed），ruff 聚焦检查全绿。完整 deterministic gate 与真机回归待执行。
+- 2026-07-14：第四轮真实 clangd barrier：21.1.1 与 22.1.8 同时 initialize 后竞争同一临时 cache，仅 21 打开 TU 并产 1 shard，22 在副作用前 `index_engine_mismatch`；两个 21.1.1 同时竞争时仅一个打开 TU，另一个 `index_engine_build_in_progress`。两组最终 stamp/分片均只属于胜者。
+- 2026-07-14：三版本真实回归：18/21/22 prewarm 分别 11.554s/6.328s/6.392s，references 均 389/62、OK/complete、`is_exhaustive=False`；18 callees FAILED + unsupported，21/22 callees OK + 3，engine_version 正确。查询耗时 refs 3.742s/3.623s/3.624s；三套 cache 的 idx 数量/字节/max mtime 前后完全不变。clangd 21 错配 18 cache 在 0.120s 内 UNRESOLVED + mismatch，快照不变。
+- 2026-07-14：第四轮完整 deterministic UT 最终复跑 `217 passed in 4.30s`；ruff 与 mypy 全绿。coverage/black/compileall/diff-check 将在提交前最终复跑并以 result.md 为准。
+- 2026-07-14：第四轮 gstack Claude 独立 review 两次均未形成投票：完整 delta 与仅 production-code 聚焦 delta 各在 180s 内无响应文本（第二次 response 为空），均按能力失败/超时处理，不计 APPROVE。分支推送后交用户侧其余异构路线复核，全票前不 merge。
+- 2026-07-14：提交前最终 gate：`217 passed in 5.29s`，coverage 总计 92%、`api.py` 93%、核心 `indexing.py` 90%；ruff、black --check、mypy、compileall、git diff --check 全绿。
+- 2026-07-14：针对“initialize 本身是否早于 claim 写分片”补真实 21/22 延时诊断：fresh CDB 上两进程完成 initialize 后强制停 2s，claim/open_file 尚未执行时两次观测均为 0 `.idx`；随后竞争仍仅胜者打开 TU并产 1 shard。当前 clangd 21/22 实证支持“首个 TU 打开是该建库流程的分片触发点”，未发现 pre-claim 副作用窗口。

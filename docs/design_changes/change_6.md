@@ -151,6 +151,11 @@ found → FAILED）已是第一个实例；需补：clangd 版本探测 + 结果
   打开索引时比对当前 clangd 版本；不匹配 → 新 IssueCode `INDEX_ENGINE_MISMATCH` +
   index_health 降级（不静默使用可能被别版本改写的索引）。
   优先级：实现期（change_6 代码落地时）或二期；design 层已把隔离定为强约束，此为执行侧防线。
+- **存量索引追认是操作者断言，不是自动检测**：`--stamp-existing-index` 只能在操作者已经从
+  外部证据确认建库版本时使用。无 stamp 的 cache 无法从分片内容反推出历史 builder；若追认成
+  错误版本，会把一份错版索引伪装成可验证的健康索引。来源不确定时必须在空目录中用目标 clangd
+  重建。真机原始 `rw_arm` cache 曾被 clangd 21 接触并从 3593 增至 3614 分片，已发生跨版本
+  污染，禁止对该目录执行追认。
 
 ## 7. 已验证事实（存档）
 - 三版本编译：clangd 21.1.1（build 52min）、22.1.8（build 58min）到 /home，18 用系统版本。

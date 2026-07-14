@@ -49,9 +49,12 @@ _KIND_FILTERS = {
 _DEFAULT_PREWARM_INDEX_READY_TIMEOUT = 30.0
 _STABLE_MATCHES = 3
 _INDEX_ENGINE_BLOCKING_REASONS = {
+    "index_engine_build_in_progress",
     "index_engine_mismatch",
     "index_engine_stamp_invalid",
+    "index_engine_stamp_write_failed",
     "index_engine_unavailable",
+    "index_health_error",
 }
 EngineVersionProbe = Callable[[str], str | None]
 
@@ -263,13 +266,13 @@ class CodeGraph:
         """Warm clangd/index caches; each user query still proves readiness itself."""
 
         health = _initial_index_health(self.config, self._engine_version_probe)
-        if _index_engine_blocks_use(health):
+        if _index_engine_blocks_use(health, self.config.background_index):
             return False
         try:
             with self._engine_factory(self._clangd_config()) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
-                if _index_engine_blocks_use(health):
+                if _index_engine_blocks_use(health, self.config.background_index):
                     return False
                 ready = _warm_background_index(
                     engine,
@@ -302,7 +305,7 @@ class CodeGraph:
             return _invalid_result(query, f"invalid kind_filter: {kind_filter}")
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
-        if _index_engine_blocks_use(health):
+        if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
                 health,
@@ -314,7 +317,7 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config()) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
-                if _index_engine_blocks_use(health):
+                if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
                         health,
@@ -380,7 +383,7 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
-        if _index_engine_blocks_use(health):
+        if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
                 health,
@@ -392,7 +395,7 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config()) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
-                if _index_engine_blocks_use(health):
+                if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
                         health,
@@ -442,7 +445,7 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
-        if _index_engine_blocks_use(health):
+        if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
                 health,
@@ -456,7 +459,7 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config()) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
-                if _index_engine_blocks_use(health):
+                if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
                         health,
@@ -570,7 +573,7 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
-        if _index_engine_blocks_use(health):
+        if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
                 health,
@@ -584,7 +587,7 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config()) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
-                if _index_engine_blocks_use(health):
+                if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
                         health,
@@ -1018,7 +1021,7 @@ def _index_health(
             ),
             check_engine_ownership=config.background_index,
         )
-    except Exception:
+    except (OSError, ValueError):
         return IndexHealthReport(
             health=IndexHealth.UNKNOWN,
             reason="index_health_error",
@@ -1040,8 +1043,8 @@ def _initial_index_health(
     return _index_health(config, engine_version)
 
 
-def _index_engine_blocks_use(health: IndexHealthReport) -> bool:
-    return health.reason in _INDEX_ENGINE_BLOCKING_REASONS
+def _index_engine_blocks_use(health: IndexHealthReport, background_index: bool) -> bool:
+    return background_index and health.reason in _INDEX_ENGINE_BLOCKING_REASONS
 
 
 def _index_guard_unresolved(
@@ -1086,19 +1089,31 @@ def _with_index_engine_health_note(
             )
         )
     elif health.reason in {
+        "index_engine_build_in_progress",
         "index_engine_stamp_invalid",
+        "index_engine_stamp_write_failed",
         "index_engine_unverified",
         "index_engine_unavailable",
+        "index_health_error",
     }:
         details = {
+            "index_engine_build_in_progress": (
+                "index build in progress; index ownership is temporarily unavailable"
+            ),
             "index_engine_stamp_invalid": (
                 "index engine stamp invalid or unreadable; index ownership unverified"
+            ),
+            "index_engine_stamp_write_failed": (
+                "index engine stamp write failed; index ownership unverified"
             ),
             "index_engine_unverified": (
                 "index engine stamp missing; engine compatibility unverified"
             ),
             "index_engine_unavailable": (
                 "current clangd version unavailable; index compatibility unverified"
+            ),
+            "index_health_error": (
+                "index health evaluation failed; index ownership unverified"
             ),
         }
         detail = details[health.reason]
