@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -1242,6 +1243,20 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
     engine = ReadyCallEdgesEngine(
         callers=(call_edge(lib, main, caller_name="helper", callee_name="add"),)
     )
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    lock = indexing_module.acquire_index_cache_lock(index_dir, exclusive=False)
+    lock.release()
+    before = {
+        str(path.relative_to(tmp_path)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in (tmp_path / ".cache").rglob("*")
+        if path.is_file()
+    }
+    seen_configs: list[object] = []
+
+    def factory(config: object) -> ReadyCallEdgesEngine:
+        seen_configs.append(config)
+        return engine
+
     line = main.read_text(encoding="utf-8").splitlines()[1]
     client = CodeGraph(
         BuildConfig(
@@ -1251,7 +1266,7 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
             index_ready_poll_interval=0,
         ),
         engine_version_probe=fake_engine_version_probe,
-        engine_factory=lambda _cfg: engine,
+        engine_factory=factory,
     )
 
     result = client.find_callers("add", str(main), Pos(1, line.index("add")))
@@ -1267,6 +1282,39 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
     )
     assert "stamp missing" in unknown.detail
     assert IssueCode.INDEX_ENGINE_MISMATCH not in {note.code for note in result.notes}
+    assert len(seen_configs) == 1
+    assert getattr(seen_configs[0], "background_index") is False
+    after = {
+        str(path.relative_to(tmp_path)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in (tmp_path / ".cache").rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_missing_index_ownership_also_disables_background_index_writes(
+    tmp_path: Path,
+):
+    write_project(tmp_path)
+    seen_configs: list[object] = []
+
+    def factory(config: object) -> NeverReadyEngine:
+        seen_configs.append(config)
+        return NeverReadyEngine()
+
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=factory,
+    )
+
+    result = client.search_symbol("missing", kind_filter="function")
+
+    assert result.status == QueryStatus.UNRESOLVED
+    assert len(seen_configs) == 1
+    assert getattr(seen_configs[0], "background_index") is False
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    assert not tuple(index_dir.glob("*.idx"))
 
 
 def test_probe_claim_is_rechecked_against_started_engine(tmp_path: Path):
@@ -1377,15 +1425,21 @@ def test_stamped_cache_with_unknown_current_version_fails_closed(tmp_path: Path)
     "stamp_state",
     ["invalid", "directory", "unreadable", "valid_symlink", "dangling_symlink"],
 )
+@pytest.mark.parametrize("marker_kind", ["committed", "dirty"])
 def test_invalid_engine_stamp_blocks_before_engine_factory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stamp_state: str,
+    marker_kind: str,
 ):
     write_project(tmp_path)
     index_dir = tmp_path / ".cache" / "clangd" / "index"
     index_dir.mkdir(parents=True)
-    stamp = index_engine_stamp_path(index_dir)
+    stamp = (
+        index_engine_stamp_path(index_dir)
+        if marker_kind == "committed"
+        else indexing_module.index_engine_building_path(index_dir)
+    )
     if stamp_state == "directory":
         stamp.mkdir()
     elif stamp_state in {"valid_symlink", "dangling_symlink"}:
@@ -1396,16 +1450,14 @@ def test_invalid_engine_stamp_blocks_before_engine_factory(
     else:
         stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
     if stamp_state == "unreadable":
-        original_open_stamp = indexing_module._open_index_engine_stamp
+        original_open_stamp = indexing_module._open_engine_marker
 
         def deny_stamp_read(path: Path) -> tuple[int, os.stat_result] | None:
             if path == stamp:
                 raise PermissionError(f"permission denied: {path}")
             return original_open_stamp(path)
 
-        monkeypatch.setattr(
-            indexing_module, "_open_index_engine_stamp", deny_stamp_read
-        )
+        monkeypatch.setattr(indexing_module, "_open_engine_marker", deny_stamp_read)
 
     factory_calls = 0
 
@@ -1472,7 +1524,7 @@ def test_build_in_progress_blocks_before_engine_factory(tmp_path: Path):
     index_dir.mkdir(parents=True)
     (index_dir / "lib.idx").write_text("idx", encoding="utf-8")
     (index_dir / "main.idx").write_text("idx", encoding="utf-8")
-    claim = indexing_module._claim_index_engine_version(index_dir, "clangd 18.1.3")
+    lock = indexing_module.acquire_index_cache_lock(index_dir, exclusive=True)
     factory_calls = 0
 
     def count_factory_calls(_config: object) -> NeverReadyEngine:
@@ -1488,7 +1540,7 @@ def test_build_in_progress_blocks_before_engine_factory(tmp_path: Path):
     try:
         result = client.search_symbol("add", kind_filter="function")
     finally:
-        claim.release(rollback=True)
+        lock.release()
 
     assert factory_calls == 0
     assert result.status == QueryStatus.UNRESOLVED
@@ -1496,6 +1548,61 @@ def test_build_in_progress_blocks_before_engine_factory(tmp_path: Path):
         note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
     )
     assert "build in progress" in unknown.detail
+
+
+def test_api_shared_lock_blocks_builder_without_cache_mixing(tmp_path: Path):
+    write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    query_result: list[QueryResult] = []
+
+    class HoldingEngine(NeverReadyEngine):
+        def __enter__(self) -> "HoldingEngine":
+            entered.set()
+            assert release.wait(timeout=5)
+            return self
+
+    client = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=lambda _cfg: HoldingEngine(),
+    )
+    query_thread = threading.Thread(
+        target=lambda: query_result.append(
+            client.search_symbol("missing", kind_filter="function")
+        )
+    )
+    query_thread.start()
+    assert entered.wait(timeout=5)
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in index_dir.glob("*.idx")
+    }
+    fake_clangd = tmp_path / "clangd-18.1.3"
+    fake_clangd.write_text(
+        "#!/bin/sh\necho 'clangd version 18.1.3'\n", encoding="utf-8"
+    )
+    fake_clangd.chmod(0o755)
+
+    build = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd),
+        )
+    )
+    release.set()
+    query_thread.join(timeout=5)
+
+    assert not query_thread.is_alive()
+    assert build.health_report.reason == "index_engine_build_in_progress"
+    assert query_result[0].status == QueryStatus.UNRESOLVED
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in index_dir.glob("*.idx")
+    }
+    assert after == before
 
 
 def test_stamp_write_failure_maps_to_index_unknown(

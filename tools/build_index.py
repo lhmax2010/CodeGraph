@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from codegraph.indexing import (  # noqa: E402 - script bootstraps repo root first.
     BackgroundIndexConfig,
+    acquire_index_cache_lock,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
     rewrite_cdb_for_index,
@@ -50,7 +51,10 @@ def _dump_json(payload: object) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build CodeGraph clangd background-index and emit index_health."
+        description=(
+            "Build a complete CodeGraph clangd background-index from zero and emit "
+            "index_health. This command is not incremental."
+        )
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
@@ -108,59 +112,38 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--stamp-existing-index requires --inspect-only")
 
         if args.inspect_only:
-            cdb = summarize_compile_commands(compile_dir)
-            try:
-                shards = scan_index_shards(
-                    index_dir_for_compile_commands_dir(compile_dir)
-                )
-            except OSError as exc:
-                _dump_json(
-                    {
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "health": "unknown",
-                        "reason": "index_health_error",
-                    }
-                )
-                return 1
-            engine_version = detect_clangd_version(args.clangd)
-            if engine_version is None:
-                health = evaluate_index_health(
-                    cdb,
-                    shards,
-                    check_engine_ownership=True,
-                )
-                if health.reason != "index_engine_stamp_invalid":
-                    health = replace(
-                        health,
-                        health=IndexHealth.UNKNOWN,
-                        reason="index_engine_unavailable",
+            if args.stamp_existing_index:
+                try:
+                    stamp_existing_index(compile_dir, args.clangd)
+                except (OSError, ValueError) as exc:
+                    reason = getattr(exc, "reason", "index_engine_stamp_write_failed")
+                    _dump_json(
+                        {
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "health": "unknown",
+                            "reason": reason,
+                        }
                     )
-                return_code = 1
-            else:
-                if args.stamp_existing_index:
-                    ownership = evaluate_index_health(
+                    return 1
+            index_dir = index_dir_for_compile_commands_dir(compile_dir)
+            inspect_lock = acquire_index_cache_lock(index_dir, exclusive=False)
+            try:
+                cdb = summarize_compile_commands(compile_dir)
+                shards = scan_index_shards(index_dir)
+                engine_version = detect_clangd_version(args.clangd)
+                if engine_version is None:
+                    health = evaluate_index_health(
                         cdb,
                         shards,
-                        expected_engine_version=engine_version,
                         check_engine_ownership=True,
                     )
-                    if ownership.reason in _INDEX_ENGINE_BLOCKING_REASONS:
-                        health = ownership
-                    else:
-                        try:
-                            health = stamp_existing_index(compile_dir, args.clangd)
-                        except OSError as exc:
-                            _dump_json(
-                                {
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                    "health": "unknown",
-                                    "reason": "index_engine_stamp_write_failed",
-                                }
-                            )
-                            return 1
-                        shards = scan_index_shards(
-                            index_dir_for_compile_commands_dir(compile_dir)
+                    if health.reason != "index_engine_stamp_invalid":
+                        health = replace(
+                            health,
+                            health=IndexHealth.UNKNOWN,
+                            reason="index_engine_unavailable",
                         )
+                    return_code = 1
                 else:
                     health = evaluate_index_health(
                         cdb,
@@ -168,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
                         expected_engine_version=engine_version,
                         check_engine_ownership=True,
                     )
+            finally:
+                inspect_lock.release()
             if health.reason in _INDEX_ENGINE_BLOCKING_REASONS:
                 return_code = 1
             payload = {
@@ -197,14 +182,22 @@ def main(argv: list[str] | None = None) -> int:
     except (
         FileNotFoundError,
         NotADirectoryError,
+        OSError,
         json.JSONDecodeError,
         ValueError,
     ) as exc:
+        reason = getattr(exc, "reason", None)
+        if not isinstance(reason, str):
+            reason = (
+                "index_health_error"
+                if isinstance(exc, PermissionError)
+                else "invalid_input"
+            )
         _dump_json(
             {
                 "error": f"{type(exc).__name__}: {exc}",
                 "health": "unknown",
-                "reason": "invalid_input",
+                "reason": reason,
             }
         )
         return 1

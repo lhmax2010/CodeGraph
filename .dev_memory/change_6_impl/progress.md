@@ -2,8 +2,27 @@
 > 开发过程持续追加，记录思考与决策，而非仅结果。
 
 ## 关键决策
-- 版本戳在 LSP 实际版本复核后、首个 TU 打开前原子认领并持锁；仅完整建库成功、分片稳定且 health COMPLETE 时保留，正常失败只回滚本 builder 创建且 inode 未变的 stamp。
-  - 原因：所有权必须先于 clangd 分片副作用；同时中途失败或未稳定的索引不能长期获得版本认证。
+- 第五轮将单一 `.codegraph_engine` 拆为 dirty/committed 双标记，并增加 cache 级共享/独占锁。
+  - 原因：单 stamp 无法同时表达“版本所有权已认领”和“完整建库已认证”；认领前置后，保留 stamp
+    会让 SIGKILL 的 partial shards 假 complete，回滚 stamp 又会留下有分片无 owner 的锁死状态。
+  - 状态机：`.codegraph_building` 存在时恒不 complete；同版本在独占锁下可接管，异版本 mismatch；
+    dirty 与 committed 版本不一致不选择任一方，按 `index_engine_version_inconsistent` fail-closed。
+    成功顺序为发布 committed、fsync、删除 dirty、再次 fsync；中间崩溃仍由 dirty 优先。
+- `run_background_index()` 定义为完整建库入口：发布/接管 dirty 后清除全部旧 `.idx`，每次从零。
+  - 原因：同版本接管旧 partial shards 时，旧分片数可能立即满足稳定判据并假 complete；分片可再生，
+    保守重建优于复用无法证明完整的残留。增量建库不在该入口承诺内。
+- cache 并发统一由 `.cache/clangd/.codegraph_index.lock` 协调：builder/追认持独占锁，API 从所有权
+  校验前到 engine 关闭持共享锁。
+  - 原因：marker 原子发布只能保护 owner 文本，不能保护声明所有权前后的分片副作用；共享/独占锁
+    把 API、builder、CLI 的 check-to-use 窗口纳入同一协议。
+  - 无 stamp 的 API 查询仍允许保守使用，但实际 adapter 强制 `background_index=false`；health/scope
+    降级之外再加行为防线，不向未确认所有权的 cache 写入。
+- LSP 初始化拆为 initialize request 与 initialized notification：实际 serverInfo 版本复核、dirty
+  发布和旧分片清理完成后才发送 initialized，随后才打开 TU。
+  - 原因：正确性不再依赖 clangd 当前版本“didOpen 前碰巧不写 shard”的实现细节。
+- 第四轮“用 committed stamp 认领、失败回滚”的单标记方案已被第五轮 dirty/committed 双标记替代。
+  - 原因：单标记保留会让 SIGKILL 后的 partial shards 假 COMPLETE，回滚又会留下有分片无 owner 的死态；
+    第五轮改为 dirty 持续表达未完成所有权，只有 COMPLETE 才发布 committed 认证。
 - 版本戳采用规范化完整版本（含 patch，如 `clangd 21.1.1`）精确匹配。
   - 原因：change_6 以保守隔离优先，暂不假设同 major/minor 的索引兼容。
 - 存量 cache 无 stamp 视为 `index_engine_unverified`：health 降为 unknown，复用 `INDEX_UNKNOWN` 并写明 detail；不新增冻结设计之外的 IssueCode。
@@ -58,3 +77,30 @@
 - 2026-07-14：第四轮 gstack Claude 独立 review 两次均未形成投票：完整 delta 与仅 production-code 聚焦 delta 各在 180s 内无响应文本（第二次 response 为空），均按能力失败/超时处理，不计 APPROVE。分支推送后交用户侧其余异构路线复核，全票前不 merge。
 - 2026-07-14：提交前最终 gate：`217 passed in 5.29s`，coverage 总计 92%、`api.py` 93%、核心 `indexing.py` 90%；ruff、black --check、mypy、compileall、git diff --check 全绿。
 - 2026-07-14：针对“initialize 本身是否早于 claim 写分片”补真实 21/22 延时诊断：fresh CDB 上两进程完成 initialize 后强制停 2s，claim/open_file 尚未执行时两次观测均为 0 `.idx`；随后竞争仍仅胜者打开 TU并产 1 shard。当前 clangd 21/22 实证支持“首个 TU 打开是该建库流程的分片触发点”，未发现 pre-claim 副作用窗口。
+- 2026-07-15：第五轮将所有权与成功认证拆为 `.codegraph_building` / `.codegraph_engine`，并以
+  `.cache/clangd/.codegraph_index.lock` 统一 builder/追认的独占锁和 API 的共享锁。dirty 存在时
+  health 恒非 COMPLETE；同版本在独占锁下清除旧 `.idx` 后从零接管，异版本 mismatch，dirty 与
+  committed 版本不一致按 `index_engine_version_inconsistent` fail-closed。
+- 2026-07-15：builder 时序固定为 exclusive lock → initialize request → serverInfo 实际版本复核 →
+  发布 dirty → 清旧 shards → `initialized` → `didOpen`。dirty 发布或清理失败均不发 `initialized`，
+  从协议时序上阻止 clangd 在所有权确认前开始后台工作。
+- 2026-07-15：真实 SIGKILL 验证：100-TU ARM 子集在 207 shards 时 kill，留下 dirty 且无 committed，
+  即使 `207 >= 100` 仍为 UNKNOWN/build_in_progress；同版本直接接管、清旧并重建到 427 shards，
+  8.599s 后才发布 committed 并恢复 COMPLETE。1303-TU 全量重试在 809/1303 的中间 plateau 被保守判
+  INCOMPLETE、dirty 保留，未将部分索引认证为 complete。
+- 2026-07-15：真实优雅失败验证：50-TU ARM 子集首次 `max_wait=0` 在 357 shards 返回
+  UNKNOWN/index_build_not_stable，dirty 保留；不删除目录直接同版本重试，7.861s 建到 446 shards，
+  commit 后 dirty 清除并恢复 COMPLETE。
+- 2026-07-15：真实并发验证：21 vs 22、21 vs 21 各 5 轮 barrier 竞争，均只有一个 LSP 建库启动；
+  输家在任何 TU/shard 副作用前返回 `index_engine_build_in_progress`，最终 committed 与 shards 单一版本。
+  API×builder 真实交错中，API 持共享锁时 builder 0.005s 被挡，阻断期间 shard 快照不变，API 查询
+  保守返回 UNRESOLVED/unknown。
+- 2026-07-15：未认证 cache 的 API 行为防线已验证：adapter 强制 `background_index=false`，查询前后
+  cache 快照不变；canonical 损坏文本、symlink、marker 不一致及守卫扫描失败均 blocking。三版本回归
+  保持 refs 389/62、18 callees FAILED、21/22 callees OK 3；21 错配 18 cache 0.152s 拦截且零污染。
+- 2026-07-15：开发机 Snap 更新移除了旧 `.venv` 所指 Python 3.11，原环境成为断链；保留旧目录备份，
+  用系统 Python 3.12 无损重建 `.venv` 并恢复固定 tree-sitter/gate 版本。最终 gate：249 passed，
+  coverage 总计 92%、`api.py` 92%、核心 `indexing.py` 90%；ruff/black/mypy/compileall/diff-check 全绿。
+  7 条核心并发/崩溃测试连续 30 轮全部通过。
+- 2026-07-15：第五轮 gstack Claude 对完整 delta 做 tool-less 独立 review，240s 内未返回 JSON/文本，
+  按能力超时记录，不计 APPROVE；分支仍须用户侧异构多路全票确认，未自行放行。

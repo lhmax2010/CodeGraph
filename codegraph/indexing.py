@@ -26,6 +26,10 @@ from .engine_version import (
 )
 
 _ENGINE_STAMP_NAME = ".codegraph_engine"
+_BUILDING_MARKER_NAME = ".codegraph_building"
+_CACHE_LOCK_NAME = ".codegraph_index.lock"
+_CONTROL_DIR_NAME = ".codegraph-control"
+_MARKER_TEMP_PREFIX = ".codegraph-marker-"
 _BUILD_INDEX_BLOCKING_REASONS = {
     "index_engine_build_in_progress",
     "index_engine_mismatch",
@@ -53,37 +57,20 @@ class _IndexEngineStampError(ValueError):
 
 
 @dataclass
-class _IndexEngineClaim:
+class IndexCacheLock:
     path: Path
-    engine_version: str
     fd: int
-    created: bool
-    device: int
-    inode: int
+    exclusive: bool
     released: bool = False
 
-    def release(self, *, rollback: bool = False) -> None:
+    def release(self) -> None:
         if self.released:
             return
         try:
-            if rollback and self.created:
-                try:
-                    current = os.lstat(self.path)
-                except FileNotFoundError:
-                    current = None
-                if (
-                    current is not None
-                    and stat.S_ISREG(current.st_mode)
-                    and current.st_dev == self.device
-                    and current.st_ino == self.inode
-                ):
-                    self.path.unlink()
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
         finally:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self.fd)
-                self.released = True
+            os.close(self.fd)
+            self.released = True
 
 
 @dataclass(frozen=True)
@@ -226,135 +213,159 @@ def index_engine_stamp_path(index_dir: str | Path) -> Path:
     return Path(index_dir) / _ENGINE_STAMP_NAME
 
 
-def read_index_engine_version(index_dir: str | Path) -> str | None:
-    """Read a canonical version without following or trusting a locked stamp."""
+def index_engine_building_path(index_dir: str | Path) -> Path:
+    return Path(index_dir) / _BUILDING_MARKER_NAME
 
-    path = index_engine_stamp_path(index_dir)
-    opened = _open_index_engine_stamp(path)
-    if opened is None:
-        return None
-    fd, _ = opened
+
+def index_cache_lock_path(index_dir: str | Path) -> Path:
+    return Path(index_dir).parent / _CACHE_LOCK_NAME
+
+
+def acquire_index_cache_lock(
+    index_dir: str | Path, *, exclusive: bool
+) -> IndexCacheLock:
+    """Acquire the cache-wide lock used by builders, queries, and attestation."""
+
+    path = index_cache_lock_path(index_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        engine_version = _read_index_engine_version_fd(fd, path)
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        raise _IndexEngineStampError(
+            "index_health_error", f"index cache lock is unavailable: {path}"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise ValueError(f"index cache lock must be a stable regular file: {path}")
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise _IndexEngineStampError(
                 "index_engine_build_in_progress",
-                f"index build already owns engine stamp: {path}",
-                existing_version=engine_version,
+                f"index cache is locked by an active build: {path}",
             ) from exc
-        return engine_version
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        return IndexCacheLock(path=path, fd=fd, exclusive=exclusive)
+    except BaseException as exc:
+        os.close(fd)
+        if isinstance(exc, _IndexEngineStampError):
+            raise
+        if isinstance(exc, (OSError, ValueError)):
+            raise _IndexEngineStampError(
+                "index_health_error", f"index cache lock is invalid: {path}"
+            ) from exc
+        raise
+
+
+def read_index_engine_version(index_dir: str | Path) -> str | None:
+    """Read the committed engine version from a canonical regular-file stamp."""
+
+    return _read_engine_marker(index_engine_stamp_path(index_dir))
+
+
+def read_index_building_version(index_dir: str | Path) -> str | None:
+    """Read the dirty build owner; its presence means the cache is uncommitted."""
+
+    return _read_engine_marker(index_engine_building_path(index_dir))
 
 
 def write_index_engine_version(index_dir: str | Path, engine_version: str) -> Path:
-    """Create an engine stamp without ever replacing existing ownership."""
-
-    claim = _claim_index_engine_version(index_dir, engine_version)
-    try:
-        return claim.path
-    finally:
-        claim.release()
-
-
-def _claim_index_engine_version(
-    index_dir: str | Path, engine_version: str
-) -> _IndexEngineClaim:
-    """Atomically claim ownership and lock the stamp before index side effects."""
+    """Explicitly publish a committed stamp without replacing another owner."""
 
     normalized = normalize_clangd_version(engine_version)
     if normalized is None:
-        raise ValueError(f"invalid clangd version: {engine_version!r}")
-    path = index_engine_stamp_path(index_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    for _attempt in range(8):
+        raise ValueError(f"invalid canonical clangd version: {engine_version!r}")
+    lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    try:
         try:
-            opened = _open_index_engine_stamp(path)
+            dirty = read_index_building_version(index_dir)
+            existing = read_index_engine_version(index_dir)
         except (OSError, ValueError) as exc:
-            raise _invalid_stamp_error(path) from exc
-        if opened is not None:
-            fd, stamp_stat = opened
-            try:
-                existing = _read_index_engine_version_fd(fd, path)
-                if existing != normalized:
-                    raise _IndexEngineStampError(
-                        "index_engine_mismatch",
-                        f"conflicting index engine stamp: {existing} != {normalized}",
-                        existing_version=existing,
-                    )
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise _IndexEngineStampError(
-                        "index_engine_build_in_progress",
-                        f"index build already owns engine stamp: {path}",
-                        existing_version=existing,
-                    ) from exc
-                _verify_stamp_identity(path, stamp_stat)
-                return _IndexEngineClaim(
-                    path=path,
-                    engine_version=normalized,
-                    fd=fd,
-                    created=False,
-                    device=stamp_stat.st_dev,
-                    inode=stamp_stat.st_ino,
-                )
-            except BaseException as exc:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-                if isinstance(exc, _IndexEngineStampError):
-                    raise
-                if isinstance(exc, (OSError, ValueError)):
-                    raise _invalid_stamp_error(path) from exc
-                raise
-
-        claim = _create_index_engine_claim(path, normalized)
-        if claim is not None:
-            return claim
-
-    raise _IndexEngineStampError(
-        "index_engine_build_in_progress",
-        f"index engine stamp changed repeatedly while claiming: {path}",
-    )
+            raise _invalid_stamp_error(index_engine_stamp_path(index_dir)) from exc
+        if dirty is not None:
+            raise _IndexEngineStampError(
+                "index_engine_build_in_progress",
+                f"cannot publish committed stamp while dirty marker exists: {dirty}",
+                existing_version=dirty,
+            )
+        if existing is not None and existing != normalized:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"conflicting index engine marker: {existing} != {normalized}",
+                existing_version=existing,
+            )
+        try:
+            return _publish_engine_marker(
+                index_engine_stamp_path(index_dir), normalized
+            )
+        except OSError as exc:
+            raise _IndexEngineStampError(
+                "index_engine_stamp_write_failed",
+                f"{type(exc).__name__}: cannot write index engine stamp: "
+                f"{index_engine_stamp_path(index_dir)}: {exc}",
+            ) from exc
+    except _IndexEngineStampError:
+        raise
+    except ValueError as exc:
+        raise _invalid_stamp_error(index_engine_stamp_path(index_dir)) from exc
+    finally:
+        lock.release()
 
 
-def _create_index_engine_claim(path: Path, normalized: str) -> _IndexEngineClaim | None:
+def _publish_engine_marker(path: Path, engine_version: str) -> Path:
+    normalized = normalize_clangd_version(engine_version)
+    if normalized is None or engine_version.strip() != normalized:
+        raise ValueError(f"invalid canonical clangd version: {engine_version!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_engine_marker(path)
+    if existing is not None:
+        if existing != normalized:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"conflicting index engine marker: {existing} != {normalized}",
+                existing_version=existing,
+            )
+        return path
+
+    control_dir = path.parent.parent / _CONTROL_DIR_NAME
+    control_dir.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=".tmp", dir=path.parent
+        prefix=_MARKER_TEMP_PREFIX, suffix=".tmp", dir=control_dir
     )
     temporary = Path(temporary_name)
     published = False
-    keep_fd = False
     try:
         os.fchmod(fd, 0o644)
         os.write(fd, (normalized + "\n").encode("utf-8"))
         os.fsync(fd)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             os.link(temporary, path)
         except FileExistsError:
-            return None
+            existing = _read_engine_marker(path)
+            if existing != normalized:
+                raise _IndexEngineStampError(
+                    "index_engine_mismatch",
+                    f"conflicting index engine marker: {existing} != {normalized}",
+                    existing_version=existing,
+                )
+            return path
         published = True
-        stamp_stat = os.fstat(fd)
-        _verify_stamp_identity(path, stamp_stat)
-        temporary.unlink()
-        keep_fd = True
-        return _IndexEngineClaim(
-            path=path,
-            engine_version=normalized,
-            fd=fd,
-            created=True,
-            device=stamp_stat.st_dev,
-            inode=stamp_stat.st_ino,
-        )
+        _verify_marker_identity(path, os.fstat(fd))
+        _fsync_directory(path.parent)
+        return path
     except BaseException:
         if published:
             try:
@@ -370,14 +381,14 @@ def _create_index_engine_claim(path: Path, normalized: str) -> _IndexEngineClaim
         raise
     finally:
         temporary.unlink(missing_ok=True)
-        if not keep_fd:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+        os.close(fd)
 
 
 def _open_index_engine_stamp(path: Path) -> tuple[int, os.stat_result] | None:
+    return _open_engine_marker(path)
+
+
+def _open_engine_marker(path: Path) -> tuple[int, os.stat_result] | None:
     try:
         path_stat = os.lstat(path)
     except FileNotFoundError:
@@ -402,21 +413,41 @@ def _open_index_engine_stamp(path: Path) -> tuple[int, os.stat_result] | None:
 
 
 def _read_index_engine_version_fd(fd: int, path: Path) -> str:
+    return _read_engine_marker_fd(fd, path)
+
+
+def _read_engine_marker_fd(fd: int, path: Path) -> str:
     os.lseek(fd, 0, os.SEEK_SET)
     encoded = os.read(fd, _MAX_ENGINE_STAMP_BYTES + 1)
     if len(encoded) > _MAX_ENGINE_STAMP_BYTES:
         raise ValueError(f"index engine stamp is too large: {path}")
     try:
-        raw = encoded.decode("utf-8").strip()
+        raw = encoded.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"invalid index engine stamp encoding: {path}") from exc
-    normalized = normalize_clangd_version(raw)
-    if normalized is None:
+    stripped = raw.strip()
+    normalized = normalize_clangd_version(stripped)
+    if normalized is None or stripped != normalized:
         raise ValueError(f"invalid index engine stamp: {path}")
     return normalized
 
 
+def _read_engine_marker(path: Path) -> str | None:
+    opened = _open_engine_marker(path)
+    if opened is None:
+        return None
+    fd, _ = opened
+    try:
+        return _read_engine_marker_fd(fd, path)
+    finally:
+        os.close(fd)
+
+
 def _verify_stamp_identity(path: Path, expected: os.stat_result) -> None:
+    _verify_marker_identity(path, expected)
+
+
+def _verify_marker_identity(path: Path, expected: os.stat_result) -> None:
     current = os.lstat(path)
     if (
         not stat.S_ISREG(current.st_mode)
@@ -424,6 +455,14 @@ def _verify_stamp_identity(path: Path, expected: os.stat_result) -> None:
         or current.st_ino != expected.st_ino
     ):
         raise ValueError(f"index engine stamp changed while claiming: {path}")
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _invalid_stamp_error(path: Path) -> _IndexEngineStampError:
@@ -452,34 +491,50 @@ def evaluate_index_health(
     verify_ownership = check_engine_ownership or expected_engine_version is not None
     expected = normalize_clangd_version(expected_engine_version)
     actual: str | None = None
+    dirty: str | None = None
+    try:
+        actual = read_index_engine_version(shards.index_dir)
+        dirty = read_index_building_version(shards.index_dir)
+    except (OSError, ValueError):
+        return _health(
+            IndexHealth.UNKNOWN,
+            "index_engine_stamp_invalid",
+            cdb,
+            shards,
+            expected_engine_version=expected,
+        )
+    if dirty is not None and actual is not None and dirty != actual:
+        return _health(
+            IndexHealth.UNKNOWN,
+            "index_engine_version_inconsistent",
+            cdb,
+            shards,
+            expected_engine_version=expected,
+            index_engine_version=dirty,
+        )
+    if dirty is not None:
+        if expected is not None and dirty != expected:
+            return _health(
+                IndexHealth.UNKNOWN,
+                "index_engine_mismatch",
+                cdb,
+                shards,
+                expected_engine_version=expected,
+                index_engine_version=dirty,
+            )
+        return _health(
+            IndexHealth.UNKNOWN,
+            (
+                "index_engine_unavailable"
+                if verify_ownership and expected is None
+                else "index_engine_build_in_progress"
+            ),
+            cdb,
+            shards,
+            expected_engine_version=expected,
+            index_engine_version=dirty,
+        )
     if verify_ownership:
-        try:
-            actual = read_index_engine_version(shards.index_dir)
-        except _IndexEngineStampError as exc:
-            reason = exc.reason
-            if (
-                reason == "index_engine_build_in_progress"
-                and exc.existing_version is not None
-                and expected is not None
-                and exc.existing_version != expected
-            ):
-                reason = "index_engine_mismatch"
-            return _health(
-                IndexHealth.UNKNOWN,
-                reason,
-                cdb,
-                shards,
-                expected_engine_version=expected,
-                index_engine_version=exc.existing_version,
-            )
-        except (OSError, ValueError):
-            return _health(
-                IndexHealth.UNKNOWN,
-                "index_engine_stamp_invalid",
-                cdb,
-                shards,
-                expected_engine_version=expected,
-            )
         if actual is not None and expected is None:
             return _health(
                 IndexHealth.UNKNOWN,
@@ -506,14 +561,29 @@ def evaluate_index_health(
                 index_engine_version=actual,
             )
 
+    return _evaluate_structural_index_health(
+        cdb,
+        shards,
+        expected_engine_version=expected,
+        index_engine_version=actual,
+    )
+
+
+def _evaluate_structural_index_health(
+    cdb: CompileCommandsSummary,
+    shards: IndexShardSummary,
+    *,
+    expected_engine_version: str | None = None,
+    index_engine_version: str | None = None,
+) -> IndexHealthReport:
     if cdb.unique_tu_count <= 0:
         return _health(
             IndexHealth.UNKNOWN,
             "no_translation_units",
             cdb,
             shards,
-            expected_engine_version=expected,
-            index_engine_version=actual,
+            expected_engine_version=expected_engine_version,
+            index_engine_version=index_engine_version,
         )
     if shards.idx_shards == 0 and shards.total_files > 0:
         return _health(
@@ -521,8 +591,8 @@ def evaluate_index_health(
             "no_idx_files",
             cdb,
             shards,
-            expected_engine_version=expected,
-            index_engine_version=actual,
+            expected_engine_version=expected_engine_version,
+            index_engine_version=index_engine_version,
         )
     if shards.idx_shards < cdb.unique_tu_count:
         return _health(
@@ -530,16 +600,16 @@ def evaluate_index_health(
             "shards_lt_unique_tu",
             cdb,
             shards,
-            expected_engine_version=expected,
-            index_engine_version=actual,
+            expected_engine_version=expected_engine_version,
+            index_engine_version=index_engine_version,
         )
     return _health(
         IndexHealth.COMPLETE,
         "shards_ge_unique_tu",
         cdb,
         shards,
-        expected_engine_version=expected,
-        index_engine_version=actual,
+        expected_engine_version=expected_engine_version,
+        index_engine_version=index_engine_version,
     )
 
 
@@ -550,34 +620,49 @@ def stamp_existing_index(
 
     cdb = summarize_compile_commands(compile_commands_dir)
     index_dir = index_dir_for_compile_commands_dir(compile_commands_dir)
-    shards = scan_index_shards(index_dir)
-    structural = evaluate_index_health(cdb, shards)
-    if structural.health != IndexHealth.COMPLETE:
-        raise ValueError(
-            f"cannot stamp index with health={structural.health.value}: "
-            f"{structural.reason}"
-        )
-    engine_version = detect_clangd_version(clangd_path)
-    if engine_version is None:
-        raise ValueError(f"cannot detect clangd version: {clangd_path}")
+    lock = acquire_index_cache_lock(index_dir, exclusive=True)
     try:
-        existing = read_index_engine_version(index_dir)
-    except _IndexEngineStampError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise _IndexEngineStampError(
-            "index_engine_stamp_invalid",
-            f"index engine stamp is invalid or unreadable: "
-            f"{index_engine_stamp_path(index_dir)}",
-        ) from exc
-    if existing is not None and existing != engine_version:
-        raise ValueError(
-            f"conflicting index engine stamp: {existing} != {engine_version}"
+        shards = scan_index_shards(index_dir)
+        try:
+            dirty = read_index_building_version(index_dir)
+            existing = read_index_engine_version(index_dir)
+        except (OSError, ValueError) as exc:
+            raise _IndexEngineStampError(
+                "index_engine_stamp_invalid",
+                f"index engine marker is invalid or unreadable: {index_dir}",
+            ) from exc
+        if dirty is not None:
+            raise _IndexEngineStampError(
+                "index_engine_build_in_progress",
+                f"cannot attest an index with a dirty build marker: {dirty}",
+                existing_version=dirty,
+            )
+        structural = _evaluate_structural_index_health(cdb, shards)
+        if structural.health != IndexHealth.COMPLETE:
+            raise ValueError(
+                f"cannot stamp index with health={structural.health.value}: "
+                f"{structural.reason}"
+            )
+        engine_version = detect_clangd_version(clangd_path)
+        if engine_version is None:
+            raise ValueError(f"cannot detect clangd version: {clangd_path}")
+        if existing is not None and existing != engine_version:
+            raise ValueError(
+                f"conflicting index engine stamp: {existing} != {engine_version}"
+            )
+        try:
+            _publish_engine_marker(index_engine_stamp_path(index_dir), engine_version)
+        except OSError as exc:
+            raise _IndexEngineStampError(
+                "index_engine_stamp_write_failed",
+                f"{type(exc).__name__}: cannot write index engine stamp: "
+                f"{index_engine_stamp_path(index_dir)}",
+            ) from exc
+        return evaluate_index_health(
+            cdb, scan_index_shards(index_dir), expected_engine_version=engine_version
         )
-    write_index_engine_version(index_dir, engine_version)
-    return evaluate_index_health(
-        cdb, scan_index_shards(index_dir), expected_engine_version=engine_version
-    )
+    finally:
+        lock.release()
 
 
 def rewrite_cdb_for_index(
@@ -622,10 +707,53 @@ def rewrite_cdb_for_index(
 
 
 def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult:
+    """Build a complete background index from zero; this is not incremental."""
+
     compile_dir = Path(config.compile_commands_dir).resolve()
     cdb = summarize_compile_commands(compile_dir)
     index_dir = index_dir_for_compile_commands_dir(compile_dir)
+    engine_version = detect_clangd_version(config.clangd_path)
     try:
+        cache_lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    except _IndexEngineStampError as exc:
+        initial_shards = _best_effort_shard_summary(index_dir)
+        health = _health(
+            IndexHealth.UNKNOWN,
+            exc.reason,
+            cdb,
+            initial_shards,
+            expected_engine_version=engine_version,
+            index_engine_version=exc.existing_version,
+        )
+        return BackgroundIndexResult(
+            compile_commands_dir=str(compile_dir),
+            index_dir=initial_shards.index_dir,
+            elapsed_seconds=0.0,
+            exit_code=None,
+            stable=False,
+            shard_report=initial_shards,
+            health_report=health,
+            stderr_tail=str(exc),
+            engine_version=engine_version,
+        )
+
+    try:
+        return _run_background_index_locked(
+            config, compile_dir, cdb, index_dir, engine_version
+        )
+    finally:
+        cache_lock.release()
+
+
+def _run_background_index_locked(
+    config: BackgroundIndexConfig,
+    compile_dir: Path,
+    cdb: CompileCommandsSummary,
+    index_dir: Path,
+    engine_version: str | None,
+) -> BackgroundIndexResult:
+    try:
+        _cleanup_control_temps(index_dir)
         initial_shards = scan_index_shards(index_dir)
     except (OSError, ValueError) as exc:
         initial_shards = IndexShardSummary(
@@ -642,7 +770,6 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
             health_report=health,
             stderr_tail=f"{type(exc).__name__}: {exc}",
         )
-    engine_version = detect_clangd_version(config.clangd_path)
     probed_engine_version = engine_version
     preflight = _build_preflight_health(cdb, initial_shards, engine_version)
     if preflight is not None:
@@ -665,7 +792,7 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
     error_reason: str | None = None
     error_tail = ""
     ownership_health: IndexHealthReport | None = None
-    claim: _IndexEngineClaim | None = None
+    dirty_published = False
     try:
         trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
         client = _IndexLspClient(config)
@@ -683,10 +810,8 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
             if engine_version is None:
                 raise RuntimeError("clangd version missing after ownership preflight")
             try:
-                # Publish and lock ownership before clangd can open a TU or write shards.
-                # A hard crash leaves a conservative claim: the same version may rebuild,
-                # while every other version remains blocked.
-                claim = _claim_index_engine_version(index_dir, engine_version)
+                _publish_dirty_marker(index_dir, engine_version)
+                dirty_published = True
             except _IndexEngineStampError as exc:
                 ownership_health = _health(
                     IndexHealth.UNKNOWN,
@@ -708,16 +833,30 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
                 error_tail = f"{type(exc).__name__}: {exc}"
                 client.shutdown()
             else:
-                for file in trigger_files:
-                    client.open_file(file)
-                client.request_document_symbols(trigger_files[0])
-                stable = _wait_for_stable_shards(
-                    index_dir,
-                    stable_rounds=config.stable_rounds,
-                    max_wait_seconds=config.max_wait_seconds,
-                    poll_interval_seconds=config.poll_interval_seconds,
-                )
-                client.shutdown()
+                try:
+                    _clear_index_shards(index_dir)
+                except (OSError, ValueError) as exc:
+                    ownership_health = _health(
+                        IndexHealth.UNKNOWN,
+                        "index_health_error",
+                        cdb,
+                        _best_effort_shard_summary(index_dir),
+                        expected_engine_version=engine_version,
+                    )
+                    error_tail = f"{type(exc).__name__}: {exc}"
+                    client.shutdown()
+                else:
+                    client.notify_initialized()
+                    for file in trigger_files:
+                        client.open_file(file)
+                    client.request_document_symbols(trigger_files[0])
+                    stable = _wait_for_stable_shards(
+                        index_dir,
+                        stable_rounds=config.stable_rounds,
+                        max_wait_seconds=config.max_wait_seconds,
+                        poll_interval_seconds=config.poll_interval_seconds,
+                    )
+                    client.shutdown()
     except Exception as exc:
         error_reason = "index_build_failed"
         error_tail = f"{type(exc).__name__}: {exc}"
@@ -743,39 +882,54 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
     elif error_reason is not None:
         health = _health(IndexHealth.UNKNOWN, error_reason, cdb, shard_report)
     elif stable and exit_code == 0:
-        if claim is None:
+        structural = _evaluate_structural_index_health(cdb, shard_report)
+        if not dirty_published:
             health = _health(
                 IndexHealth.UNKNOWN,
                 "index_engine_unverified",
                 cdb,
                 shard_report,
             )
+        elif structural.health != IndexHealth.COMPLETE:
+            health = structural
         else:
-            health = _evaluate_claimed_index_health(cdb, shard_report, claim)
+            try:
+                _commit_index_build(index_dir, engine_version)
+                health = evaluate_index_health(
+                    cdb,
+                    scan_index_shards(index_dir),
+                    expected_engine_version=engine_version,
+                    check_engine_ownership=True,
+                )
+            except _IndexEngineStampError as exc:
+                health = _health(
+                    IndexHealth.UNKNOWN,
+                    exc.reason,
+                    cdb,
+                    shard_report,
+                    expected_engine_version=engine_version,
+                    index_engine_version=exc.existing_version,
+                )
+                stderr_tail = "\n".join(
+                    part for part in (stderr_tail, str(exc)) if part
+                )
+            except (OSError, ValueError) as exc:
+                health = _health(
+                    IndexHealth.UNKNOWN,
+                    "index_engine_stamp_write_failed",
+                    cdb,
+                    shard_report,
+                    expected_engine_version=engine_version,
+                )
+                stderr_tail = "\n".join(
+                    part
+                    for part in (stderr_tail, f"{type(exc).__name__}: {exc}")
+                    if part
+                )
     else:
         health = _health(
             IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report
         )
-    if claim is not None:
-        rollback = health.health != IndexHealth.COMPLETE
-        try:
-            claim.release(rollback=rollback)
-        except OSError as exc:
-            health = _health(
-                IndexHealth.UNKNOWN,
-                "index_engine_stamp_write_failed",
-                cdb,
-                shard_report,
-                expected_engine_version=engine_version,
-            )
-            stderr_tail = "\n".join(
-                part for part in (stderr_tail, f"{type(exc).__name__}: {exc}") if part
-            )
-        if rollback:
-            try:
-                shard_report = scan_index_shards(index_dir)
-            except (OSError, ValueError):
-                pass
     return BackgroundIndexResult(
         compile_commands_dir=str(compile_dir),
         index_dir=shard_report.index_dir,
@@ -789,42 +943,80 @@ def run_background_index(config: BackgroundIndexConfig) -> BackgroundIndexResult
     )
 
 
-def _evaluate_claimed_index_health(
-    cdb: CompileCommandsSummary,
-    shards: IndexShardSummary,
-    claim: _IndexEngineClaim,
-) -> IndexHealthReport:
-    structural = evaluate_index_health(cdb, shards)
-    if structural.health != IndexHealth.COMPLETE:
-        return structural
+def _best_effort_shard_summary(index_dir: Path) -> IndexShardSummary:
     try:
-        _verify_stamp_identity(claim.path, os.fstat(claim.fd))
-        actual = _read_index_engine_version_fd(claim.fd, claim.path)
+        return scan_index_shards(index_dir)
     except (OSError, ValueError):
-        return _health(
-            IndexHealth.UNKNOWN,
-            "index_engine_stamp_invalid",
-            cdb,
-            shards,
-            expected_engine_version=claim.engine_version,
+        return IndexShardSummary(str(index_dir.resolve()), index_dir.exists(), 0, 0)
+
+
+def _publish_dirty_marker(index_dir: Path, engine_version: str) -> None:
+    committed = read_index_engine_version(index_dir)
+    dirty = read_index_building_version(index_dir)
+    if committed is not None and dirty is not None and committed != dirty:
+        raise _IndexEngineStampError(
+            "index_engine_version_inconsistent",
+            f"dirty and committed engine versions disagree: {dirty} != {committed}",
+            existing_version=dirty,
         )
-    if actual != claim.engine_version:
-        return _health(
-            IndexHealth.UNKNOWN,
-            "index_engine_mismatch",
-            cdb,
-            shards,
-            expected_engine_version=claim.engine_version,
-            index_engine_version=actual,
+    for existing in (committed, dirty):
+        if existing is not None and existing != engine_version:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"index cache belongs to {existing}, not {engine_version}",
+                existing_version=existing,
+            )
+    _publish_engine_marker(index_engine_building_path(index_dir), engine_version)
+
+
+def _commit_index_build(index_dir: Path, engine_version: str | None) -> None:
+    if engine_version is None:
+        raise _IndexEngineStampError(
+            "index_engine_unavailable", "cannot commit index without engine version"
         )
-    return _health(
-        IndexHealth.COMPLETE,
-        structural.reason,
-        cdb,
-        shards,
-        expected_engine_version=claim.engine_version,
-        index_engine_version=actual,
-    )
+    dirty = read_index_building_version(index_dir)
+    if dirty != engine_version:
+        raise _IndexEngineStampError(
+            "index_engine_version_inconsistent",
+            f"dirty marker changed before commit: {dirty!r} != {engine_version!r}",
+            existing_version=dirty,
+        )
+    _publish_engine_marker(index_engine_stamp_path(index_dir), engine_version)
+    _fsync_directory(index_dir)
+    building = index_engine_building_path(index_dir)
+    current = read_index_building_version(index_dir)
+    if current != engine_version:
+        raise _IndexEngineStampError(
+            "index_engine_version_inconsistent",
+            f"dirty marker changed during commit: {current!r}",
+            existing_version=current,
+        )
+    building.unlink()
+    _fsync_directory(index_dir)
+
+
+def _clear_index_shards(index_dir: Path) -> None:
+    """Remove all old clangd shards before a complete from-zero rebuild."""
+
+    if not index_dir.exists():
+        return
+    for current, _directories, names in os.walk(index_dir):
+        for name in names:
+            if not name.endswith(".idx"):
+                continue
+            (Path(current) / name).unlink()
+
+
+def _cleanup_control_temps(index_dir: Path) -> None:
+    control_dir = index_dir.parent / _CONTROL_DIR_NAME
+    if control_dir.exists():
+        control_stat = os.lstat(control_dir)
+        if not stat.S_ISDIR(control_stat.st_mode):
+            raise ValueError(f"index control path must be a directory: {control_dir}")
+    else:
+        control_dir.mkdir(parents=True)
+    for temporary in control_dir.glob(_MARKER_TEMP_PREFIX + "*.tmp"):
+        temporary.unlink()
 
 
 def _health(
@@ -859,6 +1051,14 @@ def _build_preflight_health(
         expected_engine_version=engine_version,
         check_engine_ownership=True,
     )
+    if (
+        report.reason == "index_engine_build_in_progress"
+        and engine_version is not None
+        and report.index_engine_version == engine_version
+    ):
+        # The cache-wide exclusive lock proves this is a stale same-version dirty
+        # marker, not an active peer. A full rebuild may safely take it over.
+        return None
     if report.reason in _BUILD_INDEX_BLOCKING_REASONS:
         return report
     return None
@@ -886,6 +1086,11 @@ def _post_initialize_preflight_health(
             shards,
             index_engine_version=report.index_engine_version,
         )
+    if (
+        report.reason == "index_engine_build_in_progress"
+        and report.index_engine_version == engine_version
+    ):
+        report = _evaluate_structural_index_health(cdb, shards)
     if report.reason in _BUILD_INDEX_BLOCKING_REASONS:
         return report
     if probed_engine_version is not None and engine_version != probed_engine_version:
@@ -1003,6 +1208,8 @@ class _IndexLspClient:
             timeout=20,
         )
         self.engine_version = clangd_version_from_initialize(result)
+
+    def notify_initialized(self) -> None:
         self.notify("initialized", {})
 
     def open_file(self, file: str) -> None:

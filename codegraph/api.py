@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
-from typing import Callable, Iterable, Literal, Protocol
+from typing import Callable, Iterable, Iterator, Literal, Protocol
 
 from .credibility import (
     ActiveConfig,
@@ -23,7 +24,9 @@ from .engines.treesitter_adapter import create_treesitter_provider
 from .engine_version import detect_clangd_version
 from .factories import make_error_credibility
 from .indexing import (
+    IndexCacheLock,
     IndexHealthReport,
+    acquire_index_cache_lock,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
     scan_index_shards,
@@ -54,6 +57,7 @@ _INDEX_ENGINE_BLOCKING_REASONS = {
     "index_engine_stamp_invalid",
     "index_engine_stamp_write_failed",
     "index_engine_unavailable",
+    "index_engine_version_inconsistent",
     "index_health_error",
 }
 EngineVersionProbe = Callable[[str], str | None]
@@ -265,11 +269,17 @@ class CodeGraph:
     def prewarm(self, file: str | None = None) -> bool:
         """Warm clangd/index caches; each user query still proves readiness itself."""
 
+        with _query_index_cache_lock(self.config) as lock_health:
+            if lock_health is not None:
+                return False
+            return self._prewarm_locked(file)
+
+    def _prewarm_locked(self, file: str | None = None) -> bool:
         health = _initial_index_health(self.config, self._engine_version_probe)
         if _index_engine_blocks_use(health, self.config.background_index):
             return False
         try:
-            with self._engine_factory(self._clangd_config()) as engine:
+            with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
                 if _index_engine_blocks_use(health, self.config.background_index):
@@ -299,6 +309,28 @@ class CodeGraph:
         limit: int = 100,
         offset: int = 0,
     ) -> QueryResult:
+        with _query_index_cache_lock(self.config) as lock_health:
+            if lock_health is not None:
+                query = QueryMeta("entity", symbol, self.config.build_config_id)
+                kind = _normalize_kind_filter(kind_filter)
+                return _index_guard_unresolved(
+                    query,
+                    lock_health,
+                    active_config=self.config.active_config,
+                    symbol_kind=_search_symbol_kind(kind),
+                )
+            return self._search_symbol_locked(
+                symbol, kind_filter=kind_filter, limit=limit, offset=offset
+            )
+
+    def _search_symbol_locked(
+        self,
+        symbol: str,
+        *,
+        kind_filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> QueryResult:
         query = QueryMeta("entity", symbol, self.config.build_config_id)
         kind = _normalize_kind_filter(kind_filter)
         if kind is None and kind_filter is not None:
@@ -314,7 +346,7 @@ class CodeGraph:
             )
         engine_version: str | None = None
         try:
-            with self._engine_factory(self._clangd_config()) as engine:
+            with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
                 if _index_engine_blocks_use(health, self.config.background_index):
@@ -376,6 +408,36 @@ class CodeGraph:
         *,
         allow_syntactic_fallback: bool = False,
     ) -> QueryResult:
+        with _query_index_cache_lock(self.config) as lock_health:
+            if lock_health is not None:
+                query = QueryMeta(
+                    "entity",
+                    symbol,
+                    self.config.build_config_id,
+                    str(Path(file).resolve()),
+                    pos,
+                )
+                return _index_guard_unresolved(
+                    query,
+                    lock_health,
+                    active_config=self.config.active_config,
+                    symbol_kind=SymbolKind.UNKNOWN,
+                )
+            return self._get_definition_locked(
+                symbol,
+                file,
+                pos,
+                allow_syntactic_fallback=allow_syntactic_fallback,
+            )
+
+    def _get_definition_locked(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        allow_syntactic_fallback: bool = False,
+    ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta("entity", symbol, self.config.build_config_id, real_file, pos)
         invalid = _validate_file_pos(real_file, pos)
@@ -392,7 +454,7 @@ class CodeGraph:
             )
         engine_version: str | None = None
         try:
-            with self._engine_factory(self._clangd_config()) as engine:
+            with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
                 if _index_engine_blocks_use(health, self.config.background_index):
@@ -438,6 +500,40 @@ class CodeGraph:
         offset: int = 0,
         allow_syntactic_fallback: bool = False,
     ) -> QueryResult:
+        with _query_index_cache_lock(self.config) as lock_health:
+            if lock_health is not None:
+                query = QueryMeta(
+                    "entity",
+                    symbol,
+                    self.config.build_config_id,
+                    str(Path(file).resolve()),
+                    pos,
+                )
+                return _index_guard_unresolved(
+                    query,
+                    lock_health,
+                    active_config=self.config.active_config,
+                    symbol_kind=SymbolKind.UNKNOWN,
+                )
+            return self._find_references_locked(
+                symbol,
+                file,
+                pos,
+                limit=limit,
+                offset=offset,
+                allow_syntactic_fallback=allow_syntactic_fallback,
+            )
+
+    def _find_references_locked(
+        self,
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        allow_syntactic_fallback: bool = False,
+    ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta("entity", symbol, self.config.build_config_id, real_file, pos)
         invalid = _validate_file_pos(real_file, pos)
@@ -456,7 +552,7 @@ class CodeGraph:
         ready = False
         engine_version: str | None = None
         try:
-            with self._engine_factory(self._clangd_config()) as engine:
+            with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
                 if _index_engine_blocks_use(health, self.config.background_index):
@@ -564,6 +660,42 @@ class CodeGraph:
         offset: int,
         allow_syntactic_fallback: bool,
     ) -> QueryResult:
+        with _query_index_cache_lock(self.config) as lock_health:
+            if lock_health is not None:
+                query = QueryMeta(
+                    "relation",
+                    symbol,
+                    self.config.build_config_id,
+                    str(Path(file).resolve()),
+                    pos,
+                )
+                return _index_guard_unresolved(
+                    query,
+                    lock_health,
+                    active_config=self.config.active_config,
+                    symbol_kind=SymbolKind.ORDINARY_FUNCTION,
+                )
+            return self._find_call_edges_locked(
+                direction,
+                symbol,
+                file,
+                pos,
+                limit=limit,
+                offset=offset,
+                allow_syntactic_fallback=allow_syntactic_fallback,
+            )
+
+    def _find_call_edges_locked(
+        self,
+        direction: Literal["callers", "callees"],
+        symbol: str,
+        file: str,
+        pos: Pos,
+        *,
+        limit: int,
+        offset: int,
+        allow_syntactic_fallback: bool,
+    ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta(
             "relation", symbol, self.config.build_config_id, real_file, pos
@@ -584,7 +716,7 @@ class CodeGraph:
         ready = False
         engine_version: str | None = None
         try:
-            with self._engine_factory(self._clangd_config()) as engine:
+            with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
                 if _index_engine_blocks_use(health, self.config.background_index):
@@ -645,11 +777,19 @@ class CodeGraph:
         result = _with_index_engine_health_note(result, health)
         return _ensure_background_index_call_hierarchy_is_non_exhaustive(result)
 
-    def _clangd_config(self) -> ClangdAdapterConfig:
+    def _clangd_config(
+        self, health: IndexHealthReport | None = None
+    ) -> ClangdAdapterConfig:
+        ownership_verified = (
+            health is not None
+            and health.index_engine_version is not None
+            and health.index_engine_version == health.expected_engine_version
+        )
+        background_index = self.config.background_index and ownership_verified
         return ClangdAdapterConfig(
             self.config.compile_commands_dir,
             clangd_path=self.config.clangd_path,
-            background_index=self.config.background_index,
+            background_index=background_index,
             request_timeout=self.config.request_timeout,
             diagnostics_wait=self.config.diagnostics_wait,
         )
@@ -1006,6 +1146,34 @@ def _ensure_background_index_results_are_non_exhaustive(
     return result
 
 
+@contextmanager
+def _query_index_cache_lock(
+    config: BuildConfig,
+) -> Iterator[IndexHealthReport | None]:
+    if not config.background_index:
+        yield None
+        return
+
+    index_dir = index_dir_for_compile_commands_dir(config.compile_commands_dir)
+    lock: IndexCacheLock | None = None
+    try:
+        lock = acquire_index_cache_lock(index_dir, exclusive=False)
+    except (OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", "index_health_error")
+        yield IndexHealthReport(
+            health=IndexHealth.UNKNOWN,
+            reason=(reason if isinstance(reason, str) else "index_health_error"),
+            unique_tu_count=0,
+            idx_shards=0,
+            index_dir=str(index_dir.resolve()),
+        )
+        return
+    try:
+        yield None
+    finally:
+        lock.release()
+
+
 def _index_health(
     config: BuildConfig, engine_version: str | None = None
 ) -> IndexHealthReport:
@@ -1094,6 +1262,7 @@ def _with_index_engine_health_note(
         "index_engine_stamp_write_failed",
         "index_engine_unverified",
         "index_engine_unavailable",
+        "index_engine_version_inconsistent",
         "index_health_error",
     }:
         details = {
@@ -1111,6 +1280,9 @@ def _with_index_engine_health_note(
             ),
             "index_engine_unavailable": (
                 "current clangd version unavailable; index compatibility unverified"
+            ),
+            "index_engine_version_inconsistent": (
+                "dirty and committed index owners disagree; index ownership unverified"
             ),
             "index_health_error": (
                 "index health evaluation failed; index ownership unverified"

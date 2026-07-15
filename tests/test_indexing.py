@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -17,10 +18,11 @@ import codegraph.indexing as indexing_module
 from codegraph.credibility import IndexHealth
 from codegraph.indexing import (
     BackgroundIndexConfig,
-    _claim_index_engine_version,
+    acquire_index_cache_lock,
     compile_commands_path,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
+    index_engine_building_path,
     index_engine_stamp_path,
     read_index_engine_version,
     rewrite_cdb_for_index,
@@ -70,6 +72,8 @@ def install_barrier_index_client(
     fail_after_open: bool = False,
     wait_for_blocked_peer: threading.Event | None = None,
 ) -> None:
+    del barrier
+
     class BarrierIndexClient:
         def __init__(self, config: BackgroundIndexConfig):
             self.config = config
@@ -78,7 +82,10 @@ def install_barrier_index_client(
             self.opened = False
 
         def initialize(self) -> None:
-            barrier.wait(timeout=5)
+            return None
+
+        def notify_initialized(self) -> None:
+            return None
 
         def open_file(self, _file: str) -> None:
             self.opened = True
@@ -109,6 +116,17 @@ def install_barrier_index_client(
             return 0, ""
 
     monkeypatch.setattr("codegraph.indexing._IndexLspClient", BarrierIndexClient)
+
+
+def install_probe_barrier(
+    monkeypatch: pytest.MonkeyPatch, barrier: threading.Barrier
+) -> None:
+    def synchronized_probe(path: str) -> str:
+        version = Path(path).name.removeprefix("clangd-")
+        barrier.wait(timeout=5)
+        return f"clangd {version}"
+
+    monkeypatch.setattr("codegraph.indexing.detect_clangd_version", synchronized_probe)
 
 
 def test_compile_commands_summary_deduplicates_unique_tu(tmp_path: Path):
@@ -299,21 +317,20 @@ def test_index_engine_stamp_has_verified_unverified_and_mismatch_states(
     assert mismatch.index_engine_version == "clangd 21.1.1"
 
 
-def test_locked_stamp_reports_mismatch_before_build_finishes(tmp_path: Path):
+def test_dirty_marker_reports_mismatch_before_build_finishes(tmp_path: Path):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     write_cdb(tmp_path, [source])
     index_dir = index_dir_for_compile_commands_dir(tmp_path)
     touch_idx(index_dir, 1)
-    claim = _claim_index_engine_version(index_dir, "clangd 21.1.1")
-    try:
-        report = evaluate_index_health(
-            summarize_compile_commands(tmp_path),
-            scan_index_shards(index_dir),
-            expected_engine_version="clangd 22.1.8",
-        )
-    finally:
-        claim.release(rollback=True)
+    index_engine_building_path(index_dir).write_text(
+        "clangd 21.1.1\n", encoding="utf-8"
+    )
+    report = evaluate_index_health(
+        summarize_compile_commands(tmp_path),
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 22.1.8",
+    )
 
     assert report.reason == "index_engine_mismatch"
     assert report.index_engine_version == "clangd 21.1.1"
@@ -332,7 +349,7 @@ def test_index_engine_stamp_write_is_create_only_idempotent_and_conflict_safe(
     assert stamp.stat().st_ino == initial_stat.st_ino
     assert stamp.stat().st_mtime_ns == initial_stat.st_mtime_ns
 
-    with pytest.raises(ValueError, match="conflicting index engine stamp"):
+    with pytest.raises(ValueError, match="conflicting index engine marker"):
         write_index_engine_version(index_dir, "clangd 22.1.8")
     assert read_index_engine_version(index_dir) == "clangd 21.1.1"
 
@@ -378,44 +395,75 @@ def test_index_engine_stamp_concurrent_creation_is_exclusive(tmp_path: Path):
     assert not tuple(index_dir.glob("*.tmp"))
 
 
-def test_index_engine_claim_lock_survives_temp_name_unlink(tmp_path: Path):
+def test_index_cache_lock_is_exclusive(tmp_path: Path):
     index_dir = tmp_path / "index"
-    claim = _claim_index_engine_version(index_dir, "clangd 21.1.1")
-    stamp = index_engine_stamp_path(index_dir)
+    lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    try:
+        with pytest.raises(ValueError, match="locked by an active build"):
+            acquire_index_cache_lock(index_dir, exclusive=False)
+    finally:
+        lock.release()
 
-    assert stamp.is_file()
-    assert not tuple(index_dir.glob("*.tmp"))
-    competing_fd = os.open(stamp, os.O_RDONLY | os.O_NOFOLLOW)
+    peer = acquire_index_cache_lock(index_dir, exclusive=False)
+    peer.release()
+
+
+def test_flock_survives_unlinked_temporary_name(tmp_path: Path):
+    index_dir = tmp_path / "index"
+    temporary = index_dir.parent / ".codegraph-control" / "lock-test.tmp"
+    temporary.parent.mkdir(exist_ok=True)
+    temporary.write_text("temporary", encoding="utf-8")
+    owner_fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+    peer_fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+    fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    temporary.unlink()
     try:
         with pytest.raises(BlockingIOError):
-            fcntl.flock(competing_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        claim.release()
-        fcntl.flock(competing_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(owner_fd, fcntl.LOCK_UN)
+        fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
-        fcntl.flock(competing_fd, fcntl.LOCK_UN)
-        os.close(competing_fd)
+        fcntl.flock(peer_fd, fcntl.LOCK_UN)
+        os.close(peer_fd)
+        os.close(owner_fd)
 
 
-def test_index_engine_claim_rejects_invalid_version(tmp_path: Path):
-    with pytest.raises(ValueError, match="invalid clangd version"):
-        _claim_index_engine_version(tmp_path / "index", "not-a-version")
+def test_index_engine_stamp_rejects_invalid_version(tmp_path: Path):
+    with pytest.raises(ValueError, match="invalid canonical clangd version"):
+        write_index_engine_version(tmp_path / "index", "not-a-version")
 
 
 @pytest.mark.parametrize(
     "content",
-    [b"\xff\n", b"x" * 4097],
-    ids=["invalid-utf8", "oversized"],
+    [
+        b"\xff\n",
+        b"x" * 4097,
+        b"CORRUPT prefix clangd 21.1.1 trailing clangd 22.1.8\n",
+    ],
+    ids=["invalid-utf8", "oversized", "noncanonical"],
 )
-def test_index_engine_stamp_rejects_malformed_bytes(tmp_path: Path, content: bytes):
+@pytest.mark.parametrize("marker_kind", ["committed", "dirty"])
+def test_index_engine_stamp_rejects_malformed_bytes(
+    tmp_path: Path, content: bytes, marker_kind: str
+):
     index_dir = tmp_path / "index"
     index_dir.mkdir()
-    index_engine_stamp_path(index_dir).write_bytes(content)
+    marker = (
+        index_engine_stamp_path(index_dir)
+        if marker_kind == "committed"
+        else index_engine_building_path(index_dir)
+    )
+    marker.write_bytes(content)
 
     with pytest.raises(ValueError, match="invalid|too large"):
-        read_index_engine_version(index_dir)
+        (
+            read_index_engine_version(index_dir)
+            if marker_kind == "committed"
+            else indexing_module.read_index_building_version(index_dir)
+        )
 
 
-def test_index_engine_claim_publish_failure_cleans_stamp_and_temp(
+def test_index_engine_stamp_publish_failure_cleans_stamp_and_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     index_dir = tmp_path / "index"
@@ -423,36 +471,40 @@ def test_index_engine_claim_publish_failure_cleans_stamp_and_temp(
     def fail_identity_check(_path: Path, _expected: os.stat_result) -> None:
         raise OSError("synthetic post-link identity failure")
 
-    monkeypatch.setattr(indexing_module, "_verify_stamp_identity", fail_identity_check)
+    monkeypatch.setattr(indexing_module, "_verify_marker_identity", fail_identity_check)
 
-    with pytest.raises(OSError, match="post-link identity failure"):
-        _claim_index_engine_version(index_dir, "clangd 21.1.1")
+    with pytest.raises(ValueError, match="post-link identity failure"):
+        write_index_engine_version(index_dir, "clangd 21.1.1")
 
     assert not index_engine_stamp_path(index_dir).exists()
-    assert not tuple(index_dir.glob("*.tmp"))
+    assert not tuple((index_dir.parent / ".codegraph-control").glob("*.tmp"))
 
 
-def test_index_engine_claim_rollback_tolerates_missing_stamp_and_is_idempotent(
-    tmp_path: Path,
-):
+def test_index_cache_lock_release_is_idempotent(tmp_path: Path):
     index_dir = tmp_path / "index"
-    claim = _claim_index_engine_version(index_dir, "clangd 21.1.1")
-    index_engine_stamp_path(index_dir).unlink()
+    lock = acquire_index_cache_lock(index_dir, exclusive=True)
 
-    claim.release(rollback=True)
-    claim.release(rollback=True)
+    lock.release()
+    lock.release()
 
-    assert claim.released is True
+    assert lock.released is True
 
 
+@pytest.mark.parametrize("marker_kind", ["committed", "dirty"])
 @pytest.mark.parametrize("target_state", ["valid", "dangling"])
-def test_index_engine_stamp_write_rejects_symlink(tmp_path: Path, target_state: str):
+def test_index_engine_stamp_write_rejects_symlink(
+    tmp_path: Path, target_state: str, marker_kind: str
+):
     index_dir = tmp_path / "index"
     index_dir.mkdir()
     target = tmp_path / "outside-stamp"
     if target_state == "valid":
         target.write_text("clangd 21.1.1\n", encoding="utf-8")
-    stamp = index_engine_stamp_path(index_dir)
+    stamp = (
+        index_engine_stamp_path(index_dir)
+        if marker_kind == "committed"
+        else index_engine_building_path(index_dir)
+    )
     stamp.symlink_to(target)
 
     with pytest.raises(ValueError, match="invalid or unreadable"):
@@ -572,6 +624,467 @@ def test_background_index_smoke_builds_idx_shard(tmp_path: Path):
     assert read_index_engine_version(result.index_dir) == result.engine_version
 
 
+def test_dirty_marker_prevents_complete_and_same_version_retry_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    attempts = 0
+
+    class RetryClient:
+        engine_version = "clangd 21.1.1"
+
+        def __init__(self, _config: BackgroundIndexConfig):
+            self.attempt = 0
+
+        def initialize(self) -> None:
+            return None
+
+        def notify_initialized(self) -> None:
+            return None
+
+        def open_file(self, _file: str) -> None:
+            nonlocal attempts
+            attempts += 1
+            self.attempt = attempts
+            index_dir.mkdir(parents=True, exist_ok=True)
+            (index_dir / f"attempt-{attempts}.idx").write_text(
+                str(attempts), encoding="utf-8"
+            )
+            if attempts == 1:
+                raise RuntimeError("synthetic graceful failure")
+
+        def request_document_symbols(self, _file: str) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+        def close(self) -> tuple[int, str]:
+            return 0, ""
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", RetryClient)
+    config = BackgroundIndexConfig(
+        compile_commands_dir=str(tmp_path),
+        clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        max_wait_seconds=0.2,
+        poll_interval_seconds=0.01,
+        stable_rounds=1,
+    )
+
+    failed = run_background_index(config)
+    dirty_health = evaluate_index_health(
+        summarize_compile_commands(tmp_path),
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+
+    assert failed.health_report.reason == "index_build_failed"
+    assert read_index_engine_version(index_dir) is None
+    assert indexing_module.read_index_building_version(index_dir) == "clangd 21.1.1"
+    assert dirty_health.health == IndexHealth.UNKNOWN
+    assert dirty_health.reason == "index_engine_build_in_progress"
+
+    succeeded = run_background_index(config)
+
+    assert succeeded.health_report.health == IndexHealth.COMPLETE
+    assert read_index_engine_version(index_dir) == "clangd 21.1.1"
+    assert indexing_module.read_index_building_version(index_dir) is None
+    assert {path.name for path in index_dir.glob("*.idx")} == {"attempt-2.idx"}
+
+
+def test_committed_plus_dirty_same_version_is_not_complete_until_rebuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    index_engine_stamp_path(index_dir).write_text("clangd 21.1.1\n", encoding="utf-8")
+    index_engine_building_path(index_dir).write_text(
+        "clangd 21.1.1\n", encoding="utf-8"
+    )
+    before = evaluate_index_health(
+        summarize_compile_commands(tmp_path),
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+    opened: list[str] = []
+    install_barrier_index_client(
+        monkeypatch, threading.Barrier(1), opened, threading.Lock()
+    )
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+            max_wait_seconds=0.2,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    assert before.health == IndexHealth.UNKNOWN
+    assert before.reason == "index_engine_build_in_progress"
+    assert result.health_report.health == IndexHealth.COMPLETE
+    assert indexing_module.read_index_building_version(index_dir) is None
+    assert opened == ["clangd 21.1.1"]
+
+
+def test_sigkill_during_build_leaves_dirty_and_same_version_can_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    clangd = fake_clangd(tmp_path, "21.1.1")
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    child_code = f"""
+import time
+from pathlib import Path
+import codegraph.indexing as indexing
+
+index_dir = Path({str(index_dir)!r})
+
+class SlowClient:
+    engine_version = "clangd 21.1.1"
+    def __init__(self, _config): pass
+    def initialize(self): pass
+    def notify_initialized(self): pass
+    def open_file(self, _file):
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / "partial.idx").write_text("partial", encoding="utf-8")
+        time.sleep(60)
+    def request_document_symbols(self, _file): pass
+    def shutdown(self): pass
+    def close(self): return (0, "")
+
+indexing._IndexLspClient = SlowClient
+indexing.run_background_index(indexing.BackgroundIndexConfig(
+    compile_commands_dir={str(tmp_path)!r},
+    clangd_path={str(clangd)!r},
+    max_wait_seconds=60,
+))
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": ".:tools"},
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if (
+            index_engine_building_path(index_dir).is_file()
+            and (index_dir / "partial.idx").is_file()
+        ):
+            break
+        time.sleep(0.02)
+    else:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail("child did not reach dirty build state")
+    proc.kill()
+    proc.wait(timeout=5)
+
+    after_kill = evaluate_index_health(
+        summarize_compile_commands(tmp_path),
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+
+    assert proc.returncode == -9
+    assert after_kill.health == IndexHealth.UNKNOWN
+    assert after_kill.reason == "index_engine_build_in_progress"
+    assert read_index_engine_version(index_dir) is None
+
+    opened: list[str] = []
+    install_barrier_index_client(
+        monkeypatch, threading.Barrier(1), opened, threading.Lock()
+    )
+    rebuilt = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(clangd),
+            max_wait_seconds=0.2,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    assert rebuilt.health_report.health == IndexHealth.COMPLETE
+    assert read_index_engine_version(index_dir) == "clangd 21.1.1"
+    assert indexing_module.read_index_building_version(index_dir) is None
+    assert not (index_dir / "partial.idx").exists()
+
+
+def test_dirty_publish_failure_does_not_send_initialized_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    events: list[str] = []
+
+    class OrderedClient:
+        engine_version = "clangd 21.1.1"
+
+        def __init__(self, _config: BackgroundIndexConfig):
+            return None
+
+        def initialize(self) -> None:
+            events.append("initialize")
+
+        def notify_initialized(self) -> None:
+            events.append("initialized")
+
+        def open_file(self, _file: str) -> None:
+            events.append("open")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+        def close(self) -> tuple[int, str]:
+            return 0, ""
+
+    def reject_dirty(_index_dir: Path, _engine_version: str) -> None:
+        raise indexing_module._IndexEngineStampError(
+            "index_engine_mismatch", "synthetic ownership rejection"
+        )
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", OrderedClient)
+    monkeypatch.setattr("codegraph.indexing._publish_dirty_marker", reject_dirty)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert result.health_report.reason == "index_engine_mismatch"
+    assert events == ["initialize", "shutdown"]
+
+
+def test_shard_cleanup_failure_retains_dirty_and_skips_initialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    events: list[str] = []
+
+    class OrderedClient:
+        engine_version = "clangd 21.1.1"
+
+        def __init__(self, _config: BackgroundIndexConfig):
+            return None
+
+        def initialize(self) -> None:
+            events.append("initialize")
+
+        def notify_initialized(self) -> None:
+            events.append("initialized")
+
+        def open_file(self, _file: str) -> None:
+            events.append("open")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+        def close(self) -> tuple[int, str]:
+            return 0, ""
+
+    def reject_cleanup(_index_dir: Path) -> None:
+        raise PermissionError("cannot clear")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", OrderedClient)
+    monkeypatch.setattr("codegraph.indexing._clear_index_shards", reject_cleanup)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    assert result.health_report.reason == "index_health_error"
+    assert indexing_module.read_index_building_version(index_dir) == "clangd 21.1.1"
+    assert events == ["initialize", "shutdown"]
+
+
+def test_commit_failure_keeps_dirty_marker_and_never_reports_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    opened: list[str] = []
+    install_barrier_index_client(
+        monkeypatch, threading.Barrier(1), opened, threading.Lock()
+    )
+
+    def reject_commit(_index_dir: Path, _engine_version: str | None) -> None:
+        raise indexing_module._IndexEngineStampError(
+            "index_engine_version_inconsistent", "synthetic commit failure"
+        )
+
+    monkeypatch.setattr("codegraph.indexing._commit_index_build", reject_commit)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+            max_wait_seconds=0.2,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_version_inconsistent"
+    assert read_index_engine_version(index_dir) is None
+    assert indexing_module.read_index_building_version(index_dir) == "clangd 21.1.1"
+
+
+def test_commit_io_failure_is_structured_and_keeps_dirty_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    opened: list[str] = []
+    install_barrier_index_client(
+        monkeypatch, threading.Barrier(1), opened, threading.Lock()
+    )
+
+    def reject_commit(_index_dir: Path, _engine_version: str | None) -> None:
+        raise OSError("synthetic commit I/O failure")
+
+    monkeypatch.setattr("codegraph.indexing._commit_index_build", reject_commit)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+            max_wait_seconds=0.2,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    assert result.health_report.health == IndexHealth.UNKNOWN
+    assert result.health_report.reason == "index_engine_stamp_write_failed"
+    assert "synthetic commit I/O failure" in result.stderr_tail
+    assert read_index_engine_version(index_dir) is None
+    assert indexing_module.read_index_building_version(index_dir) == "clangd 21.1.1"
+
+
+def test_dirty_and_commit_helpers_fail_closed_on_impossible_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+
+    with pytest.raises(ValueError, match="without engine version"):
+        indexing_module._commit_index_build(index_dir, None)
+    with pytest.raises(ValueError, match="dirty marker changed before commit"):
+        indexing_module._commit_index_build(index_dir, "clangd 21.1.1")
+
+    index_engine_stamp_path(index_dir).write_text("clangd 21.1.1\n", encoding="utf-8")
+    index_engine_building_path(index_dir).write_text(
+        "clangd 22.1.8\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="dirty and committed.*disagree"):
+        indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+
+    index_engine_stamp_path(index_dir).unlink()
+    with pytest.raises(ValueError, match="belongs to clangd 22.1.8"):
+        indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+
+    index_engine_building_path(index_dir).write_text(
+        "clangd 21.1.1\n", encoding="utf-8"
+    )
+    reads = iter(("clangd 21.1.1", "clangd 22.1.8"))
+    monkeypatch.setattr(
+        indexing_module, "read_index_building_version", lambda _dir: next(reads)
+    )
+    monkeypatch.setattr(
+        indexing_module, "_publish_engine_marker", lambda _path, _version: _path
+    )
+    with pytest.raises(ValueError, match="dirty marker changed during commit"):
+        indexing_module._commit_index_build(index_dir, "clangd 21.1.1")
+
+    indexing_module._clear_index_shards(tmp_path / "missing-index")
+
+
+def test_invalid_control_directory_blocks_before_client_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    control = index_dir.parent / ".codegraph-control"
+    control.parent.mkdir(parents=True)
+    control.write_text("not a directory", encoding="utf-8")
+    started = False
+
+    def reject_start(_config: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("invalid control path must block before clangd starts")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", reject_start)
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert result.health_report.reason == "index_health_error"
+    assert started is False
+
+
+def test_stale_control_temp_is_outside_shard_scan_and_cleaned_before_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    control_dir = index_dir.parent / ".codegraph-control"
+    control_dir.mkdir(parents=True)
+    stale = control_dir / ".codegraph-marker-stale.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    before = scan_index_shards(index_dir)
+    opened: list[str] = []
+    install_barrier_index_client(
+        monkeypatch, threading.Barrier(1), opened, threading.Lock()
+    )
+
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+            max_wait_seconds=0.2,
+            poll_interval_seconds=0.01,
+            stable_rounds=1,
+        )
+    )
+
+    assert before.total_files == 0
+    assert not stale.exists()
+    assert result.health_report.health == IndexHealth.COMPLETE
+
+
 def test_different_version_builders_claim_before_any_index_side_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -581,6 +1094,7 @@ def test_different_version_builders_claim_before_any_index_side_effect(
     barrier = threading.Barrier(2)
     opened_versions: list[str] = []
     opened_lock = threading.Lock()
+    install_probe_barrier(monkeypatch, barrier)
     install_barrier_index_client(monkeypatch, barrier, opened_versions, opened_lock)
     configs = tuple(
         BackgroundIndexConfig(
@@ -597,7 +1111,7 @@ def test_different_version_builders_claim_before_any_index_side_effect(
         results = tuple(pool.map(run_background_index, configs))
 
     reasons = {result.health_report.reason for result in results}
-    assert reasons == {"shards_ge_unique_tu", "index_engine_mismatch"}
+    assert reasons == {"shards_ge_unique_tu", "index_engine_build_in_progress"}
     assert len(opened_versions) == 1
     index_dir = index_dir_for_compile_commands_dir(tmp_path)
     assert read_index_engine_version(index_dir) == opened_versions[0]
@@ -607,7 +1121,7 @@ def test_different_version_builders_claim_before_any_index_side_effect(
     assert shard_versions == {opened_versions[0]}
 
 
-def test_same_version_builders_are_serialized_by_stamp_lock(
+def test_same_version_builders_are_serialized_by_cache_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     source = tmp_path / "main.c"
@@ -616,6 +1130,7 @@ def test_same_version_builders_are_serialized_by_stamp_lock(
     barrier = threading.Barrier(2)
     opened_versions: list[str] = []
     opened_lock = threading.Lock()
+    install_probe_barrier(monkeypatch, barrier)
     install_barrier_index_client(monkeypatch, barrier, opened_versions, opened_lock)
     clangd = fake_clangd(tmp_path, "21.1.1")
     configs = tuple(
@@ -641,23 +1156,22 @@ def test_same_version_builders_are_serialized_by_stamp_lock(
     )
 
 
-def test_failed_builder_rolls_back_only_its_claim_before_other_version_can_build(
+def test_failed_builder_retains_dirty_and_blocks_other_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     write_cdb(tmp_path, [source])
     barrier = threading.Barrier(2)
-    blocked_peer = threading.Event()
     opened_versions: list[str] = []
     opened_lock = threading.Lock()
+    install_probe_barrier(monkeypatch, barrier)
     install_barrier_index_client(
         monkeypatch,
         barrier,
         opened_versions,
         opened_lock,
         fail_after_open=True,
-        wait_for_blocked_peer=blocked_peer,
     )
     configs = tuple(
         BackgroundIndexConfig(
@@ -674,27 +1188,53 @@ def test_failed_builder_rolls_back_only_its_claim_before_other_version_can_build
         results = tuple(pool.map(run_background_index, configs))
 
     reasons = {result.health_report.reason for result in results}
-    assert reasons == {"index_build_failed", "index_engine_mismatch"}
+    assert reasons == {"index_build_failed", "index_engine_build_in_progress"}
     assert len(opened_versions) == 1
     index_dir = index_dir_for_compile_commands_dir(tmp_path)
     assert read_index_engine_version(index_dir) is None
+    assert indexing_module.read_index_building_version(index_dir) == opened_versions[0]
     assert {path.read_text(encoding="utf-8") for path in index_dir.glob("*.idx")} == {
         opened_versions[0]
     }
 
 
-def test_claim_rollback_does_not_unlink_replaced_inode(tmp_path: Path):
-    index_dir = tmp_path / "index"
-    claim = _claim_index_engine_version(index_dir, "clangd 21.1.1")
-    stamp = index_engine_stamp_path(index_dir)
-    displaced = index_dir / "original-stamp"
-    stamp.rename(displaced)
-    stamp.write_text("clangd 22.1.8\n", encoding="utf-8")
+def test_dirty_and_committed_version_disagreement_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    index_engine_stamp_path(index_dir).write_text("clangd 21.1.1\n", encoding="utf-8")
+    index_engine_building_path(index_dir).write_text(
+        "clangd 22.1.8\n", encoding="utf-8"
+    )
 
-    claim.release(rollback=True)
+    report = evaluate_index_health(
+        summarize_compile_commands(tmp_path),
+        scan_index_shards(index_dir),
+        expected_engine_version="clangd 21.1.1",
+    )
+    started = False
 
-    assert stamp.read_text(encoding="utf-8") == "clangd 22.1.8\n"
-    assert displaced.read_text(encoding="utf-8") == "clangd 21.1.1\n"
+    def reject_start(_config: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("inconsistent ownership must block before clangd starts")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", reject_start)
+    build = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert report.health == IndexHealth.UNKNOWN
+    assert report.reason == "index_engine_version_inconsistent"
+    assert build.health_report.reason == "index_engine_version_inconsistent"
+    assert started is False
 
 
 def test_stamp_identity_check_rejects_replaced_path(tmp_path: Path):
@@ -773,7 +1313,7 @@ def test_background_index_rechecks_lsp_version_before_opening_tu(
     assert ownership_overwritten is False
 
 
-def test_background_index_stamp_claim_failure_is_structured_before_opening_tu(
+def test_background_index_dirty_publish_failure_is_structured_before_opening_tu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     source = tmp_path / "main.c"
@@ -790,6 +1330,9 @@ def test_background_index_stamp_claim_failure_is_structured_before_opening_tu(
         def initialize(self) -> None:
             return None
 
+        def notify_initialized(self) -> None:
+            return None
+
         def open_file(self, file: str) -> None:
             opened_files.append(file)
 
@@ -803,7 +1346,7 @@ def test_background_index_stamp_claim_failure_is_structured_before_opening_tu(
         raise PermissionError("stamp parent is not writable")
 
     monkeypatch.setattr("codegraph.indexing._IndexLspClient", FakeClient)
-    monkeypatch.setattr("codegraph.indexing._claim_index_engine_version", fail_claim)
+    monkeypatch.setattr("codegraph.indexing._publish_dirty_marker", fail_claim)
 
     result = run_background_index(
         BackgroundIndexConfig(
@@ -890,17 +1433,23 @@ def test_unstamped_non_idx_cache_is_not_auto_claimed(tmp_path: Path):
     "stamp_state",
     ["invalid", "directory", "unreadable", "valid_symlink", "dangling_symlink"],
 )
+@pytest.mark.parametrize("marker_kind", ["committed", "dirty"])
 def test_invalid_engine_stamp_blocks_background_index_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stamp_state: str,
+    marker_kind: str,
 ):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     write_cdb(tmp_path, [source])
     index_dir = index_dir_for_compile_commands_dir(tmp_path)
     index_dir.mkdir(parents=True)
-    stamp = index_engine_stamp_path(index_dir)
+    stamp = (
+        index_engine_stamp_path(index_dir)
+        if marker_kind == "committed"
+        else index_engine_building_path(index_dir)
+    )
     if stamp_state == "directory":
         stamp.mkdir()
     elif stamp_state in {"valid_symlink", "dangling_symlink"}:
@@ -911,16 +1460,14 @@ def test_invalid_engine_stamp_blocks_background_index_start(
     else:
         stamp.write_text("not-a-clangd-version\n", encoding="utf-8")
     if stamp_state == "unreadable":
-        original_open_stamp = indexing_module._open_index_engine_stamp
+        original_open_stamp = indexing_module._open_engine_marker
 
         def deny_stamp_read(path: Path) -> tuple[int, os.stat_result] | None:
             if path == stamp:
                 raise PermissionError(f"permission denied: {path}")
             return original_open_stamp(path)
 
-        monkeypatch.setattr(
-            indexing_module, "_open_index_engine_stamp", deny_stamp_read
-        )
+        monkeypatch.setattr(indexing_module, "_open_engine_marker", deny_stamp_read)
     client_started = False
 
     def fail_if_started(_config: object) -> object:
@@ -993,6 +1540,22 @@ def test_stamp_existing_index_requires_health_and_rejects_conflicts(tmp_path: Pa
     clangd_22 = fake_clangd(tmp_path, "22.1.8")
     with pytest.raises(ValueError, match="conflicting index engine stamp"):
         stamp_existing_index(tmp_path, str(clangd_22))
+
+
+def test_stamp_existing_index_rejects_dirty_cache(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    index_engine_building_path(index_dir).write_text(
+        "clangd 21.1.1\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="dirty build marker"):
+        stamp_existing_index(tmp_path, str(fake_clangd(tmp_path, "21.1.1")))
+
+    assert read_index_engine_version(index_dir) is None
 
 
 def test_stamp_existing_index_rejects_incomplete_cache_and_unknown_engine(
@@ -1167,14 +1730,19 @@ def test_build_index_cli_invalid_stamp_reports_structured_block(
     payload = json.loads(completed.stdout)
 
     assert completed.returncode == 1
-    assert payload["health"]["health"] == IndexHealth.UNKNOWN
-    assert payload["health"]["reason"] == "index_engine_stamp_invalid"
+    if stamp_existing:
+        assert payload["health"] == IndexHealth.UNKNOWN
+        assert payload["reason"] == "index_engine_stamp_invalid"
+    else:
+        assert payload["health"]["health"] == IndexHealth.UNKNOWN
+        assert payload["health"]["reason"] == "index_engine_stamp_invalid"
     assert "Traceback" not in completed.stderr
 
 
 @pytest.mark.parametrize("target_state", ["valid", "dangling"])
+@pytest.mark.parametrize("marker_kind", ["committed", "dirty"])
 def test_build_index_cli_rejects_symlink_engine_stamp(
-    tmp_path: Path, target_state: str
+    tmp_path: Path, target_state: str, marker_kind: str
 ):
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
@@ -1184,7 +1752,12 @@ def test_build_index_cli_rejects_symlink_engine_stamp(
     target = tmp_path / "outside-stamp"
     if target_state == "valid":
         target.write_text("clangd 21.1.1\n", encoding="utf-8")
-    index_engine_stamp_path(index_dir).symlink_to(target)
+    marker = (
+        index_engine_stamp_path(index_dir)
+        if marker_kind == "committed"
+        else index_engine_building_path(index_dir)
+    )
+    marker.symlink_to(target)
 
     completed = subprocess.run(
         [

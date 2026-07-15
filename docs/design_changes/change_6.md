@@ -156,6 +156,19 @@ found → FAILED）已是第一个实例；需补：clangd 版本探测 + 结果
   错误版本，会把一份错版索引伪装成可验证的健康索引。来源不确定时必须在空目录中用目标 clangd
   重建。真机原始 `rw_arm` cache 曾被 clangd 21 接触并从 3593 增至 3614 分片，已发生跨版本
   污染，禁止对该目录执行追认。
+- **实现采用 dirty/committed 双标记**：`.codegraph_building` 只表示某一精确 clangd 版本已
+  认领一次尚未认证完成的完整建库；`.codegraph_engine` 只在分片稳定且 health=complete 后发布。
+  只要 dirty 存在，任何 shard 数都不得解释为 complete；同版本可在取得 cache 独占锁后清除旧
+  `.idx` 并从零接管重建，异版本必须 fail-closed。committed 已发布但 dirty 尚未清除时仍以 dirty
+  为准，避免提交窗口崩溃把半完成目录伪装成健康索引。
+- **cache 读写共用锁协议**：完整 builder 与 `--stamp-existing-index` 持独占锁；启用
+  background-index 的查询从所有权校验前到 clangd 关闭持共享锁。锁竞争或锁自身不可验证均按
+  `INDEX_UNKNOWN` 阻断，防止 API 与 builder 或两个异版本 builder 交错写同一 cache。无 stamp
+  存量 cache 仍可保守查询，但 adapter 强制 `background_index=false`，不向未确认所有权的目录
+  写分片。
+- **完整建库入口不提供增量语义**：`run_background_index()` 每次在发布 dirty 后清除既有 `.idx`
+  并从零建库。这样同版本接管崩溃残留时不会被旧 partial shard 的稳定计数提前判 complete；增量
+  索引如需支持，必须另设带独立完成证据的入口。
 
 ## 7. 已验证事实（存档）
 - 三版本编译：clangd 21.1.1（build 52min）、22.1.8（build 58min）到 /home，18 用系统版本。
