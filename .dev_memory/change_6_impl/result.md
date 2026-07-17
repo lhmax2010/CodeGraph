@@ -3,7 +3,7 @@
 ## 最终状态
 - 第六轮 namespace/lease/defer-initialized 加固已实现并通过 deterministic gate；真实防线
   spot-check 与 verified committed cache 上的 `389 refs/62 files` 核心价值回归均通过；
-  Claude Code、Kimi、Codex、Gemini 四路 Review 全票通过，待 fast-forward merge。
+  Claude Code、Kimi、Codex、Gemini 四路 Review 全票通过，已 fast-forward merge 到 `main`。
 
 ## 测试情况
 - Baseline：`159 passed in 3.74s`
@@ -80,7 +80,7 @@
 
 ## 代码
 - 分支：`impl/change-6-multiversion`
-- 对应 Git Commit：见该分支 HEAD；未 merge。
+- 对应 Git Commit：`9de966d`；checkpoint：`checkpoint/change_6_implementation`；已 merge 到 `main`。
 
 ## Review
 - Codex：完整 staged diff 自审与安全路径复核，无遗留 BLOCKER/MAJOR；实现中发现并修正了 mismatch 必须在默认 clangd 启动前拦截、显式 kind 不能因 health 降级而失真、stamp 后 CLI payload 需重扫分片等问题。
@@ -112,5 +112,5 @@
 - 本实现涉及索引诚实性防线，已通过 Claude Code、Kimi、Codex、Gemini 四路异构 Review。
 
 ## 下一步
-- 第六轮 `c8b79c2` 已推送，Claude Code、Kimi、Codex、Gemini 四路全票通过；完成三个 review NIT
-  后按用户指令 fast-forward merge 收口。
+- 第六轮 `c8b79c2` 与最终 NIT 收口 `9de966d` 已推送，Claude Code、Kimi、Codex、Gemini 四路
+  全票通过；change_6 多版本 clangd support 已完成 merge 与 checkpoint 收口。

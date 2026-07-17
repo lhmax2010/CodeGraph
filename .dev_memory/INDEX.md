@@ -3,9 +3,9 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：change_6_impl（review 修复完成，待异构复核）
-- 最后已确认 stage（已 Merge）：stage08_call_hierarchy
-- 设计基线：docs/design.md v1.5.0 Frozen（2026-07-13；R1 change_2/change_3/change_4/change_5/change_6 已应用；change_6 已冻结，多版本 clangd support）
+- 当前活跃 stage：无
+- 最后已确认 stage（已 Merge）：change_6_impl
+- 设计基线：docs/design.md v1.5.0 Frozen（change_6 多版本 clangd support 的设计与实现已全闭环）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
 
 ## stage 列表
@@ -19,7 +19,7 @@
 | stage06 | e2e | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_6_e2e` |
 | stage07 | find_references | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_7_find_references` |
 | stage08 | call_hierarchy | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_8_call_hierarchy` |
-| change_6_impl | multiversion clangd | 待 Review | N/A（按用户要求只 push 不走 PR） | `impl/change-6-multiversion` 分支 HEAD |
+| change_6_impl | multiversion clangd | 已 Merge | N/A（按用户要求只 push 不走 PR） | `9de966d` / `checkpoint/change_6_implementation` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
