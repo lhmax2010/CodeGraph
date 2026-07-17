@@ -2,8 +2,8 @@
 
 ## 最终状态
 - 第六轮 namespace/lease/defer-initialized 加固已实现并通过 deterministic gate；真实防线
-  spot-check 与 `389 refs/62 files` 核心价值回归均通过；待第六轮用户异构多路 Review 全票确认，
-  尚未 merge。
+  spot-check 与 verified committed cache 上的 `389 refs/62 files` 核心价值回归均通过；
+  Claude Code、Kimi、Codex、Gemini 四路 Review 全票通过，待 fast-forward merge。
 
 ## 测试情况
 - Baseline：`159 passed in 3.74s`
@@ -95,19 +95,22 @@
 - 第五轮 gstack Claude：完整 delta tool-less review 在 240s 内无 JSON/审查文本，按超时处理，
   不计 APPROVE。
 - 第六轮：deterministic 自审和 30 轮并发稳定性已完成；真实 symlink、lock-path replacement、
-  mismatch 与三版本 callees spot-check 通过。资源恢复后正式 CodeGraph API 连续三次复现
-  `389/62`，现可进入用户异构多路 Review；Review 全票前仍不得 merge。
+  mismatch 与三版本 callees spot-check 通过。verified committed cache 上已复现
+  `389/62`（隔离重建实测，含 `indexed_project` scope 与正确 `engine_version`）；legacy 未 stamp 的
+  `rw_arm` 按既定 `unverified -> background_index=false` 行为只返回 `2 refs / 1 file`，未冒充项目级结果。
+  Claude Code、Kimi、Codex、Gemini 四路 Review 全票通过。
 
 ## 遗留问题 / 风险
-- [第六轮真机 gate·已关闭] clangd 21 正式 CodeGraph API 连续三次 references 均为
-  `389/62`、`381 semantic + 8 candidates`、`OK/complete/indexed_project`、`is_exhaustive=False`，
-  耗时 `2.930s / 2.953s / 2.925s`；3595 个分片的数量/字节/max-mtime 前后不变。
+- [第六轮真机 gate·已关闭] clangd 21 的 verified committed cache 上复现
+  `389/62`、`381 semantic + 8 candidates`、`OK/complete/indexed_project`、`is_exhaustive=False`
+  与正确 `engine_version`；该 cache 来自版本隔离重建，3595 个分片的数量/字节/max-mtime 前后不变。
+  legacy 未 stamp 的 `rw_arm` 则按 `unverified -> background_index=false` 返回 `2 refs / 1 file`。
 - 本阶段按冻结设计使用完整 patch 版本精确匹配；是否允许同 major 的索引兼容留二期，不在本实现放宽。
 - `--stamp-existing-index` 是显式人工 provenance attestation：它验证 CDB/分片 health、当前 clangd 版本、冲突 stamp，但无法从无 stamp 分片反推历史 builder；来源不确定时必须空目录重建。
 - 原始 `rw_arm` cache 曾被 clangd 21 接触并从 3593 增至 3614 分片，属于已污染来源，禁止使用 `--stamp-existing-index` 追认。
 - 不存在符号的 `workspace/symbol` 真机耗时为 18=24.672s、21=27.032s、22=29.295s；诚实性正确但性能值得后续独立 harden。
-- 本实现涉及索引诚实性防线，必须通过用户异构多路 Review 后才能 merge。
+- 本实现涉及索引诚实性防线，已通过 Claude Code、Kimi、Codex、Gemini 四路异构 Review。
 
 ## 下一步
-- commit + push 第五轮守卫修复，供用户侧异构 review 按“任何路径 × 任何 marker 状态 × 任何并发
-  交错”构造性复核；全票通过后才可等待 merge 收口。
+- 第六轮 `c8b79c2` 已推送，Claude Code、Kimi、Codex、Gemini 四路全票通过；完成三个 review NIT
+  后按用户指令 fast-forward merge 收口。

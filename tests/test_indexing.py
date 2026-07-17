@@ -1321,7 +1321,7 @@ def test_control_directory_symlink_blocks_marker_publish(
     control.symlink_to(target, target_is_directory=True)
     outside_before = tuple(target.iterdir()) if target.exists() else ()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(indexing_module._IndexEngineStampError):
         write_index_engine_version(index_dir, "clangd 21.1.1")
 
     assert (tuple(target.iterdir()) if target.exists() else ()) == outside_before
