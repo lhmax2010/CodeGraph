@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：无
+- 当前活跃 stage：stage09_mcp_server（实现与真机 gate 完成，待异构 Review）
 - 最后已确认 stage（已 Merge）：change_6_impl
 - 设计基线：docs/design.md v1.5.0 Frozen（change_6 多版本 clangd support 的设计与实现已全闭环）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -20,6 +20,7 @@
 | stage07 | find_references | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_7_find_references` |
 | stage08 | call_hierarchy | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_8_call_hierarchy` |
 | change_6_impl | multiversion clangd | 已 Merge | N/A（按用户要求只 push 不走 PR） | `9de966d` / `checkpoint/change_6_implementation` |
+| stage09 | mcp_server | 进行中 | N/A（按用户要求只 push 不走 PR） | `phase/9-mcp-server` |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
