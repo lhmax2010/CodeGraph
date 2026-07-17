@@ -53,6 +53,7 @@ class ClangdAdapterConfig:
     request_timeout: float = 30.0
     diagnostics_wait: float = 0.5
     verbose: bool = False
+    defer_initialized: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.extra_args, tuple) or not all(
@@ -74,6 +75,7 @@ class ClangdAdapter:
     ):
         self.config = config
         self.engine_version: str | None = None
+        self._initialized_notified = False
         self._probe_executable_version = client_factory is LSPClient
         self.compile_dir = _compile_dir(config.compile_commands_dir)
         extra_args = [
@@ -110,6 +112,14 @@ class ClangdAdapter:
         """Open a TU so clangd can attach compile flags and load its project index."""
 
         self._open_document(file)
+
+    def notify_initialized(self) -> None:
+        """Finish LSP startup after an external ownership guard has passed."""
+
+        if self._initialized_notified:
+            return
+        self._client.notify("initialized", {})
+        self._initialized_notified = True
 
     def search_symbol(
         self,
@@ -256,7 +266,8 @@ class ClangdAdapter:
         self.engine_version = clangd_version_from_initialize(result)
         if self.engine_version is None and self._probe_executable_version:
             self.engine_version = detect_clangd_version(self.config.clangd_path)
-        self._client.notify("initialized", {})
+        if not self.config.defer_initialized:
+            self.notify_initialized()
 
     def _open_document(self, file: str) -> str:
         path = os.path.abspath(file)

@@ -166,9 +166,22 @@ found → FAILED）已是第一个实例；需补：clangd 版本探测 + 结果
   `INDEX_UNKNOWN` 阻断，防止 API 与 builder 或两个异版本 builder 交错写同一 cache。无 stamp
   存量 cache 仍可保守查询，但 adapter 强制 `background_index=false`，不向未确认所有权的目录
   写分片。
+- **锁与 marker 的 inode 绑定协议**：cache lock 文件是永久基础设施，CodeGraph 不删除它；取得
+  `flock` 后必须复核 fd 与路径仍指向同一 inode。锁序固定为 cache lock → committed marker lease →
+  dirty marker lease，逆序释放。builder 持 dirty 独占 lease 覆盖认领至 commit/失败全程，API 对
+  verified cache 持 committed 共享 lease 覆盖 adapter 生命周期；即使 lock 路径被外部删除重建，
+  活跃 builder/API 仍不能与新进程形成 split-brain。index/control 目录及 marker 必须是本目录内
+  的真实目录/普通文件，任何 symlink 或身份替换均 fail-closed。
 - **完整建库入口不提供增量语义**：`run_background_index()` 每次在发布 dirty 后清除既有 `.idx`
   并从零建库。这样同版本接管崩溃残留时不会被旧 partial shard 的稳定计数提前判 complete；增量
   索引如需支持，必须另设带独立完成证据的入口。
+- **崩溃与断电边界**：上述协议保证正常并发、优雅失败及进程崩溃/SIGKILL 后的保守恢复；不承诺
+  机器断电时 shards 与 marker 的跨文件原子持久化。对真实 1303-TU 索引逐分片 fsync 的实测额外
+  耗时约 31.2s，MVP 选择明确声明边界而不承担该成本。断电后应以 dirty/health 重新验证，无法
+  证明完整时从零重建。
+- **verified API 的同版本刷新语义**：多个已验证 API 查询可由同版本 clangd 刷新自身 cache；
+  clangd 的 shard store 使用临时输出后原子替换。CodeGraph 的 lease 负责阻断 builder/跨版本交错，
+  不把同版本查询强制改成只读。该保证不放宽版本隔离，也不把 background-index 结果声明为穷尽。
 
 ## 7. 已验证事实（存档）
 - 三版本编译：clangd 21.1.1（build 52min）、22.1.8（build 58min）到 /home，18 用系统版本。

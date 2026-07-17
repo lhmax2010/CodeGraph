@@ -227,6 +227,9 @@ class NeverReadyEngine:
     def __exit__(self, *_exc: object) -> None:
         return None
 
+    def notify_initialized(self) -> None:
+        self.initialized_calls = getattr(self, "initialized_calls", 0) + 1
+
     def warm_file(self, file: str) -> None:
         self.warmed_file = file
 
@@ -1292,6 +1295,23 @@ def test_unstamped_index_is_unknown_and_cannot_claim_project_scope(tmp_path: Pat
     assert after == before
 
 
+def test_codegraph_adapter_configs_always_defer_initialized(tmp_path: Path):
+    write_project(tmp_path)
+    client = CodeGraph(BuildConfig("test", str(tmp_path), background_index=True))
+    health = IndexHealthReport(
+        health=IndexHealth.COMPLETE,
+        reason="shards_ge_unique_tu",
+        unique_tu_count=2,
+        idx_shards=2,
+        index_dir=str(tmp_path / ".cache" / "clangd" / "index"),
+        expected_engine_version="clangd 18.1.3",
+        index_engine_version="clangd 18.1.3",
+    )
+
+    assert client._clangd_config(health).defer_initialized is True
+    assert client._clangd_config(None).defer_initialized is True
+
+
 def test_missing_index_ownership_also_disables_background_index_writes(
     tmp_path: Path,
 ):
@@ -1343,6 +1363,7 @@ def test_probe_claim_is_rechecked_against_started_engine(tmp_path: Path):
     assert result.index_health == "unknown"
     assert result.semantic_results == []
     assert engine.find_callers_calls == 0
+    assert getattr(engine, "initialized_calls", 0) == 0
     mismatch = next(
         note for note in result.notes if note.code == IssueCode.INDEX_ENGINE_MISMATCH
     )
@@ -1518,6 +1539,32 @@ def test_index_health_error_blocks_before_engine_factory(tmp_path: Path):
     assert "health evaluation failed" in unknown.detail
 
 
+def test_index_directory_symlink_blocks_api_before_engine_factory(tmp_path: Path):
+    write_project(tmp_path)
+    external = tmp_path / "outside-index"
+    external.mkdir()
+    clangd_cache = tmp_path / ".cache" / "clangd"
+    clangd_cache.mkdir(parents=True)
+    (clangd_cache / "index").symlink_to(external, target_is_directory=True)
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    result = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=count_factory_calls,
+    ).search_symbol("add", kind_filter="function")
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    assert not tuple(external.iterdir())
+
+
 def test_build_in_progress_blocks_before_engine_factory(tmp_path: Path):
     write_project(tmp_path)
     index_dir = tmp_path / ".cache" / "clangd" / "index"
@@ -1603,6 +1650,37 @@ def test_api_shared_lock_blocks_builder_without_cache_mixing(tmp_path: Path):
         for path in index_dir.glob("*.idx")
     }
     assert after == before
+
+
+def test_verified_health_without_committed_lease_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    write_project(tmp_path)
+    touch_complete_index(tmp_path)
+    factory_calls = 0
+
+    def count_factory_calls(_config: object) -> NeverReadyEngine:
+        nonlocal factory_calls
+        factory_calls += 1
+        return NeverReadyEngine()
+
+    monkeypatch.setattr(
+        "codegraph.api.acquire_index_engine_lease",
+        lambda _index_dir, *, exclusive: None,
+    )
+    result = CodeGraph(
+        BuildConfig("test", str(tmp_path), background_index=True),
+        engine_version_probe=fake_engine_version_probe,
+        engine_factory=count_factory_calls,
+    ).search_symbol("add", kind_filter="function")
+
+    assert factory_calls == 0
+    assert result.status == QueryStatus.UNRESOLVED
+    assert result.index_health == "unknown"
+    unknown = next(
+        note for note in result.notes if note.code == IssueCode.INDEX_UNKNOWN
+    )
+    assert "build in progress" in unknown.detail
 
 
 def test_stamp_write_failure_maps_to_index_unknown(

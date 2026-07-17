@@ -1,8 +1,9 @@
 # Change 6 Implementation - Multiversion clangd / Result
 
 ## 最终状态
-- 第五轮 dirty/committed 状态机、cache 共享/独占锁与完整重建语义已实现，并通过 deterministic
-  与真机 gate；等待第五轮异构多路 Review 全票确认，尚未 merge。
+- 第六轮 namespace/lease/defer-initialized 加固已实现并通过 deterministic gate；真实防线
+  spot-check 与 `389 refs/62 files` 核心价值回归均通过；待第六轮用户异构多路 Review 全票确认，
+  尚未 merge。
 
 ## 测试情况
 - Baseline：`159 passed in 3.74s`
@@ -12,9 +13,11 @@
 - 第四轮守卫加固后最终 coverage gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch` → `217 passed in 5.29s`。
 - 第五轮最终 coverage gate：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph --cov-branch`
   → `249 passed in 29.77s`（Python 3.12.3）。
+- 第六轮最终 deterministic coverage gate：同命令 → `271 passed in 18.39s`（Python 3.12.3）。
 - 修复后覆盖率：总计 92%（含 branch）；`api.py` 行覆盖 94%、综合 92%，`indexing.py` 行覆盖 91%、综合 89%，`clangd_adapter.py` 99%，`engine_version.py` 94%。
 - 第四轮覆盖率：总计 92%（含 branch）；`api.py` 93%，核心 `indexing.py` 90%，`clangd_adapter.py` 99%，`engine_version.py` 94%。
 - 第五轮覆盖率：总计 92%（含 branch）；`api.py` 92%，核心 `indexing.py` 90%，`clangd_adapter.py` 99%，`engine_version.py` 94%。
+- 第六轮覆盖率：总计 92%（含 branch）；`api.py` 92%，核心 `indexing.py` 90%，`clangd_adapter.py` 99%，`engine_version.py` 94%。
 - 静态 gate：ruff、black --check、带固定 tree-sitter binding 的 mypy codegraph、compileall、git diff --check 全绿。
 - 新增覆盖：
   - LSP/serverInfo 版本提取与规范化；call graph 版本元数据成功/FAILED 路径。
@@ -91,8 +94,14 @@
   能力失败或超时均不计票，用户要求全票前不得 merge。
 - 第五轮 gstack Claude：完整 delta tool-less review 在 240s 内无 JSON/审查文本，按超时处理，
   不计 APPROVE。
+- 第六轮：deterministic 自审和 30 轮并发稳定性已完成；真实 symlink、lock-path replacement、
+  mismatch 与三版本 callees spot-check 通过。资源恢复后正式 CodeGraph API 连续三次复现
+  `389/62`，现可进入用户异构多路 Review；Review 全票前仍不得 merge。
 
 ## 遗留问题 / 风险
+- [第六轮真机 gate·已关闭] clangd 21 正式 CodeGraph API 连续三次 references 均为
+  `389/62`、`381 semantic + 8 candidates`、`OK/complete/indexed_project`、`is_exhaustive=False`，
+  耗时 `2.930s / 2.953s / 2.925s`；3595 个分片的数量/字节/max-mtime 前后不变。
 - 本阶段按冻结设计使用完整 patch 版本精确匹配；是否允许同 major 的索引兼容留二期，不在本实现放宽。
 - `--stamp-existing-index` 是显式人工 provenance attestation：它验证 CDB/分片 health、当前 clangd 版本、冲突 stamp，但无法从无 stamp 分片反推历史 builder；来源不确定时必须空目录重建。
 - 原始 `rw_arm` cache 曾被 clangd 21 接触并从 3593 增至 3614 分片，属于已污染来源，禁止使用 `--stamp-existing-index` 追认。

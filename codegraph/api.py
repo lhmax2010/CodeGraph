@@ -26,7 +26,9 @@ from .factories import make_error_credibility
 from .indexing import (
     IndexCacheLock,
     IndexHealthReport,
+    IndexMarkerLease,
     acquire_index_cache_lock,
+    acquire_index_engine_lease,
     evaluate_index_health,
     index_dir_for_compile_commands_dir,
     scan_index_shards,
@@ -269,21 +271,28 @@ class CodeGraph:
     def prewarm(self, file: str | None = None) -> bool:
         """Warm clangd/index caches; each user query still proves readiness itself."""
 
-        with _query_index_cache_lock(self.config) as lock_health:
+        with _query_index_cache_lock(self.config) as (lock_health, owner_leased):
             if lock_health is not None:
                 return False
-            return self._prewarm_locked(file)
+            return self._prewarm_locked(file, owner_leased=owner_leased)
 
-    def _prewarm_locked(self, file: str | None = None) -> bool:
+    def _prewarm_locked(self, file: str | None = None, *, owner_leased: bool) -> bool:
         health = _initial_index_health(self.config, self._engine_version_probe)
+        health = _health_requiring_owner_lease(
+            health, self.config, owner_leased=owner_leased
+        )
         if _index_engine_blocks_use(health, self.config.background_index):
             return False
         try:
             with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
+                health = _health_requiring_owner_lease(
+                    health, self.config, owner_leased=owner_leased
+                )
                 if _index_engine_blocks_use(health, self.config.background_index):
                     return False
+                _notify_engine_initialized(engine)
                 ready = _warm_background_index(
                     engine,
                     self.config,
@@ -309,7 +318,7 @@ class CodeGraph:
         limit: int = 100,
         offset: int = 0,
     ) -> QueryResult:
-        with _query_index_cache_lock(self.config) as lock_health:
+        with _query_index_cache_lock(self.config) as (lock_health, owner_leased):
             if lock_health is not None:
                 query = QueryMeta("entity", symbol, self.config.build_config_id)
                 kind = _normalize_kind_filter(kind_filter)
@@ -320,7 +329,11 @@ class CodeGraph:
                     symbol_kind=_search_symbol_kind(kind),
                 )
             return self._search_symbol_locked(
-                symbol, kind_filter=kind_filter, limit=limit, offset=offset
+                symbol,
+                kind_filter=kind_filter,
+                limit=limit,
+                offset=offset,
+                owner_leased=owner_leased,
             )
 
     def _search_symbol_locked(
@@ -330,6 +343,7 @@ class CodeGraph:
         kind_filter: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        owner_leased: bool,
     ) -> QueryResult:
         query = QueryMeta("entity", symbol, self.config.build_config_id)
         kind = _normalize_kind_filter(kind_filter)
@@ -337,6 +351,9 @@ class CodeGraph:
             return _invalid_result(query, f"invalid kind_filter: {kind_filter}")
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
+        health = _health_requiring_owner_lease(
+            health, self.config, owner_leased=owner_leased
+        )
         if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
@@ -349,6 +366,9 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
+                health = _health_requiring_owner_lease(
+                    health, self.config, owner_leased=owner_leased
+                )
                 if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
@@ -356,6 +376,7 @@ class CodeGraph:
                         active_config=self.config.active_config,
                         symbol_kind=_search_symbol_kind(kind),
                     )
+                _notify_engine_initialized(engine)
                 ready = _warm_background_index(engine, self.config)
                 engine_limit = _semantic_search_limit(limit, offset)
                 observation = engine.search_symbol(
@@ -408,7 +429,7 @@ class CodeGraph:
         *,
         allow_syntactic_fallback: bool = False,
     ) -> QueryResult:
-        with _query_index_cache_lock(self.config) as lock_health:
+        with _query_index_cache_lock(self.config) as (lock_health, owner_leased):
             if lock_health is not None:
                 query = QueryMeta(
                     "entity",
@@ -428,6 +449,7 @@ class CodeGraph:
                 file,
                 pos,
                 allow_syntactic_fallback=allow_syntactic_fallback,
+                owner_leased=owner_leased,
             )
 
     def _get_definition_locked(
@@ -437,6 +459,7 @@ class CodeGraph:
         pos: Pos,
         *,
         allow_syntactic_fallback: bool = False,
+        owner_leased: bool,
     ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta("entity", symbol, self.config.build_config_id, real_file, pos)
@@ -445,6 +468,9 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
+        health = _health_requiring_owner_lease(
+            health, self.config, owner_leased=owner_leased
+        )
         if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
@@ -457,6 +483,9 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
+                health = _health_requiring_owner_lease(
+                    health, self.config, owner_leased=owner_leased
+                )
                 if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
@@ -464,6 +493,7 @@ class CodeGraph:
                         active_config=self.config.active_config,
                         symbol_kind=SymbolKind.UNKNOWN,
                     )
+                _notify_engine_initialized(engine)
                 ready = _warm_background_index(engine, self.config, real_file)
                 observation = engine.get_definition(symbol, real_file, pos)
         except Exception as exc:  # noqa: BLE001 - API reports engine failures.
@@ -500,7 +530,7 @@ class CodeGraph:
         offset: int = 0,
         allow_syntactic_fallback: bool = False,
     ) -> QueryResult:
-        with _query_index_cache_lock(self.config) as lock_health:
+        with _query_index_cache_lock(self.config) as (lock_health, owner_leased):
             if lock_health is not None:
                 query = QueryMeta(
                     "entity",
@@ -522,6 +552,7 @@ class CodeGraph:
                 limit=limit,
                 offset=offset,
                 allow_syntactic_fallback=allow_syntactic_fallback,
+                owner_leased=owner_leased,
             )
 
     def _find_references_locked(
@@ -533,6 +564,7 @@ class CodeGraph:
         limit: int = 100,
         offset: int = 0,
         allow_syntactic_fallback: bool = False,
+        owner_leased: bool,
     ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta("entity", symbol, self.config.build_config_id, real_file, pos)
@@ -541,6 +573,9 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
+        health = _health_requiring_owner_lease(
+            health, self.config, owner_leased=owner_leased
+        )
         if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
@@ -555,6 +590,9 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
+                health = _health_requiring_owner_lease(
+                    health, self.config, owner_leased=owner_leased
+                )
                 if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
@@ -562,6 +600,7 @@ class CodeGraph:
                         active_config=self.config.active_config,
                         symbol_kind=SymbolKind.UNKNOWN,
                     )
+                _notify_engine_initialized(engine)
                 warmup_file = _reference_warmup_file(self.config, real_file)
                 _warm_references_file(engine, self.config, warmup_file)
                 observation, ready = _find_references_with_stable_cross_tu(
@@ -660,7 +699,7 @@ class CodeGraph:
         offset: int,
         allow_syntactic_fallback: bool,
     ) -> QueryResult:
-        with _query_index_cache_lock(self.config) as lock_health:
+        with _query_index_cache_lock(self.config) as (lock_health, owner_leased):
             if lock_health is not None:
                 query = QueryMeta(
                     "relation",
@@ -683,6 +722,7 @@ class CodeGraph:
                 limit=limit,
                 offset=offset,
                 allow_syntactic_fallback=allow_syntactic_fallback,
+                owner_leased=owner_leased,
             )
 
     def _find_call_edges_locked(
@@ -695,6 +735,7 @@ class CodeGraph:
         limit: int,
         offset: int,
         allow_syntactic_fallback: bool,
+        owner_leased: bool,
     ) -> QueryResult:
         real_file = str(Path(file).resolve())
         query = QueryMeta(
@@ -705,6 +746,9 @@ class CodeGraph:
             return _invalid_result(query, invalid)
         provider = create_treesitter_provider(self.config.source_roots)
         health = _initial_index_health(self.config, self._engine_version_probe)
+        health = _health_requiring_owner_lease(
+            health, self.config, owner_leased=owner_leased
+        )
         if _index_engine_blocks_use(health, self.config.background_index):
             return _index_guard_unresolved(
                 query,
@@ -719,6 +763,9 @@ class CodeGraph:
             with self._engine_factory(self._clangd_config(health)) as engine:
                 engine_version = _managed_engine_version(engine)
                 health = _index_health(self.config, engine_version)
+                health = _health_requiring_owner_lease(
+                    health, self.config, owner_leased=owner_leased
+                )
                 if _index_engine_blocks_use(health, self.config.background_index):
                     return _index_guard_unresolved(
                         query,
@@ -727,6 +774,7 @@ class CodeGraph:
                         symbol_kind=SymbolKind.ORDINARY_FUNCTION,
                         engine_version=engine_version,
                     )
+                _notify_engine_initialized(engine)
                 warmup_file = _reference_warmup_file(self.config, real_file)
                 _warm_references_file(engine, self.config, warmup_file)
                 observation, ready = _find_call_edges_with_stable_cross_tu(
@@ -792,6 +840,7 @@ class CodeGraph:
             background_index=background_index,
             request_timeout=self.config.request_timeout,
             diagnostics_wait=self.config.diagnostics_wait,
+            defer_initialized=True,
         )
 
 
@@ -1149,16 +1198,23 @@ def _ensure_background_index_results_are_non_exhaustive(
 @contextmanager
 def _query_index_cache_lock(
     config: BuildConfig,
-) -> Iterator[IndexHealthReport | None]:
+) -> Iterator[tuple[IndexHealthReport | None, bool]]:
     if not config.background_index:
-        yield None
+        yield None, False
         return
 
     index_dir = index_dir_for_compile_commands_dir(config.compile_commands_dir)
     lock: IndexCacheLock | None = None
+    committed_lease: IndexMarkerLease | None = None
     try:
         lock = acquire_index_cache_lock(index_dir, exclusive=False)
+        # Lock order: cache lock -> committed lease -> dirty lease. Queries
+        # never take dirty; builders release dirty, committed, then cache.
+        committed_lease = acquire_index_engine_lease(index_dir, exclusive=False)
     except (OSError, ValueError) as exc:
+        if lock is not None:
+            lock.release()
+            lock = None
         reason = getattr(exc, "reason", "index_health_error")
         yield IndexHealthReport(
             health=IndexHealth.UNKNOWN,
@@ -1166,12 +1222,40 @@ def _query_index_cache_lock(
             unique_tu_count=0,
             idx_shards=0,
             index_dir=str(index_dir.resolve()),
-        )
+        ), False
         return
     try:
-        yield None
+        yield None, committed_lease is not None
     finally:
+        if committed_lease is not None:
+            committed_lease.release()
         lock.release()
+
+
+def _notify_engine_initialized(engine: EngineObservation) -> None:
+    notify = getattr(engine, "notify_initialized", None)
+    if callable(notify):
+        notify()
+
+
+def _health_requiring_owner_lease(
+    health: IndexHealthReport,
+    config: BuildConfig,
+    *,
+    owner_leased: bool,
+) -> IndexHealthReport:
+    if (
+        config.background_index
+        and health.index_engine_version is not None
+        and health.index_engine_version == health.expected_engine_version
+        and not owner_leased
+    ):
+        return replace(
+            health,
+            health=IndexHealth.UNKNOWN,
+            reason="index_engine_build_in_progress",
+        )
+    return health
 
 
 def _index_health(

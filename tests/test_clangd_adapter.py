@@ -153,6 +153,22 @@ def test_initialize_captures_and_normalizes_server_version(tmp_path: Path):
     assert adapter.engine_version == "clangd 21.1.1"
 
 
+def test_deferred_initialized_notification_is_explicit_and_idempotent(
+    tmp_path: Path,
+):
+    fake = FakeClient({"initialize": [{}]})
+    adapter = ClangdAdapter(
+        ClangdAdapterConfig(str(tmp_path), defer_initialized=True),
+        client_factory=lambda *_args: fake,
+    )
+
+    assert [method for method, _params in fake.notifications] == []
+    adapter.notify_initialized()
+    adapter.notify_initialized()
+
+    assert [method for method, _params in fake.notifications] == ["initialized"]
+
+
 def test_config_positional_extra_args_keep_background_default(tmp_path: Path):
     config = ClangdAdapterConfig(str(tmp_path), "clangd-custom", ("--flag",))
 

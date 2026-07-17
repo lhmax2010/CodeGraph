@@ -349,7 +349,7 @@ def test_index_engine_stamp_write_is_create_only_idempotent_and_conflict_safe(
     assert stamp.stat().st_ino == initial_stat.st_ino
     assert stamp.stat().st_mtime_ns == initial_stat.st_mtime_ns
 
-    with pytest.raises(ValueError, match="conflicting index engine marker"):
+    with pytest.raises(ValueError, match="conflicting index engine"):
         write_index_engine_version(index_dir, "clangd 22.1.8")
     assert read_index_engine_version(index_dir) == "clangd 21.1.1"
 
@@ -406,6 +406,254 @@ def test_index_cache_lock_is_exclusive(tmp_path: Path):
 
     peer = acquire_index_cache_lock(index_dir, exclusive=False)
     peer.release()
+
+
+def test_index_cache_lock_rejects_symlink_path(tmp_path: Path):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    target = tmp_path / "outside-lock"
+    target.write_text("outside", encoding="utf-8")
+    indexing_module.index_cache_lock_path(index_dir).symlink_to(target)
+
+    with pytest.raises(ValueError, match="lock is unavailable"):
+        acquire_index_cache_lock(index_dir, exclusive=True)
+
+    assert target.read_text(encoding="utf-8") == "outside"
+
+
+def test_index_cache_lock_retries_when_path_changes_after_flock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    original = indexing_module._require_same_regular_file
+    checks = 0
+
+    def fail_first_post_flock_check(
+        opened: os.stat_result, current: os.stat_result, path: Path
+    ) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise ValueError("synthetic pathname replacement")
+        original(opened, current, path)
+
+    monkeypatch.setattr(
+        indexing_module, "_require_same_regular_file", fail_first_post_flock_check
+    )
+    lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    try:
+        assert checks >= 4
+    finally:
+        lock.release()
+
+
+def test_unlinked_lock_path_cannot_split_brain_between_builders(tmp_path: Path):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    old_cache_lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    dirty_lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    old_cache_lock.path.unlink()
+    replacement_cache_lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    try:
+        with pytest.raises(
+            ValueError, match="leased by an active user|build in progress"
+        ):
+            indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    finally:
+        replacement_cache_lock.release()
+        dirty_lease.release()
+        old_cache_lock.release()
+
+
+def test_unlinked_lock_path_cannot_split_api_and_builder(tmp_path: Path):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    write_index_engine_version(index_dir, "clangd 21.1.1")
+    api_cache_lock = acquire_index_cache_lock(index_dir, exclusive=False)
+    api_committed_lease = indexing_module.acquire_index_engine_lease(
+        index_dir, exclusive=False
+    )
+    assert api_committed_lease is not None
+    api_cache_lock.path.unlink()
+    builder_cache_lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    try:
+        with pytest.raises(ValueError, match="leased by an active user"):
+            indexing_module.acquire_index_engine_lease(index_dir, exclusive=True)
+    finally:
+        builder_cache_lock.release()
+        api_committed_lease.release()
+        api_cache_lock.release()
+
+
+def test_unlinked_lock_path_cannot_bypass_dirty_via_explicit_attestation(
+    tmp_path: Path,
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    index_dir = index_dir_for_compile_commands_dir(tmp_path)
+    touch_idx(index_dir, 1)
+    old_cache_lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    dirty_lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    old_cache_lock.path.unlink()
+    clangd = fake_clangd(tmp_path, "21.1.1")
+    try:
+        with pytest.raises(ValueError, match="dirty build marker"):
+            write_index_engine_version(index_dir, "clangd 21.1.1")
+        with pytest.raises(ValueError, match="dirty build marker"):
+            stamp_existing_index(tmp_path, str(clangd))
+        assert read_index_engine_version(index_dir) is None
+    finally:
+        dirty_lease.release()
+        old_cache_lock.release()
+
+
+def test_published_marker_keeps_lease_after_temp_name_cleanup(tmp_path: Path):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    control_dir = index_dir.parent / ".codegraph-control"
+    assert not tuple(control_dir.glob(".codegraph-marker-*.tmp"))
+    try:
+        with pytest.raises(ValueError, match="leased by an active user"):
+            indexing_module._acquire_engine_marker_lease(
+                index_engine_building_path(index_dir),
+                exclusive=True,
+                expected_version="clangd 21.1.1",
+            )
+    finally:
+        lease.release()
+
+
+def test_marker_lease_rejects_expected_version_mismatch(tmp_path: Path):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    write_index_engine_version(index_dir, "clangd 21.1.1")
+
+    with pytest.raises(ValueError, match="belongs to clangd 21.1.1"):
+        indexing_module._acquire_engine_marker_lease(
+            index_engine_stamp_path(index_dir),
+            exclusive=False,
+            expected_version="clangd 22.1.8",
+        )
+
+
+def test_marker_publish_recovers_from_same_version_link_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    marker = index_engine_building_path(index_dir)
+    raced = False
+
+    def race_link(*args: object, **kwargs: object) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            marker.write_text("clangd 21.1.1\n", encoding="utf-8")
+            raise FileExistsError(marker)
+        raise AssertionError(f"unexpected second link call: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(os, "link", race_link)
+    lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    try:
+        assert lease.version == "clangd 21.1.1"
+    finally:
+        lease.release()
+
+
+def test_attestation_fails_if_dirty_appears_after_committed_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    write_index_engine_version(index_dir, "clangd 21.1.1")
+    reads = 0
+
+    def appear_after_lease(_index_dir: str | Path) -> str | None:
+        nonlocal reads
+        reads += 1
+        return None if reads == 1 else "clangd 21.1.1"
+
+    monkeypatch.setattr(
+        indexing_module, "read_index_building_version", appear_after_lease
+    )
+    with pytest.raises(ValueError, match="dirty marker appeared"):
+        indexing_module._claim_index_attestation(index_dir, "clangd 21.1.1")
+
+    lease = indexing_module.acquire_index_engine_lease(index_dir, exclusive=True)
+    assert lease is not None
+    lease.release()
+
+
+def test_attestation_rolls_back_if_committed_appears_after_dirty_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    versions = iter((None, None, "clangd 21.1.1"))
+    monkeypatch.setattr(
+        indexing_module,
+        "read_index_engine_version",
+        lambda _index_dir: next(versions),
+    )
+
+    with pytest.raises(ValueError, match="committed marker appeared"):
+        indexing_module._claim_index_attestation(index_dir, "clangd 21.1.1")
+
+    assert not index_engine_building_path(index_dir).exists()
+
+
+def test_attestation_rollback_never_removes_replaced_dirty_marker(tmp_path: Path):
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    marker = index_engine_building_path(index_dir)
+    marker.unlink()
+    marker.write_text("clangd 22.1.8\n", encoding="utf-8")
+    try:
+        indexing_module._rollback_attestation_dirty(lease)
+        assert marker.read_text(encoding="utf-8") == "clangd 22.1.8\n"
+    finally:
+        lease.release()
+
+
+def test_explicit_stamp_commit_io_failure_is_structured_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+
+    def fail_commit(*_args: object, **_kwargs: object) -> None:
+        raise OSError("synthetic attestation commit failure")
+
+    monkeypatch.setattr(indexing_module, "_commit_index_build", fail_commit)
+    with pytest.raises(ValueError, match="cannot write index engine stamp") as exc_info:
+        write_index_engine_version(index_dir, "clangd 21.1.1")
+
+    assert exc_info.value.reason == "index_engine_stamp_write_failed"
+    assert read_index_engine_version(index_dir) is None
+    assert indexing_module.read_index_building_version(index_dir) is None
+
+
+def test_verified_directory_detects_path_replacement(tmp_path: Path):
+    directory = tmp_path / "cache"
+    directory.mkdir()
+    opened = indexing_module._open_verified_directory(directory)
+    old_directory = tmp_path / "old-cache"
+    directory.rename(old_directory)
+    directory.mkdir()
+    try:
+        with pytest.raises(ValueError, match="pathname changed"):
+            indexing_module._verify_directory_identity(opened)
+    finally:
+        opened.release()
+
+
+def test_index_dir_verifier_allows_absent_path_only_without_creation(
+    tmp_path: Path,
+):
+    indexing_module._verify_index_dir_is_real(tmp_path / "plain-index", create=False)
+    (tmp_path / "managed").mkdir()
+    indexing_module._verify_index_dir_is_real(
+        tmp_path / "managed" / ".cache" / "clangd" / "index",
+        create=False,
+    )
 
 
 def test_flock_survives_unlinked_temporary_name(tmp_path: Path):
@@ -927,7 +1175,9 @@ def test_commit_failure_keeps_dirty_marker_and_never_reports_complete(
         monkeypatch, threading.Barrier(1), opened, threading.Lock()
     )
 
-    def reject_commit(_index_dir: Path, _engine_version: str | None) -> None:
+    def reject_commit(
+        _index_dir: Path, _engine_version: str | None, **_kwargs: object
+    ) -> None:
         raise indexing_module._IndexEngineStampError(
             "index_engine_version_inconsistent", "synthetic commit failure"
         )
@@ -962,7 +1212,9 @@ def test_commit_io_failure_is_structured_and_keeps_dirty_marker(
         monkeypatch, threading.Barrier(1), opened, threading.Lock()
     )
 
-    def reject_commit(_index_dir: Path, _engine_version: str | None) -> None:
+    def reject_commit(
+        _index_dir: Path, _engine_version: str | None, **_kwargs: object
+    ) -> None:
         raise OSError("synthetic commit I/O failure")
 
     monkeypatch.setattr("codegraph.indexing._commit_index_build", reject_commit)
@@ -993,7 +1245,7 @@ def test_dirty_and_commit_helpers_fail_closed_on_impossible_states(
 
     with pytest.raises(ValueError, match="without engine version"):
         indexing_module._commit_index_build(index_dir, None)
-    with pytest.raises(ValueError, match="dirty marker changed before commit"):
+    with pytest.raises(ValueError, match="dirty marker missing before commit"):
         indexing_module._commit_index_build(index_dir, "clangd 21.1.1")
 
     index_engine_stamp_path(index_dir).write_text("clangd 21.1.1\n", encoding="utf-8")
@@ -1010,15 +1262,18 @@ def test_dirty_and_commit_helpers_fail_closed_on_impossible_states(
     index_engine_building_path(index_dir).write_text(
         "clangd 21.1.1\n", encoding="utf-8"
     )
-    reads = iter(("clangd 21.1.1", "clangd 22.1.8"))
-    monkeypatch.setattr(
-        indexing_module, "read_index_building_version", lambda _dir: next(reads)
+    dirty_lease = indexing_module._publish_dirty_marker(index_dir, "clangd 21.1.1")
+    index_engine_building_path(index_dir).unlink()
+    index_engine_building_path(index_dir).write_text(
+        "clangd 21.1.1\n", encoding="utf-8"
     )
-    monkeypatch.setattr(
-        indexing_module, "_publish_engine_marker", lambda _path, _version: _path
-    )
-    with pytest.raises(ValueError, match="dirty marker changed during commit"):
-        indexing_module._commit_index_build(index_dir, "clangd 21.1.1")
+    try:
+        with pytest.raises(ValueError, match="dirty marker changed during commit"):
+            indexing_module._commit_index_build(
+                index_dir, "clangd 21.1.1", dirty_lease=dirty_lease
+            )
+    finally:
+        dirty_lease.release()
 
     indexing_module._clear_index_shards(tmp_path / "missing-index")
 
@@ -1051,6 +1306,75 @@ def test_invalid_control_directory_blocks_before_client_start(
 
     assert result.health_report.reason == "index_health_error"
     assert started is False
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_control_directory_symlink_blocks_marker_publish(
+    tmp_path: Path, dangling: bool
+):
+    index_dir = tmp_path / ".cache" / "clangd" / "index"
+    index_dir.mkdir(parents=True)
+    control = index_dir.parent / ".codegraph-control"
+    target = tmp_path / "outside-control"
+    if not dangling:
+        target.mkdir()
+    control.symlink_to(target, target_is_directory=True)
+    outside_before = tuple(target.iterdir()) if target.exists() else ()
+
+    with pytest.raises(ValueError):
+        write_index_engine_version(index_dir, "clangd 21.1.1")
+
+    assert (tuple(target.iterdir()) if target.exists() else ()) == outside_before
+    assert read_index_engine_version(index_dir) is None
+
+
+def test_index_directory_symlink_blocks_before_client_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    external = tmp_path / "outside-index"
+    external.mkdir()
+    clangd_cache = tmp_path / ".cache" / "clangd"
+    clangd_cache.mkdir(parents=True)
+    (clangd_cache / "index").symlink_to(external, target_is_directory=True)
+    before = tuple(external.iterdir())
+    started = False
+
+    def reject_start(_config: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("index symlink must block before clangd starts")
+
+    monkeypatch.setattr("codegraph.indexing._IndexLspClient", reject_start)
+    result = run_background_index(
+        BackgroundIndexConfig(
+            compile_commands_dir=str(tmp_path),
+            clangd_path=str(fake_clangd(tmp_path, "21.1.1")),
+        )
+    )
+
+    assert started is False
+    assert result.health_report.reason == "index_health_error"
+    assert tuple(external.iterdir()) == before
+
+
+def test_index_directory_symlink_blocks_explicit_attestation(tmp_path: Path):
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    write_cdb(tmp_path, [source])
+    external = tmp_path / "outside-index"
+    touch_idx(external, 1)
+    clangd_cache = tmp_path / ".cache" / "clangd"
+    clangd_cache.mkdir(parents=True)
+    (clangd_cache / "index").symlink_to(external, target_is_directory=True)
+    before = {path.name: path.read_bytes() for path in external.iterdir()}
+
+    with pytest.raises(ValueError, match="cache directory is invalid"):
+        stamp_existing_index(tmp_path, str(fake_clangd(tmp_path, "21.1.1")))
+
+    assert {path.name: path.read_bytes() for path in external.iterdir()} == before
 
 
 def test_stale_control_temp_is_outside_shard_scan_and_cleaned_before_build(
@@ -1538,7 +1862,7 @@ def test_stamp_existing_index_requires_health_and_rejects_conflicts(tmp_path: Pa
     assert report.health == IndexHealth.COMPLETE
     assert read_index_engine_version(index_dir) == "clangd 21.1.1"
     clangd_22 = fake_clangd(tmp_path, "22.1.8")
-    with pytest.raises(ValueError, match="conflicting index engine stamp"):
+    with pytest.raises(ValueError, match="conflicting index engine"):
         stamp_existing_index(tmp_path, str(clangd_22))
 
 

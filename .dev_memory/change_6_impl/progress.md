@@ -35,6 +35,19 @@
   - 原因：零分片或损坏内容不会消除目录所有权，其他版本仍不得启动并写入。
 - 自定义 engine factory 通过独立 `engine_version_probe` 提供无启动版本声明；默认 probe 始终检查 `BuildConfig.clangd_path`。
   - 原因：测试桩不依赖宿主机 clangd，同时真实/自定义 factory 都不能绕过启动前所有权守卫；factory 实际版本在启动后、任何 warm/query 前再次复核。
+- 第六轮锁协议固定为 `cache lock → committed lease → dirty lease`，释放严格逆序；cache lock 永不由
+  CodeGraph 删除，flock 后复核路径与 fd inode，marker lease 直接锁住已发布 inode。
+  - 原因：cache lock 路径被外部删除重建时，仅靠 cache flock 会形成 split-brain；committed/dirty
+    lease 分别把活跃 API 和 builder 与真实 marker inode 绑定，关闭 builder×builder 与 API×builder
+    两类交错窗口。
+- index/control 目录与 marker 发布均采用 `lstat`、`O_NOFOLLOW`、fd/path inode 复核；managed
+  `index` symlink、control-dir symlink 和 marker symlink 一律 fail-closed。
+- CodeGraph API 创建的 adapter 一律 `defer_initialized=True`；initialize request 只读取 serverInfo，
+  ownership/版本/committed lease 复核后才发送 `initialized`。P3 默认仍为 `False`，保持既有适配器行为。
+- 断电语义选择“明确边界”而非逐 shard fsync：真实 1303-TU/13.38MB 分片复制后逐文件+目录 fsync
+  实测约 31.2s；MVP 保证正常并发与进程崩溃/SIGKILL 恢复，不承诺机器断电原子性。
+- verified 同版本 API 继续允许 clangd 刷新 cache；clangd 21/22 的 `BackgroundIndexStorage::storeShard`
+  使用 `llvm::writeToOutput` 临时文件后原子替换。CodeGraph lease 只阻断 builder/跨版本交错。
 
 ## 改动摘要
 - `codegraph/engine_version.py`：stdlib-only clangd 版本规范化、LSP initialize 提取与二进制探测。
@@ -104,3 +117,37 @@
   7 条核心并发/崩溃测试连续 30 轮全部通过。
 - 2026-07-15：第五轮 gstack Claude 对完整 delta 做 tool-less 独立 review，240s 内未返回 JSON/文本，
   按能力超时记录，不计 APPROVE；分支仍须用户侧异构多路全票确认，未自行放行。
+- 2026-07-15：第六轮开始实现保护机制自身的 namespace 绑定：managed index symlink 在 clangd 启动
+  前拒绝；cache lock 永不删除且 flock 后复核 inode；builder/API 分别持 dirty EX / committed SH
+  lease，锁路径被外部替换时仍不能越过真实 marker inode。
+- 2026-07-15：adapter 增加默认关闭的 `defer_initialized`，CodeGraph 统一显式开启；P3 默认行为不变，
+  API 在所有守卫通过后才通知 initialized。首轮聚焦回归为 169 passed，继续补全第六轮并发真机 gate。
+- 2026-07-15：崩溃恢复后逐文件核对第六轮未提交工作区，无冲突标记或半写文件。完成 namespace
+  绑定加固：managed index/control 目录拒绝 symlink，cache lock 永不由 CodeGraph 删除且 flock 后
+  复核 inode；builder 持 dirty EX lease，verified API 持 committed SH lease；显式追认和直接 stamp
+  也先发布/获取 marker lease，lock 路径被替换后仍不能绕过活跃 owner。
+- 2026-07-15：自审补齐 attestation 的 TOCTOU 回归：活跃 dirty + lock 路径替换时 direct-write 与
+  `--stamp-existing-index` 均被挡；committed/dirty 在复核窗口出现时 fail-closed；回滚只按 inode 删除
+  自己创建的 dirty，路径被替换时不误删；commit I/O 失败结构化为
+  `index_engine_stamp_write_failed`。
+- 2026-07-15：第六轮 deterministic gate：全套 coverage 命令 `271 passed in 18.39s`，总覆盖率
+  92%，`api.py` 92%、核心 `indexing.py` 90%、adapter 99%；ruff、black --check、mypy、compileall、
+  `git diff --check` 全绿。10 条 lock/lease/symlink/initialized 核心测试连续 30 轮全部通过。
+- 2026-07-15：第六轮真实防线 spot-check：真实 clangd 的 managed index symlink 在启动前阻断且
+  外部目录快照不变；删除 lock pathname 后，builder×builder 与 API×builder 均由 dirty/committed
+  lease 返回 build-in-progress；21 对 18 cache mismatch 在约 0.108s 拦截且快照不变；三版本
+  callees 保持 18 FAILED、21/22 各 3 edges。
+- 2026-07-15：`389/62` 当前复跑受宿主机资源阻塞，未计 gate 通过：无关 `ld.lld` 长时间占用约
+  22% 内存，available RAM 约 4 GiB、4 GiB swap 已满。CodeGraph clangd 21 在 90s readiness
+  配置下最终 120.183s 返回 UNRESOLVED/unknown、18 candidates，分片快照 3595/40114730 bytes/
+  max-mtime 前后完全不变。使用旧 adapter 默认 initialized 时序的直接 P3 探测同样只能得到局部
+  结果，说明当前失败是环境资源压力而非本轮 defer 时序回归；按同一问题三次失败上限停止重试，
+  暂不宣称第六轮完成、暂不送异构 review。
+- 2026-07-17：宿主机 available RAM 恢复至约 22 GiB 后继续真机 gate。先排除一次错误探针：版本
+  专用 CDB 的 canonical URI 位于 GBS build root，源码镜像 URI 只能得到诚实的单 TU 结果，不能用于
+  `389/62` 验收。使用归档 spot-check 的 exact build-root URI `gstelement.c` zero-based `[2950,0]`
+  后，P3 adapter 日志确认加载 CDB、enqueue 1303 commands，并从磁盘加载 background index。
+- 2026-07-17：正式 CodeGraph API 在 clangd 21 cache 上连续三次复现 `389 refs/62 files`：每次均
+  `OK/complete/indexed_project`、`381 semantic + 8 candidates`、`is_exhaustive=False`，耗时
+  `2.930s / 2.953s / 2.925s`。分片快照 `(3595, 40114730 bytes, max-mtime)` 前后完全不变；
+  第六轮 `389/62` 真机阻塞关闭，进入最终提交与用户异构多路 Review 准备。

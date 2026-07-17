@@ -10,9 +10,9 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +41,10 @@ _BUILD_INDEX_BLOCKING_REASONS = {
     "index_health_error",
 }
 _MAX_ENGINE_STAMP_BYTES = 4096
+_LOCK_IDENTITY_RETRIES = 3
+
+# Global lock order: cache lock -> committed lease -> dirty lease. Release in
+# reverse order. Acquiring an earlier layer while holding a later one can deadlock.
 
 
 class _IndexEngineStampError(ValueError):
@@ -60,7 +64,32 @@ class _IndexEngineStampError(ValueError):
 class IndexCacheLock:
     path: Path
     fd: int
+    parent_fd: int
     exclusive: bool
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            try:
+                os.close(self.fd)
+            finally:
+                os.close(self.parent_fd)
+                self.released = True
+
+
+@dataclass
+class IndexMarkerLease:
+    """A flock lease bound to the inode of a committed or dirty marker."""
+
+    path: Path
+    fd: int
+    version: str
+    exclusive: bool
+    created: bool = False
     released: bool = False
 
     def release(self) -> None:
@@ -71,6 +100,16 @@ class IndexCacheLock:
         finally:
             os.close(self.fd)
             self.released = True
+
+
+@dataclass
+class _VerifiedDirectory:
+    path: Path
+    fd: int
+    identity: os.stat_result
+
+    def release(self) -> None:
+        os.close(self.fd)
 
 
 @dataclass(frozen=True)
@@ -206,7 +245,7 @@ def scan_index_shards(index_dir: str | Path) -> IndexShardSummary:
 
 def index_dir_for_compile_commands_dir(path_or_dir: str | Path) -> Path:
     cdb_path = compile_commands_path(path_or_dir)
-    return cdb_path.parent / ".cache" / "clangd" / "index"
+    return cdb_path.parent.resolve() / ".cache" / "clangd" / "index"
 
 
 def index_engine_stamp_path(index_dir: str | Path) -> Path:
@@ -226,48 +265,166 @@ def acquire_index_cache_lock(
 ) -> IndexCacheLock:
     """Acquire the cache-wide lock used by builders, queries, and attestation."""
 
-    path = index_cache_lock_path(index_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    index_path = Path(index_dir)
+    try:
+        _verify_index_dir_is_real(index_path, create=True, create_index=True)
+    except (OSError, ValueError) as exc:
+        raise _IndexEngineStampError(
+            "index_health_error",
+            f"{type(exc).__name__}: index cache directory is invalid: {index_path}",
+        ) from exc
+    path = index_cache_lock_path(index_path)
     flags = (
         os.O_RDWR
         | os.O_CREAT
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    try:
-        fd = os.open(path, flags, 0o644)
-    except OSError as exc:
-        raise _IndexEngineStampError(
-            "index_health_error", f"index cache lock is unavailable: {path}"
-        ) from exc
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    for _attempt in range(_LOCK_IDENTITY_RETRIES):
+        parent = _open_verified_directory(path.parent)
+        try:
+            fd = os.open(path.name, flags, 0o644, dir_fd=parent.fd)
+        except OSError as exc:
+            parent.release()
+            raise _IndexEngineStampError(
+                "index_health_error", f"index cache lock is unavailable: {path}"
+            ) from exc
+        try:
+            opened = os.fstat(fd)
+            current = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False)
+            _require_same_regular_file(opened, current, path)
+            try:
+                fcntl.flock(fd, operation | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise _IndexEngineStampError(
+                    "index_engine_build_in_progress",
+                    f"index cache is locked by an active build: {path}",
+                ) from exc
+
+            # The lock pathname is permanent. If an external actor replaced it
+            # while flock() waited, never let the old inode form a split brain.
+            current = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False)
+            try:
+                _require_same_regular_file(opened, current, path)
+            except ValueError:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                parent.release()
+                continue
+            _verify_directory_identity(parent)
+            return IndexCacheLock(
+                path=path,
+                fd=fd,
+                parent_fd=parent.fd,
+                exclusive=exclusive,
+            )
+        except BaseException as exc:
+            os.close(fd)
+            parent.release()
+            if isinstance(exc, _IndexEngineStampError):
+                raise
+            if isinstance(exc, (OSError, ValueError)):
+                raise _IndexEngineStampError(
+                    "index_health_error", f"index cache lock is invalid: {path}"
+                ) from exc
+            raise
+    raise _IndexEngineStampError(
+        "index_health_error", f"index cache lock pathname is unstable: {path}"
+    )
+
+
+def _require_same_regular_file(
+    opened: os.stat_result, current: os.stat_result, path: Path
+) -> None:
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+    ):
+        raise ValueError(f"path must be a stable regular file: {path}")
+
+
+def _open_verified_directory(path: Path, *, create: bool = False) -> _VerifiedDirectory:
+    if create:
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+    path_stat = os.lstat(path)
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise ValueError(f"path must be a real directory, not a symlink: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
-        current = os.lstat(path)
         if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(current.st_mode)
-            or opened.st_dev != current.st_dev
-            or opened.st_ino != current.st_ino
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != path_stat.st_dev
+            or opened.st_ino != path_stat.st_ino
         ):
-            raise ValueError(f"index cache lock must be a stable regular file: {path}")
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        try:
-            fcntl.flock(fd, operation | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise _IndexEngineStampError(
-                "index_engine_build_in_progress",
-                f"index cache is locked by an active build: {path}",
-            ) from exc
-        return IndexCacheLock(path=path, fd=fd, exclusive=exclusive)
-    except BaseException as exc:
+            raise ValueError(f"directory changed while opening: {path}")
+        return _VerifiedDirectory(path, fd, opened)
+    except BaseException:
         os.close(fd)
-        if isinstance(exc, _IndexEngineStampError):
-            raise
-        if isinstance(exc, (OSError, ValueError)):
-            raise _IndexEngineStampError(
-                "index_health_error", f"index cache lock is invalid: {path}"
-            ) from exc
         raise
+
+
+def _verify_directory_identity(directory: _VerifiedDirectory) -> None:
+    current = os.lstat(directory.path)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != directory.identity.st_dev
+        or current.st_ino != directory.identity.st_ino
+    ):
+        raise ValueError(f"directory pathname changed while in use: {directory.path}")
+
+
+def _verify_index_dir_is_real(
+    index_dir: Path, *, create: bool, create_index: bool = False
+) -> None:
+    """Reject managed cache symlinks before any lock, marker, or shard I/O."""
+
+    managed_layout = (
+        index_dir.name == "index"
+        and index_dir.parent.name == "clangd"
+        and index_dir.parent.parent.name == ".cache"
+    )
+    if not managed_layout:
+        parent = _open_verified_directory(index_dir.parent)
+        parent.release()
+        try:
+            directory = _open_verified_directory(
+                index_dir, create=create and create_index
+            )
+        except FileNotFoundError:
+            if create:
+                raise
+            return
+        directory.release()
+        return
+
+    root = index_dir.parent.parent.parent
+    root_dir = _open_verified_directory(root)
+    root_dir.release()
+    current = root
+    for component in (".cache", "clangd", "index"):
+        current = current / component
+        try:
+            directory = _open_verified_directory(
+                current, create=create and (component != "index" or create_index)
+            )
+        except FileNotFoundError:
+            if create:
+                raise
+            return
+        directory.release()
 
 
 def read_index_engine_version(index_dir: str | Path) -> str | None:
@@ -289,28 +446,32 @@ def write_index_engine_version(index_dir: str | Path, engine_version: str) -> Pa
     if normalized is None:
         raise ValueError(f"invalid canonical clangd version: {engine_version!r}")
     lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    committed_lease: IndexMarkerLease | None = None
+    dirty_lease: IndexMarkerLease | None = None
     try:
         try:
-            dirty = read_index_building_version(index_dir)
-            existing = read_index_engine_version(index_dir)
-        except (OSError, ValueError) as exc:
+            committed_lease, dirty_lease = _claim_index_attestation(
+                Path(index_dir), normalized
+            )
+        except _IndexEngineStampError:
+            raise
+        except OSError as exc:
+            raise _IndexEngineStampError(
+                "index_engine_stamp_write_failed",
+                f"{type(exc).__name__}: cannot write index engine stamp: "
+                f"{index_engine_stamp_path(index_dir)}: {exc}",
+            ) from exc
+        except ValueError as exc:
             raise _invalid_stamp_error(index_engine_stamp_path(index_dir)) from exc
-        if dirty is not None:
-            raise _IndexEngineStampError(
-                "index_engine_build_in_progress",
-                f"cannot publish committed stamp while dirty marker exists: {dirty}",
-                existing_version=dirty,
-            )
-        if existing is not None and existing != normalized:
-            raise _IndexEngineStampError(
-                "index_engine_mismatch",
-                f"conflicting index engine marker: {existing} != {normalized}",
-                existing_version=existing,
-            )
         try:
-            return _publish_engine_marker(
-                index_engine_stamp_path(index_dir), normalized
-            )
+            if dirty_lease is not None:
+                committed_lease, dirty_lease = _commit_index_build(
+                    Path(index_dir),
+                    normalized,
+                    committed_lease=committed_lease,
+                    dirty_lease=dirty_lease,
+                )
+            return index_engine_stamp_path(index_dir)
         except OSError as exc:
             raise _IndexEngineStampError(
                 "index_engine_stamp_write_failed",
@@ -322,54 +483,139 @@ def write_index_engine_version(index_dir: str | Path, engine_version: str) -> Pa
     except ValueError as exc:
         raise _invalid_stamp_error(index_engine_stamp_path(index_dir)) from exc
     finally:
+        if dirty_lease is not None:
+            _rollback_attestation_dirty(dirty_lease)
+            dirty_lease.release()
+        if committed_lease is not None:
+            committed_lease.release()
         lock.release()
 
 
 def _publish_engine_marker(path: Path, engine_version: str) -> Path:
+    lease = _publish_engine_marker_lease(path, engine_version, exclusive=True)
+    lease.release()
+    return path
+
+
+def acquire_index_engine_lease(
+    index_dir: str | Path, *, exclusive: bool
+) -> IndexMarkerLease | None:
+    """Lease the committed owner inode so cache use cannot race a rebuild."""
+
+    path = index_engine_stamp_path(index_dir)
+    try:
+        return _acquire_engine_marker_lease(path, exclusive=exclusive)
+    except _IndexEngineStampError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise _invalid_stamp_error(path) from exc
+
+
+def _acquire_engine_marker_lease(
+    path: Path,
+    *,
+    exclusive: bool,
+    expected_version: str | None = None,
+) -> IndexMarkerLease | None:
+    opened = _open_engine_marker(path)
+    if opened is None:
+        return None
+    fd, opened_stat = opened
+    try:
+        version = _read_engine_marker_fd(fd, path)
+        if expected_version is not None and version != expected_version:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"index cache belongs to {version}, not {expected_version}",
+                existing_version=version,
+            )
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _IndexEngineStampError(
+                "index_engine_build_in_progress",
+                f"index marker is leased by an active user: {path}",
+                existing_version=version,
+            ) from exc
+        _verify_marker_identity(path, opened_stat)
+        return IndexMarkerLease(path, fd, version, exclusive)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _publish_engine_marker_lease(
+    path: Path, engine_version: str, *, exclusive: bool
+) -> IndexMarkerLease:
     normalized = normalize_clangd_version(engine_version)
     if normalized is None or engine_version.strip() != normalized:
         raise ValueError(f"invalid canonical clangd version: {engine_version!r}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_engine_marker(path)
-    if existing is not None:
-        if existing != normalized:
-            raise _IndexEngineStampError(
-                "index_engine_mismatch",
-                f"conflicting index engine marker: {existing} != {normalized}",
-                existing_version=existing,
-            )
-        return path
-
-    control_dir = path.parent.parent / _CONTROL_DIR_NAME
-    control_dir.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=_MARKER_TEMP_PREFIX, suffix=".tmp", dir=control_dir
+    _verify_index_dir_is_real(path.parent, create=True, create_index=True)
+    existing = _acquire_engine_marker_lease(
+        path, exclusive=exclusive, expected_version=normalized
     )
-    temporary = Path(temporary_name)
+    if existing is not None:
+        return existing
+
+    index_dir = _open_verified_directory(path.parent)
+    control_dir = path.parent.parent / _CONTROL_DIR_NAME
+    try:
+        control = _open_verified_directory(control_dir, create=True)
+    except BaseException:
+        index_dir.release()
+        raise
+    temporary_name = f"{_MARKER_TEMP_PREFIX}{uuid.uuid4().hex}.tmp"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(temporary_name, flags, 0o600, dir_fd=control.fd)
+    except BaseException:
+        control.release()
+        index_dir.release()
+        raise
     published = False
     try:
         os.fchmod(fd, 0o644)
         os.write(fd, (normalized + "\n").encode("utf-8"))
         os.fsync(fd)
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(fd, operation | fcntl.LOCK_NB)
         try:
-            os.link(temporary, path)
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=control.fd,
+                dst_dir_fd=index_dir.fd,
+                follow_symlinks=False,
+            )
         except FileExistsError:
-            existing = _read_engine_marker(path)
-            if existing != normalized:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            fd = -1
+            existing = _acquire_engine_marker_lease(
+                path, exclusive=exclusive, expected_version=normalized
+            )
+            if existing is None:
                 raise _IndexEngineStampError(
-                    "index_engine_mismatch",
-                    f"conflicting index engine marker: {existing} != {normalized}",
-                    existing_version=existing,
+                    "index_health_error", f"marker vanished while claiming: {path}"
                 )
-            return path
+            return existing
         published = True
         _verify_marker_identity(path, os.fstat(fd))
+        _verify_directory_identity(index_dir)
+        _verify_directory_identity(control)
         _fsync_directory(path.parent)
-        return path
+        return IndexMarkerLease(path, fd, normalized, exclusive, created=True)
     except BaseException:
-        if published:
+        if published and fd >= 0:
             try:
-                current = os.lstat(path)
+                current = os.stat(path.name, dir_fd=index_dir.fd, follow_symlinks=False)
             except FileNotFoundError:
                 current = None
             if (
@@ -377,11 +623,17 @@ def _publish_engine_marker(path: Path, engine_version: str) -> Path:
                 and current.st_dev == os.fstat(fd).st_dev
                 and current.st_ino == os.fstat(fd).st_ino
             ):
-                path.unlink()
+                os.unlink(path.name, dir_fd=index_dir.fd)
         raise
     finally:
-        temporary.unlink(missing_ok=True)
-        os.close(fd)
+        try:
+            os.unlink(temporary_name, dir_fd=control.fd)
+        except FileNotFoundError:
+            pass
+        control.release()
+        index_dir.release()
+        if fd >= 0 and not published:
+            os.close(fd)
 
 
 def _open_index_engine_stamp(path: Path) -> tuple[int, os.stat_result] | None:
@@ -621,37 +873,30 @@ def stamp_existing_index(
     cdb = summarize_compile_commands(compile_commands_dir)
     index_dir = index_dir_for_compile_commands_dir(compile_commands_dir)
     lock = acquire_index_cache_lock(index_dir, exclusive=True)
+    committed_lease: IndexMarkerLease | None = None
+    dirty_lease: IndexMarkerLease | None = None
     try:
-        shards = scan_index_shards(index_dir)
-        try:
-            dirty = read_index_building_version(index_dir)
-            existing = read_index_engine_version(index_dir)
-        except (OSError, ValueError) as exc:
-            raise _IndexEngineStampError(
-                "index_engine_stamp_invalid",
-                f"index engine marker is invalid or unreadable: {index_dir}",
-            ) from exc
-        if dirty is not None:
-            raise _IndexEngineStampError(
-                "index_engine_build_in_progress",
-                f"cannot attest an index with a dirty build marker: {dirty}",
-                existing_version=dirty,
-            )
-        structural = _evaluate_structural_index_health(cdb, shards)
-        if structural.health != IndexHealth.COMPLETE:
-            raise ValueError(
-                f"cannot stamp index with health={structural.health.value}: "
-                f"{structural.reason}"
-            )
         engine_version = detect_clangd_version(clangd_path)
         if engine_version is None:
             raise ValueError(f"cannot detect clangd version: {clangd_path}")
-        if existing is not None and existing != engine_version:
-            raise ValueError(
-                f"conflicting index engine stamp: {existing} != {engine_version}"
-            )
         try:
-            _publish_engine_marker(index_engine_stamp_path(index_dir), engine_version)
+            committed_lease, dirty_lease = _claim_index_attestation(
+                index_dir, engine_version
+            )
+            shards = scan_index_shards(index_dir)
+            structural = _evaluate_structural_index_health(cdb, shards)
+            if structural.health != IndexHealth.COMPLETE:
+                raise ValueError(
+                    f"cannot stamp index with health={structural.health.value}: "
+                    f"{structural.reason}"
+                )
+            if dirty_lease is not None:
+                committed_lease, dirty_lease = _commit_index_build(
+                    index_dir,
+                    engine_version,
+                    committed_lease=committed_lease,
+                    dirty_lease=dirty_lease,
+                )
         except OSError as exc:
             raise _IndexEngineStampError(
                 "index_engine_stamp_write_failed",
@@ -662,6 +907,11 @@ def stamp_existing_index(
             cdb, scan_index_shards(index_dir), expected_engine_version=engine_version
         )
     finally:
+        if dirty_lease is not None:
+            _rollback_attestation_dirty(dirty_lease)
+            dirty_lease.release()
+        if committed_lease is not None:
+            committed_lease.release()
         lock.release()
 
 
@@ -769,6 +1019,7 @@ def _run_background_index_locked(
             shard_report=initial_shards,
             health_report=health,
             stderr_tail=f"{type(exc).__name__}: {exc}",
+            engine_version=engine_version,
         )
     probed_engine_version = engine_version
     preflight = _build_preflight_health(cdb, initial_shards, engine_version)
@@ -793,6 +1044,8 @@ def _run_background_index_locked(
     error_tail = ""
     ownership_health: IndexHealthReport | None = None
     dirty_published = False
+    committed_lease: IndexMarkerLease | None = None
+    dirty_lease: IndexMarkerLease | None = None
     try:
         trigger_files = config.trigger_files or _default_trigger_files(compile_dir, cdb)
         client = _IndexLspClient(config)
@@ -810,7 +1063,21 @@ def _run_background_index_locked(
             if engine_version is None:
                 raise RuntimeError("clangd version missing after ownership preflight")
             try:
-                _publish_dirty_marker(index_dir, engine_version)
+                # Global lock order is cache lock -> committed lease -> dirty
+                # lease. Every exit releases in reverse order. Never acquire a
+                # cache lock or committed lease while holding the dirty lease.
+                committed_lease = acquire_index_engine_lease(index_dir, exclusive=True)
+                if (
+                    committed_lease is not None
+                    and committed_lease.version != engine_version
+                ):
+                    raise _IndexEngineStampError(
+                        "index_engine_mismatch",
+                        f"index cache belongs to {committed_lease.version}, "
+                        f"not {engine_version}",
+                        existing_version=committed_lease.version,
+                    )
+                dirty_lease = _publish_dirty_marker(index_dir, engine_version)
                 dirty_published = True
             except _IndexEngineStampError as exc:
                 ownership_health = _health(
@@ -894,7 +1161,12 @@ def _run_background_index_locked(
             health = structural
         else:
             try:
-                _commit_index_build(index_dir, engine_version)
+                committed_lease, dirty_lease = _commit_index_build(
+                    index_dir,
+                    engine_version,
+                    committed_lease=committed_lease,
+                    dirty_lease=dirty_lease,
+                )
                 health = evaluate_index_health(
                     cdb,
                     scan_index_shards(index_dir),
@@ -930,17 +1202,23 @@ def _run_background_index_locked(
         health = _health(
             IndexHealth.UNKNOWN, "index_build_not_stable", cdb, shard_report
         )
-    return BackgroundIndexResult(
-        compile_commands_dir=str(compile_dir),
-        index_dir=shard_report.index_dir,
-        elapsed_seconds=elapsed,
-        exit_code=exit_code,
-        stable=stable,
-        shard_report=shard_report,
-        health_report=health,
-        stderr_tail=stderr_tail,
-        engine_version=engine_version,
-    )
+    try:
+        return BackgroundIndexResult(
+            compile_commands_dir=str(compile_dir),
+            index_dir=shard_report.index_dir,
+            elapsed_seconds=elapsed,
+            exit_code=exit_code,
+            stable=stable,
+            shard_report=shard_report,
+            health_report=health,
+            stderr_tail=stderr_tail,
+            engine_version=engine_version,
+        )
+    finally:
+        if dirty_lease is not None:
+            dirty_lease.release()
+        if committed_lease is not None:
+            committed_lease.release()
 
 
 def _best_effort_shard_summary(index_dir: Path) -> IndexShardSummary:
@@ -950,7 +1228,7 @@ def _best_effort_shard_summary(index_dir: Path) -> IndexShardSummary:
         return IndexShardSummary(str(index_dir.resolve()), index_dir.exists(), 0, 0)
 
 
-def _publish_dirty_marker(index_dir: Path, engine_version: str) -> None:
+def _publish_dirty_marker(index_dir: Path, engine_version: str) -> IndexMarkerLease:
     committed = read_index_engine_version(index_dir)
     dirty = read_index_building_version(index_dir)
     if committed is not None and dirty is not None and committed != dirty:
@@ -966,33 +1244,165 @@ def _publish_dirty_marker(index_dir: Path, engine_version: str) -> None:
                 f"index cache belongs to {existing}, not {engine_version}",
                 existing_version=existing,
             )
-    _publish_engine_marker(index_engine_building_path(index_dir), engine_version)
+    return _publish_engine_marker_lease(
+        index_engine_building_path(index_dir), engine_version, exclusive=True
+    )
 
 
-def _commit_index_build(index_dir: Path, engine_version: str | None) -> None:
+def _claim_index_attestation(
+    index_dir: Path, engine_version: str
+) -> tuple[IndexMarkerLease | None, IndexMarkerLease | None]:
+    """Anchor explicit attestation before it validates or publishes ownership."""
+
+    try:
+        committed = read_index_engine_version(index_dir)
+        dirty = read_index_building_version(index_dir)
+    except (OSError, ValueError) as exc:
+        raise _invalid_stamp_error(index_engine_stamp_path(index_dir)) from exc
+    if dirty is not None:
+        reason = (
+            "index_engine_build_in_progress"
+            if dirty == engine_version
+            else "index_engine_mismatch"
+        )
+        raise _IndexEngineStampError(
+            reason,
+            f"cannot attest an index with a dirty build marker: {dirty}",
+            existing_version=dirty,
+        )
+    if committed is not None:
+        if committed != engine_version:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"conflicting index engine stamp: {committed} != {engine_version}",
+                existing_version=committed,
+            )
+        lease = _acquire_engine_marker_lease(
+            index_engine_stamp_path(index_dir),
+            exclusive=True,
+            expected_version=engine_version,
+        )
+        if lease is None:
+            raise _IndexEngineStampError(
+                "index_health_error", "committed marker vanished during attestation"
+            )
+        try:
+            if read_index_building_version(index_dir) is not None:
+                raise _IndexEngineStampError(
+                    "index_engine_build_in_progress",
+                    "dirty marker appeared during attestation",
+                )
+        except BaseException:
+            lease.release()
+            raise
+        return lease, None
+
+    dirty_lease = _publish_dirty_marker(index_dir, engine_version)
+    if not dirty_lease.created:
+        dirty_lease.release()
+        raise _IndexEngineStampError(
+            "index_engine_build_in_progress",
+            "another owner published the dirty marker during attestation",
+            existing_version=dirty_lease.version,
+        )
+    committed = read_index_engine_version(index_dir)
+    if committed is not None:
+        _rollback_attestation_dirty(dirty_lease)
+        dirty_lease.release()
+        raise _IndexEngineStampError(
+            (
+                "index_engine_build_in_progress"
+                if committed == engine_version
+                else "index_engine_mismatch"
+            ),
+            f"committed marker appeared during attestation: {committed}",
+            existing_version=committed,
+        )
+    return None, dirty_lease
+
+
+def _rollback_attestation_dirty(lease: IndexMarkerLease) -> None:
+    """Remove only a dirty marker created by this side-effect-free attestation."""
+
+    if not lease.created:
+        return
+    try:
+        _verify_marker_identity(lease.path, os.fstat(lease.fd))
+    except (FileNotFoundError, ValueError):
+        return
+    lease.path.unlink()
+    _fsync_directory(lease.path.parent)
+
+
+def _commit_index_build(
+    index_dir: Path,
+    engine_version: str | None,
+    *,
+    committed_lease: IndexMarkerLease | None = None,
+    dirty_lease: IndexMarkerLease | None = None,
+) -> tuple[IndexMarkerLease | None, IndexMarkerLease | None]:
     if engine_version is None:
         raise _IndexEngineStampError(
             "index_engine_unavailable", "cannot commit index without engine version"
         )
-    dirty = read_index_building_version(index_dir)
-    if dirty != engine_version:
+    caller_holds_leases = dirty_lease is not None or committed_lease is not None
+    owns_dirty_lease = dirty_lease is None
+    if dirty_lease is None:
+        dirty_lease = _acquire_engine_marker_lease(
+            index_engine_building_path(index_dir),
+            exclusive=True,
+            expected_version=engine_version,
+        )
+    if dirty_lease is None:
         raise _IndexEngineStampError(
             "index_engine_version_inconsistent",
-            f"dirty marker changed before commit: {dirty!r} != {engine_version!r}",
-            existing_version=dirty,
+            "dirty marker missing before commit",
         )
-    _publish_engine_marker(index_engine_stamp_path(index_dir), engine_version)
-    _fsync_directory(index_dir)
-    building = index_engine_building_path(index_dir)
-    current = read_index_building_version(index_dir)
-    if current != engine_version:
-        raise _IndexEngineStampError(
-            "index_engine_version_inconsistent",
-            f"dirty marker changed during commit: {current!r}",
-            existing_version=current,
-        )
-    building.unlink()
-    _fsync_directory(index_dir)
+    owns_committed_lease = committed_lease is None
+    published_committed_here = False
+    try:
+        dirty = dirty_lease.version
+        if dirty != engine_version:
+            raise _IndexEngineStampError(
+                "index_engine_version_inconsistent",
+                f"dirty marker changed before commit: {dirty!r} != {engine_version!r}",
+                existing_version=dirty,
+            )
+        if committed_lease is None:
+            committed_lease = _publish_engine_marker_lease(
+                index_engine_stamp_path(index_dir), engine_version, exclusive=True
+            )
+            published_committed_here = True
+        elif committed_lease.version != engine_version:
+            raise _IndexEngineStampError(
+                "index_engine_mismatch",
+                f"committed lease changed before commit: {committed_lease.version}",
+                existing_version=committed_lease.version,
+            )
+        _fsync_directory(index_dir)
+        building = index_engine_building_path(index_dir)
+        try:
+            _verify_marker_identity(building, os.fstat(dirty_lease.fd))
+        except (OSError, ValueError) as exc:
+            raise _IndexEngineStampError(
+                "index_engine_version_inconsistent",
+                "dirty marker changed during commit",
+            ) from exc
+        building.unlink()
+        _fsync_directory(index_dir)
+    except BaseException:
+        if published_committed_here and committed_lease is not None:
+            committed_lease.release()
+        if owns_dirty_lease and not dirty_lease.released:
+            dirty_lease.release()
+        raise
+    if owns_dirty_lease or caller_holds_leases:
+        dirty_lease.release()
+        dirty_lease = None
+    if owns_committed_lease and not caller_holds_leases:
+        committed_lease.release()
+        committed_lease = None
+    return committed_lease, dirty_lease
 
 
 def _clear_index_shards(index_dir: Path) -> None:
@@ -1009,14 +1419,13 @@ def _clear_index_shards(index_dir: Path) -> None:
 
 def _cleanup_control_temps(index_dir: Path) -> None:
     control_dir = index_dir.parent / _CONTROL_DIR_NAME
-    if control_dir.exists():
-        control_stat = os.lstat(control_dir)
-        if not stat.S_ISDIR(control_stat.st_mode):
-            raise ValueError(f"index control path must be a directory: {control_dir}")
-    else:
-        control_dir.mkdir(parents=True)
-    for temporary in control_dir.glob(_MARKER_TEMP_PREFIX + "*.tmp"):
-        temporary.unlink()
+    control = _open_verified_directory(control_dir, create=True)
+    try:
+        for name in os.listdir(control.fd):
+            if name.startswith(_MARKER_TEMP_PREFIX) and name.endswith(".tmp"):
+                os.unlink(name, dir_fd=control.fd)
+    finally:
+        control.release()
 
 
 def _health(
