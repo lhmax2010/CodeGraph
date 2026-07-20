@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：无（CodeGraph MVP 九层全闭环）
+- 当前活跃 stage：verification（团队验证进行中；指南见 `docs/verification_guide.md`，结果待收集）
 - 最后已确认 stage（已 Merge）：stage09_mcp_server
 - 设计基线：docs/design.md v1.5.0 Frozen（change_6 多版本 clangd support 的设计与实现已全闭环）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md
@@ -21,6 +21,7 @@
 | stage08 | call_hierarchy | 已 Merge | N/A（按用户要求只 push 不走 PR） | `checkpoint/phase_8_call_hierarchy` |
 | change_6_impl | multiversion clangd | 已 Merge | N/A（按用户要求只 push 不走 PR） | `9de966d` / `checkpoint/change_6_implementation` |
 | stage09 | mcp_server | 已 Merge | N/A（按用户要求只 push 不走 PR） | `b975310` / `checkpoint/phase_9_mcp_server` |
+| verification | team verification | 进行中 | N/A（文档验证阶段） | `docs/verification_guide.md`；团队结果待收集 |
 
 ## 环境与能力预检（2026-06-13）
 - Git：可用。
