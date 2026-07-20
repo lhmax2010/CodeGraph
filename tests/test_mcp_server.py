@@ -763,6 +763,13 @@ def test_raw_argument_gate_runs_before_fastmcp_tool_manager(
     assert dispatched is False
 
 
+def test_raw_argument_gate_rejects_non_object_and_ignores_unknown_tool() -> None:
+    with pytest.raises(ToolError, match='"field":"arguments"'):
+        mcp_module._validate_raw_arguments("search", [])
+
+    assert mcp_module._validate_raw_arguments("future_tool", {}) is None
+
+
 def test_load_startup_config_converts_enums_and_rejects_unknown_fields(
     tmp_path: Path,
 ) -> None:
@@ -852,7 +859,11 @@ def test_load_startup_config_accepts_json_numbers_for_float_fields(
                     "build_config_id": "arm",
                     "compile_commands_dir": str(tmp_path),
                     "request_timeout": 30,
+                    "diagnostics_wait": 0,
+                    "index_ready_timeout": 0,
                     "prewarm_index_ready_timeout": None,
+                    "warmup_file": str(tmp_path / "warm.c"),
+                    "background_index": True,
                 },
                 "allowed_read_roots": [str(tmp_path)],
             }
@@ -864,7 +875,91 @@ def test_load_startup_config_accepts_json_numbers_for_float_fields(
 
     assert config.request_timeout == 30.0
     assert type(config.request_timeout) is float
+    assert config.diagnostics_wait == 0.0
+    assert config.index_ready_timeout == 0.0
     assert config.prewarm_index_ready_timeout is None
+    assert config.warmup_file == str(tmp_path / "warm.c")
+    assert config.background_index is True
+
+
+@pytest.mark.parametrize("missing", ["build_config_id", "compile_commands_dir"])
+def test_load_startup_config_requires_build_config_fields(
+    tmp_path: Path, missing: str
+) -> None:
+    build_config = {
+        "build_config_id": "arm",
+        "compile_commands_dir": str(tmp_path),
+    }
+    del build_config[missing]
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "build_config": build_config,
+                "allowed_read_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"BuildConfig\.{missing} is required"):
+        load_startup_config(config_path)
+
+
+def test_load_startup_config_rejects_number_that_overflows_float(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "build_config": {
+                    "build_config_id": "arm",
+                    "compile_commands_dir": str(tmp_path),
+                    "request_timeout": 10**400,
+                },
+                "allowed_read_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be a finite number"):
+        load_startup_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("request_timeout", 0, "must be greater than zero"),
+        ("request_timeout", -1, "must be greater than zero"),
+        ("diagnostics_wait", -0.1, "must be non-negative"),
+        ("index_ready_timeout", -0.1, "must be non-negative"),
+        ("prewarm_index_ready_timeout", -0.1, "must be non-negative"),
+        ("index_ready_poll_interval", 0, "must be greater than zero"),
+        ("index_ready_poll_interval", -0.1, "must be greater than zero"),
+    ],
+)
+def test_load_startup_config_rejects_out_of_range_numbers(
+    tmp_path: Path, field: str, value: int | float, message: str
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "build_config": {
+                    "build_config_id": "arm",
+                    "compile_commands_dir": str(tmp_path),
+                    field: value,
+                },
+                "allowed_read_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_startup_config(config_path)
 
 
 @pytest.mark.parametrize(

@@ -138,11 +138,13 @@ class _StrictFastMCP(FastMCP):
         for tool in tools:
             contract = _TOOL_ARGUMENT_CONTRACTS.get(tool.name)
             if contract is None:
-                continue
+                continue  # pragma: no cover - registered tools have contracts.
             properties = set(tool.inputSchema.get("properties", {}))
             required = set(tool.inputSchema.get("required", []))
             if properties != contract.allowed or required != contract.required:
-                raise RuntimeError(f"tool argument contract drift: {tool.name}")
+                raise RuntimeError(  # pragma: no cover - startup integrity guard.
+                    f"tool argument contract drift: {tool.name}"
+                )
             tool.inputSchema["additionalProperties"] = False
         return tools
 
@@ -548,7 +550,8 @@ def _validate_build_config_values(build_raw: dict[str, Any]) -> dict[str, Any]:
             if type(value) is not str:
                 raise ValueError("BuildConfig.active_config must be a string")
             values[name] = ActiveConfig(value)
-        elif name == "index_scope":
+        # Unknown names were rejected above, so this final branch is exhaustive.
+        elif name == "index_scope":  # pragma: no branch
             if type(value) is not str:
                 raise ValueError("BuildConfig.index_scope must be a string")
             values[name] = IndexScope(value)
@@ -564,10 +567,24 @@ def _validate_config_number(field: str, value: object) -> float:
         raise ValueError(f"BuildConfig.{field} must be a finite number") from exc
     if not math.isfinite(number):
         raise ValueError(f"BuildConfig.{field} must be a finite number")
+    if field in {"request_timeout", "index_ready_poll_interval"} and number <= 0:
+        raise ValueError(f"BuildConfig.{field} must be greater than zero")
+    if (
+        field
+        in {
+            "diagnostics_wait",
+            "index_ready_timeout",
+            "prewarm_index_ready_timeout",
+        }
+        and number < 0
+    ):
+        raise ValueError(f"BuildConfig.{field} must be non-negative")
     return number
 
 
-def _validate_raw_arguments(name: str, arguments: dict[str, Any]) -> None:
+def _validate_raw_arguments(name: str, arguments: object) -> None:
+    if not isinstance(arguments, dict):
+        _invalid_parameter("arguments", "must be an object")
     contract = _TOOL_ARGUMENT_CONTRACTS.get(name)
     if contract is None:
         return

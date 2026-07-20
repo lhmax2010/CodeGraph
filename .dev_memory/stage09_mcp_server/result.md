@@ -1,20 +1,20 @@
 # Stage 09 - MCP 薄封装 / Result
 
 ## 最终状态
-Review MAJOR 已修，待四路聚焦复核。实现、确定性 gate 与真实 SDK stdio client 真机复攻均完成，
-尚未 merge。
+四路聚焦复核全票通过，raw 门禁独立复攻零绕过；收口 MINOR、确定性 gate 与真实 SDK stdio
+client 真机复攻均完成，待 merge。
 
 ## 测试情况
 - Baseline：`271 passed in 4.63s`。
 - 初版全套：`324 passed in 6.03s`；总 branch coverage 93%。
-- Review 修复后最终全套：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph
-  --cov-branch` -> `354 passed in 6.32s`；总 branch coverage 92%。
-- P9 定向：`83 passed`；`codegraph/mcp_server.py` branch coverage 97%。
+- 收口最终全套：`PYTHONPATH=.:tools .venv/bin/python -m pytest tests/ -q --cov=codegraph
+  --cov-branch` -> `365 passed in 6.70s`；总 branch coverage 93%。
+- P9 定向：`94 passed`；`codegraph/mcp_server.py` 行/分支覆盖均为 100%。
 - 静态 gate：ruff、black --check、mypy、compileall、git diff --check 全绿。
 - 补测内容：五种 status、三类结果、嵌套 credibility/候选/notes/engine_version 全字段 JSON
   roundtrip；未知类型 fail-loud；五工具 schema/映射；错型/越界/allowlist/symlink 输入门禁与 API
-  零调用；五工具 raw unknown/伪造 build_config_id/missing required；严格启动配置；真实 SDK
-  initialize/list/call 与 stdout 协议隔离。
+  零调用；五工具 raw unknown/伪造 build_config_id/missing required；严格启动配置及 timeout 数值
+  范围；非对象 raw arguments；真实 SDK initialize/list/call 与 stdout 协议隔离。
 
 ## 真机验收
 - 环境：官方 MCP SDK `1.28.1`；系统 clangd `18.1.3`；版本专用 verified cache 为
@@ -46,12 +46,14 @@ Review MAJOR 已修，待四路聚焦复核。实现、确定性 gate 与真实 
 - gstack Claude：完整 diff、聚焦生产 diff、只读 Consult 三种调用均以 `aborted_streaming`
   结束且没有最终审查文本，明确不计票；已按三次上限停止。
 - 初版四路裁决：三票同意；一票发现 unknown raw argument 被 Pydantic 静默忽略的 MAJOR，实测
-  属实并已修复。当前等待各路聚焦确认 pre-Pydantic 门禁闭合、无新绕过。
+  属实并已修复。
+- 聚焦复核：Codex、Gemini、Claude Code、Kimi 四路全票通过；四路独立复攻 raw arguments 门禁
+  均未发现绕过。
 
 ## 遗留问题 / 风险
 - MCP SDK 是 P9 独立可选依赖，固定在 `requirements-mcp.txt`；核心库未引入该依赖。
 - 当前只实现 stdio，不存在网络监听面；SSE/HTTP 不在 MVP 范围。
-- 合入前需四路聚焦复核本轮门禁修复并全票通过。
+- 无阻塞遗留；网络 transport 仍按 MVP 范围明确不实现。
 
 ## 下一阶段计划
-- P9 是 MVP 最后一个 phase；完成后进入 MVP 总体验收/收口。
+- P9 merge 后完成 CodeGraph MVP 九个 phase 闭环。

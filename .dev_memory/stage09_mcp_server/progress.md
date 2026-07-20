@@ -21,6 +21,10 @@
   schema properties/required 与 raw contract 完全一致，防两层规则漂移。
 - 启动 JSON 在构造 BuildConfig 前逐字段严格校验：bool 不接受字符串/整数，timeout 只接受有限
   JSON number，路径/探针字段只接受 string/null，枚举先验类型必须为 string；未知顶层字段也拒绝。
+- 聚焦复核后的 operator 健壮性收口将 timeout 约束细化为字段语义：`request_timeout` 与
+  `index_ready_poll_interval` 必须大于零，diagnostics/index-ready/prewarm timeout 必须非负；
+  非对象 raw arguments 也在统一门禁内 fail-closed。仅对 SDK 注册表/显式 contract 已保证不可达的
+  schema drift 分支使用 coverage pragma，可执行启动错误路径全部由测试覆盖。
 - `os.PathLike` 是 types.py 路径声明的显式支持类型，serializer 用 `os.fspath()` 后继续递归校验；
   其他未知类型仍 fail-loud。响应 JSON 不再排序键，保持声明顺序。
 
@@ -57,3 +61,8 @@
   clangd 18 callees FAILED，cache 前后均 `(3593, 39932298, 1783649150070320105)`。
 - 2026-07-20：最终 gate：P9 定向 `83 passed`；全套 branch coverage `354 passed`、总计 92%、
   `mcp_server.py` 97%；ruff、black --check、mypy、compileall、diff-check 全绿。
+- 2026-07-20：raw 门禁聚焦复核四路全票通过。按收口意见补 timeout 数值范围、非对象 raw 参数
+  防线以及 startup config 缺必填/溢出/合法边界/未知工具测试；P9 定向增至 `94 passed`，
+  `mcp_server.py` 行/分支覆盖均为 100%。
+- 2026-07-20：收口 gate：全套 `365 passed`、总 branch coverage 93%，`mcp_server.py` 行/分支
+  100%；ruff、black、mypy（13 个核心源文件）、compileall 与 diff-check 全绿。
