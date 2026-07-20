@@ -2,7 +2,7 @@
 
 ## 最终状态
 四路聚焦复核全票通过，raw 门禁独立复攻零绕过；收口 MINOR、确定性 gate 与真实 SDK stdio
-client 真机复攻均完成，待 merge。
+client 真机复攻均完成，已 Merge。
 
 ## 测试情况
 - Baseline：`271 passed in 4.63s`。
@@ -37,7 +37,7 @@ client 真机复攻均完成，待 merge。
 ## PR 与代码
 - PR：N/A（按用户要求只 push，不创建 PR）。
 - 分支：`phase/9-mcp-server`。
-- Commit：本阶段 Phase 9 实现提交（branch HEAD；merge 收口时回填最终 hash）。
+- Commit：`b975310` / `checkpoint/phase_9_mcp_server`。
 
 ## Review
 - Codex：完整 staged diff 自审，无 BLOCKER/MAJOR。
@@ -56,4 +56,4 @@ client 真机复攻均完成，待 merge。
 - 无阻塞遗留；网络 transport 仍按 MVP 范围明确不实现。
 
 ## 下一阶段计划
-- P9 merge 后完成 CodeGraph MVP 九个 phase 闭环。
+- CodeGraph MVP 九个 phase 已全部闭环；当前无活跃 stage。
