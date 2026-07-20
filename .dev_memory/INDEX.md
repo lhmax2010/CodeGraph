@@ -3,7 +3,7 @@
 > 以及上一 stage 的 plan/progress/result。_archived/ 内容不读、不引用。
 
 ## 当前状态
-- 当前活跃 stage：stage09_mcp_server（实现与真机 gate 完成，待异构 Review）
+- 当前活跃 stage：stage09_mcp_server（Review MAJOR 已修，待四路聚焦复核）
 - 最后已确认 stage（已 Merge）：change_6_impl
 - 设计基线：docs/design.md v1.5.0 Frozen（change_6 多版本 clangd support 的设计与实现已全闭环）
 - 流程基线：docs/CodeGraph-SOP部署开发Guide.md + AGENTS.md

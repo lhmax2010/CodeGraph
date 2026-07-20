@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
@@ -85,6 +86,67 @@ _KindFilterInput = Annotated[
 _BoolInput = Annotated[Any, WithJsonSchema({"type": "boolean"})]
 
 
+@dataclass(frozen=True, slots=True)
+class _ArgumentContract:
+    allowed: frozenset[str]
+    required: frozenset[str]
+
+
+_POSITION_QUERY_ARGUMENTS = frozenset(
+    {
+        "symbol",
+        "file",
+        "pos",
+        "limit",
+        "offset",
+        "allow_syntactic_fallback",
+    }
+)
+_TOOL_ARGUMENT_CONTRACTS = {
+    "search": _ArgumentContract(
+        frozenset({"symbol", "kind_filter", "limit", "offset"}),
+        frozenset({"symbol"}),
+    ),
+    "definition": _ArgumentContract(
+        frozenset({"symbol", "file", "pos", "allow_syntactic_fallback"}),
+        frozenset({"symbol", "file", "pos"}),
+    ),
+    "references": _ArgumentContract(
+        _POSITION_QUERY_ARGUMENTS, frozenset({"symbol", "file", "pos"})
+    ),
+    "callers": _ArgumentContract(
+        _POSITION_QUERY_ARGUMENTS, frozenset({"symbol", "file", "pos"})
+    ),
+    "callees": _ArgumentContract(
+        _POSITION_QUERY_ARGUMENTS, frozenset({"symbol", "file", "pos"})
+    ),
+}
+
+
+class _StrictFastMCP(FastMCP):
+    """FastMCP with a fail-closed raw argument gate before Pydantic."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        try:
+            _validate_raw_arguments(name, arguments)
+        except ToolError as exc:
+            return _tool_error_result(exc)
+        return await super().call_tool(name, arguments)
+
+    async def list_tools(self) -> list[Any]:
+        tools = await super().list_tools()
+        for tool in tools:
+            contract = _TOOL_ARGUMENT_CONTRACTS.get(tool.name)
+            if contract is None:
+                continue
+            properties = set(tool.inputSchema.get("properties", {}))
+            required = set(tool.inputSchema.get("required", []))
+            if properties != contract.allowed or required != contract.required:
+                raise RuntimeError(f"tool argument contract drift: {tool.name}")
+            tool.inputSchema["additionalProperties"] = False
+        return tools
+
+
 def query_result_to_json(result: QueryResult) -> dict[str, Any]:
     """Convert a QueryResult to JSON data without dropping or stringifying fields."""
 
@@ -100,6 +162,8 @@ def query_result_to_json(result: QueryResult) -> dict[str, Any]:
 def _to_json_value(value: object) -> Any:
     if isinstance(value, Enum):
         return _to_json_value(value.value)
+    if isinstance(value, os.PathLike):
+        return _to_json_value(os.fspath(value))
     if is_dataclass(value) and not isinstance(value, type):
         return {
             field.name: _to_json_value(getattr(value, field.name))
@@ -274,7 +338,7 @@ def create_mcp_server(
     roots = _normalize_allowed_roots(allowed_read_roots)
     codegraph_api.register_build_config(config)
     handlers = _ToolHandlers(config.build_config_id, roots)
-    server = FastMCP(
+    server = _StrictFastMCP(
         "CodeGraph",
         instructions=_SERVER_INSTRUCTIONS,
         log_level="WARNING",
@@ -386,6 +450,11 @@ def load_startup_config(path: str | Path) -> tuple[BuildConfig, tuple[str, ...]]
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("startup config must be a JSON object")
+    unknown_top_level = sorted(set(raw) - {"build_config", "allowed_read_roots"})
+    if unknown_top_level:
+        raise ValueError(
+            f"unknown startup config fields: {', '.join(unknown_top_level)}"
+        )
     build_raw = raw.get("build_config")
     roots_raw = raw.get("allowed_read_roots")
     if not isinstance(build_raw, dict):
@@ -393,26 +462,8 @@ def load_startup_config(path: str | Path) -> tuple[BuildConfig, tuple[str, ...]]
     if not isinstance(roots_raw, list) or not roots_raw:
         raise ValueError("allowed_read_roots must be a non-empty JSON array")
 
-    allowed_fields = {field.name for field in fields(BuildConfig)}
-    unknown = sorted(set(build_raw) - allowed_fields)
-    if unknown:
-        raise ValueError(f"unknown BuildConfig fields: {', '.join(unknown)}")
-    values = dict(build_raw)
-    if "source_roots" in values:
-        if not isinstance(values["source_roots"], list) or not all(
-            isinstance(root, str) for root in values["source_roots"]
-        ):
-            raise ValueError("BuildConfig.source_roots must be an array of strings")
-        values["source_roots"] = tuple(values["source_roots"])
-    if "active_config" in values:
-        values["active_config"] = ActiveConfig(values["active_config"])
-    if "index_scope" in values:
-        values["index_scope"] = IndexScope(values["index_scope"])
+    values = _validate_build_config_values(build_raw)
     config = BuildConfig(**values)
-    if not config.build_config_id or not isinstance(config.build_config_id, str):
-        raise ValueError("BuildConfig.build_config_id must be a non-empty string")
-    if not isinstance(config.compile_commands_dir, str):
-        raise ValueError("BuildConfig.compile_commands_dir must be a string")
     if not all(isinstance(root, str) for root in roots_raw):
         raise ValueError("allowed_read_roots must contain only strings")
     roots = tuple(cast(list[str], roots_raw))
@@ -424,17 +475,127 @@ def _tool_description(summary: str) -> str:
     return f"{summary} {_NOT_EVIDENCE_WARNING}"
 
 
+def _validate_build_config_values(build_raw: dict[str, Any]) -> dict[str, Any]:
+    allowed_fields = {field.name for field in fields(BuildConfig)}
+    unknown = sorted(set(build_raw) - allowed_fields)
+    if unknown:
+        raise ValueError(f"unknown BuildConfig fields: {', '.join(unknown)}")
+    for required in ("build_config_id", "compile_commands_dir"):
+        if required not in build_raw:
+            raise ValueError(f"BuildConfig.{required} is required")
+
+    string_fields = {"build_config_id", "compile_commands_dir", "clangd_path"}
+    optional_string_fields = {
+        "index_ready_probe_symbol",
+        "index_ready_probe_path_suffix",
+        "warmup_file",
+    }
+    number_fields = {
+        "request_timeout",
+        "diagnostics_wait",
+        "index_ready_timeout",
+        "index_ready_poll_interval",
+    }
+    handled_fields = (
+        string_fields
+        | optional_string_fields
+        | number_fields
+        | {
+            "source_roots",
+            "background_index",
+            "prewarm_index_ready_timeout",
+            "active_config",
+            "index_scope",
+        }
+    )
+    unvalidated = allowed_fields - handled_fields
+    if unvalidated:  # pragma: no cover - protects future BuildConfig fields.
+        raise RuntimeError(
+            f"BuildConfig fields lack MCP startup validators: {', '.join(sorted(unvalidated))}"
+        )
+
+    values: dict[str, Any] = {}
+    for name, value in build_raw.items():
+        if name in string_fields:
+            if type(value) is not str:
+                raise ValueError(f"BuildConfig.{name} must be a string")
+            if name == "build_config_id" and not value:
+                raise ValueError(
+                    "BuildConfig.build_config_id must be a non-empty string"
+                )
+            values[name] = value
+        elif name in optional_string_fields:
+            if value is not None and type(value) is not str:
+                raise ValueError(f"BuildConfig.{name} must be a string or null")
+            values[name] = value
+        elif name in number_fields:
+            values[name] = _validate_config_number(name, value)
+        elif name == "prewarm_index_ready_timeout":
+            values[name] = (
+                None if value is None else _validate_config_number(name, value)
+            )
+        elif name == "source_roots":
+            if not isinstance(value, list) or not all(
+                type(root) is str for root in value
+            ):
+                raise ValueError("BuildConfig.source_roots must be an array of strings")
+            values[name] = tuple(value)
+        elif name == "background_index":
+            if type(value) is not bool:
+                raise ValueError("BuildConfig.background_index must be a boolean")
+            values[name] = value
+        elif name == "active_config":
+            if type(value) is not str:
+                raise ValueError("BuildConfig.active_config must be a string")
+            values[name] = ActiveConfig(value)
+        elif name == "index_scope":
+            if type(value) is not str:
+                raise ValueError("BuildConfig.index_scope must be a string")
+            values[name] = IndexScope(value)
+    return values
+
+
+def _validate_config_number(field: str, value: object) -> float:
+    if type(value) not in (int, float):
+        raise ValueError(f"BuildConfig.{field} must be a finite number")
+    try:
+        number = float(cast(int | float, value))
+    except OverflowError as exc:
+        raise ValueError(f"BuildConfig.{field} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"BuildConfig.{field} must be a finite number")
+    return number
+
+
+def _validate_raw_arguments(name: str, arguments: dict[str, Any]) -> None:
+    contract = _TOOL_ARGUMENT_CONTRACTS.get(name)
+    if contract is None:
+        return
+    unknown = sorted(set(arguments) - contract.allowed)
+    if unknown:
+        _invalid_parameter(unknown[0], "unknown parameter")
+    missing = sorted(contract.required - set(arguments))
+    if missing:
+        _invalid_parameter(missing[0], "required parameter is missing")
+
+
 def _mcp_call(handler: Any, *arguments: object) -> CallToolResult:
     try:
         payload = handler(*arguments)
         is_error = False
     except ToolError as exc:
-        payload = json.loads(str(exc))
-        is_error = True
+        return _tool_error_result(exc)
+    return _call_tool_result(payload, is_error=is_error)
+
+
+def _tool_error_result(error: ToolError) -> CallToolResult:
+    return _call_tool_result(json.loads(str(error)), is_error=True)
+
+
+def _call_tool_result(payload: dict[str, Any], *, is_error: bool) -> CallToolResult:
     text = json.dumps(
         payload,
         ensure_ascii=False,
-        sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     )
@@ -525,9 +686,7 @@ def _validate_integer(field: str, value: object, *, minimum: int, maximum: int) 
 
 def _invalid_parameter(field: str, detail: str) -> NoReturn:
     payload = {"error": {"code": "invalid_params", "field": field, "detail": detail}}
-    raise ToolError(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
+    raise ToolError(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def _parser() -> argparse.ArgumentParser:

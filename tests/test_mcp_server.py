@@ -197,6 +197,7 @@ def _assert_preserved(original: object, decoded: object) -> None:
     "status",
     [
         QueryStatus.OK,
+        QueryStatus.NOT_FOUND,
         QueryStatus.UNRESOLVED,
         QueryStatus.FAILED,
         QueryStatus.INVALID_REQUEST,
@@ -226,11 +227,20 @@ def test_query_result_serialization_preserves_every_result_shape(data: object) -
 def test_query_result_serialization_fails_loud_on_unknown_type() -> None:
     result = _ok_result(_location())
     result.status_credibility = replace(
-        result.status_credibility, consumer_hint={"bad": Path("not-json")}
+        result.status_credibility, consumer_hint={"bad": object()}
     )
 
-    with pytest.raises(TypeError, match="PosixPath"):
+    with pytest.raises(TypeError, match="object"):
         query_result_to_json(result)
+
+
+def test_query_result_serialization_supports_declared_pathlike_values() -> None:
+    result = _ok_result(_reference())
+    result.semantic_results[0].data.file = Path("/project/pathlike.c")  # type: ignore[union-attr,assignment]
+
+    encoded = query_result_to_json(result)
+
+    assert encoded["semantic_results"][0]["data"]["file"] == ("/project/pathlike.c")
 
 
 @pytest.mark.parametrize("bad", [{1: "value"}, {"value": float("nan")}])
@@ -260,6 +270,7 @@ def test_tool_mapping_is_exact_and_hides_build_config_id(tmp_path: Path) -> None
     for tool in tools:
         assert _NOT_EVIDENCE_WARNING in (tool.description or "")
         assert "build_config_id" not in tool.inputSchema.get("properties", {})
+        assert tool.inputSchema["additionalProperties"] is False
         assert tool.inputSchema["properties"]["symbol"]["type"] == "string"
         assert tool.inputSchema["properties"]["symbol"]["maxLength"] == 512
     search_schema = next(tool for tool in tools if tool.name == "search").inputSchema
@@ -571,6 +582,187 @@ def test_input_file_symlink_cannot_escape_allowed_root(tmp_path: Path) -> None:
     assert json.loads(str(error.value))["error"]["field"] == "file"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("search", {"symbol": "needle"}),
+        (
+            "definition",
+            {
+                "symbol": "needle",
+                "file": "SOURCE",
+                "pos": {"line": 0, "character": 0},
+            },
+        ),
+        (
+            "references",
+            {
+                "symbol": "needle",
+                "file": "SOURCE",
+                "pos": {"line": 0, "character": 0},
+            },
+        ),
+        (
+            "callers",
+            {
+                "symbol": "needle",
+                "file": "SOURCE",
+                "pos": {"line": 0, "character": 0},
+            },
+        ),
+        (
+            "callees",
+            {
+                "symbol": "needle",
+                "file": "SOURCE",
+                "pos": {"line": 0, "character": 0},
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("unknown_field", ["unexpected_field", "build_config_id"])
+def test_raw_argument_gate_rejects_unknown_fields_for_every_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict[str, object],
+    unknown_field: str,
+) -> None:
+    source = tmp_path / "query.c"
+    source.write_text("int needle(void);\n", encoding="utf-8")
+    called = False
+
+    def should_not_run(*_args: object, **_kwargs: object) -> QueryResult:
+        nonlocal called
+        called = True
+        raise AssertionError("library API must not run")
+
+    for api_name in (
+        "search_symbol",
+        "get_definition",
+        "find_references",
+        "find_callers",
+        "find_callees",
+    ):
+        monkeypatch.setattr(codegraph_api, api_name, should_not_run)
+    server = create_mcp_server(
+        BuildConfig("arm", str(tmp_path)), allowed_read_roots=[str(tmp_path)]
+    )
+    call_arguments = dict(arguments)
+    if call_arguments.get("file") == "SOURCE":
+        call_arguments["file"] = str(source)
+    call_arguments[unknown_field] = (
+        "forged" if unknown_field == "build_config_id" else True
+    )
+
+    returned = asyncio.run(server.call_tool(tool_name, call_arguments))
+
+    assert returned.isError is True
+    assert returned.structuredContent == {
+        "error": {
+            "code": "invalid_params",
+            "field": unknown_field,
+            "detail": "unknown parameter",
+        }
+    }
+    assert json.loads(returned.content[0].text) == returned.structuredContent
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "missing_field"),
+    [
+        ("search", {}, "symbol"),
+        (
+            "definition",
+            {"symbol": "needle", "pos": {"line": 0, "character": 0}},
+            "file",
+        ),
+        (
+            "references",
+            {"symbol": "needle", "file": "SOURCE"},
+            "pos",
+        ),
+        (
+            "callers",
+            {"file": "SOURCE", "pos": {"line": 0, "character": 0}},
+            "symbol",
+        ),
+        (
+            "callees",
+            {"symbol": "needle", "file": "SOURCE"},
+            "pos",
+        ),
+    ],
+)
+def test_raw_argument_gate_structures_missing_required_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict[str, object],
+    missing_field: str,
+) -> None:
+    source = tmp_path / "query.c"
+    source.write_text("int needle(void);\n", encoding="utf-8")
+    called = False
+
+    def should_not_run(*_args: object, **_kwargs: object) -> QueryResult:
+        nonlocal called
+        called = True
+        raise AssertionError("library API must not run")
+
+    for api_name in (
+        "search_symbol",
+        "get_definition",
+        "find_references",
+        "find_callers",
+        "find_callees",
+    ):
+        monkeypatch.setattr(codegraph_api, api_name, should_not_run)
+    server = create_mcp_server(
+        BuildConfig("arm", str(tmp_path)), allowed_read_roots=[str(tmp_path)]
+    )
+    call_arguments = dict(arguments)
+    if call_arguments.get("file") == "SOURCE":
+        call_arguments["file"] = str(source)
+
+    returned = asyncio.run(server.call_tool(tool_name, call_arguments))
+
+    assert returned.isError is True
+    assert returned.structuredContent == {
+        "error": {
+            "code": "invalid_params",
+            "field": missing_field,
+            "detail": "required parameter is missing",
+        }
+    }
+    assert called is False
+
+
+def test_raw_argument_gate_runs_before_fastmcp_tool_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = create_mcp_server(
+        BuildConfig("arm", str(tmp_path)), allowed_read_roots=[str(tmp_path)]
+    )
+    dispatched = False
+
+    async def should_not_dispatch(*_args: object, **_kwargs: object) -> object:
+        nonlocal dispatched
+        dispatched = True
+        raise AssertionError("FastMCP ToolManager must not run")
+
+    monkeypatch.setattr(server._tool_manager, "call_tool", should_not_dispatch)
+
+    returned = asyncio.run(
+        server.call_tool("search", {"symbol": "needle", "unexpected_field": True})
+    )
+
+    assert returned.isError is True
+    assert returned.structuredContent["error"]["field"] == "unexpected_field"
+    assert dispatched is False
+
+
 def test_load_startup_config_converts_enums_and_rejects_unknown_fields(
     tmp_path: Path,
 ) -> None:
@@ -603,6 +795,76 @@ def test_load_startup_config_converts_enums_and_rejects_unknown_fields(
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown BuildConfig fields"):
         load_startup_config(config_path)
+
+    del raw["build_config"]["unexpected"]
+    raw["unexpected"] = True
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown startup config fields"):
+        load_startup_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("background_index", "false", "must be a boolean"),
+        ("request_timeout", "30", "must be a finite number"),
+        ("request_timeout", True, "must be a finite number"),
+        ("diagnostics_wait", None, "must be a finite number"),
+        ("index_ready_timeout", float("nan"), "must be a finite number"),
+        ("prewarm_index_ready_timeout", "30", "must be a finite number"),
+        ("clangd_path", 18, "must be a string"),
+        ("warmup_file", False, "must be a string or null"),
+        ("index_ready_probe_symbol", 1, "must be a string or null"),
+        ("active_config", 1, "must be a string"),
+        ("index_scope", False, "must be a string"),
+    ],
+)
+def test_load_startup_config_strictly_validates_every_field_family(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "build_config": {
+                    "build_config_id": "arm",
+                    "compile_commands_dir": str(tmp_path),
+                    field: value,
+                },
+                "allowed_read_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_startup_config(config_path)
+
+
+def test_load_startup_config_accepts_json_numbers_for_float_fields(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "build_config": {
+                    "build_config_id": "arm",
+                    "compile_commands_dir": str(tmp_path),
+                    "request_timeout": 30,
+                    "prewarm_index_ready_timeout": None,
+                },
+                "allowed_read_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config, _ = load_startup_config(config_path)
+
+    assert config.request_timeout == 30.0
+    assert type(config.request_timeout) is float
+    assert config.prewarm_index_ready_timeout is None
 
 
 @pytest.mark.parametrize(
@@ -739,7 +1001,7 @@ def test_real_sdk_stdio_client_sees_only_protocol_frames(tmp_path: Path) -> None
     )
     stderr_path = tmp_path / "server.stderr"
 
-    async def exercise() -> tuple[set[str], object]:
+    async def exercise() -> tuple[set[str], object, object]:
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "codegraph.mcp_server", "--config", str(config)],
@@ -752,12 +1014,23 @@ def test_real_sdk_stdio_client_sees_only_protocol_frames(tmp_path: Path) -> None
                     await session.initialize()
                     tools = await session.list_tools()
                     invalid = await session.call_tool("search", {"symbol": ""})
-                    return {tool.name for tool in tools.tools}, invalid
+                    unexpected = await session.call_tool(
+                        "search", {"symbol": "needle", "unexpected_field": True}
+                    )
+                    return {tool.name for tool in tools.tools}, invalid, unexpected
 
-    names, invalid = asyncio.run(exercise())
+    names, invalid, unexpected = asyncio.run(exercise())
 
     assert names == {"search", "definition", "references", "callers", "callees"}
     assert invalid.isError is True
     assert json.loads(invalid.content[0].text)["error"]["code"] == "invalid_params"
     assert invalid.structuredContent == json.loads(invalid.content[0].text)
+    assert unexpected.isError is True
+    assert unexpected.structuredContent == {
+        "error": {
+            "code": "invalid_params",
+            "field": "unexpected_field",
+            "detail": "unknown parameter",
+        }
+    }
     assert "Traceback" not in stderr_path.read_text(encoding="utf-8")

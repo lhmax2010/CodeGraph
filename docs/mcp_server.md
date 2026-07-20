@@ -50,6 +50,10 @@ The process uses stdout exclusively for MCP stdio frames and sends logs to stder
 network listener. The registered tools are `search`, `definition`, `references`, `callers`, and
 `callees`; `impact` is intentionally absent from the MVP.
 
+Each tool schema is closed. Unknown parameters, hidden-configuration attempts such as a forged
+`build_config_id`, and missing required parameters are rejected as structured `invalid_params`
+results before SDK type conversion or any CodeGraph API call.
+
 Every tool returns the complete `QueryResult` JSON, including credibility, candidates, notes, and
 engine version. `syntactic_candidates` are heuristic only, carry
 `consumer_warning=not_evidence`, and must not be used as deterministic evidence.

@@ -15,6 +15,14 @@
 - file allowlist 只约束 agent 输入的查询位置；QueryResult 输出路径完全不经过 allowlist，不过滤、
   不改写系统头或 sysroot 路径。
 - `build_config_id` 只由 server 启动 JSON 注入并由闭包捕获，五个 MCP 工具 schema 均不暴露该字段。
+- Review MAJOR 后新增统一 raw-arguments contract：`_StrictFastMCP.call_tool()` 在 FastMCP
+  `ToolManager`/Pydantic 前检查每个工具的 allowed/required 字段；unknown/missing 均返回稳定
+  `invalid_params`，库 API 零调用。`list_tools()` 同时发布 `additionalProperties:false`，并校验
+  schema properties/required 与 raw contract 完全一致，防两层规则漂移。
+- 启动 JSON 在构造 BuildConfig 前逐字段严格校验：bool 不接受字符串/整数，timeout 只接受有限
+  JSON number，路径/探针字段只接受 string/null，枚举先验类型必须为 string；未知顶层字段也拒绝。
+- `os.PathLike` 是 types.py 路径声明的显式支持类型，serializer 用 `os.fspath()` 后继续递归校验；
+  其他未知类型仍 fail-loud。响应 JSON 不再排序键，保持声明顺序。
 
 ## 改动摘要
 - 新增 stdio MCP server、五工具薄映射、保真 serializer、协议参数门禁、启动 JSON loader 与独立依赖。
@@ -40,3 +48,12 @@
   validation/response 两次 dumps 的轻微冗余，均符合已确认语义、不改。
 - 2026-07-17：gstack Claude 完整 diff、聚焦生产 diff、只读 Consult 三次分别在 273s/200s/205s
   以 `aborted_streaming` 结束，均无最终审查文本，按能力失败不计票；达到三次上限后停止重试。
+- 2026-07-20：四路 Review 三票同意、一票发现 raw unknown 参数被 Pydantic 静默丢弃的 MAJOR；
+  实测确认 `unexpected_field` 可进入库，按裁决实现 pre-Pydantic raw contract 门禁。
+- 2026-07-20：构造性复攻覆盖五工具 × unknown、五工具 × 伪造 build_config_id、五工具 × missing
+  required，全部结构化拒绝且 API 零调用；五个 inputSchema 均为 closed object。
+- 2026-07-20：真实 SDK stdio 复攻：`unexpected_field` / `build_config_id` 分别在 0.9ms / 0.6ms
+  返回 `invalid_params`，missing pos 同样结构化；随后五工具仍为 references 389/62、callers 387、
+  clangd 18 callees FAILED，cache 前后均 `(3593, 39932298, 1783649150070320105)`。
+- 2026-07-20：最终 gate：P9 定向 `83 passed`；全套 branch coverage `354 passed`、总计 92%、
+  `mcp_server.py` 97%；ruff、black --check、mypy、compileall、diff-check 全绿。
